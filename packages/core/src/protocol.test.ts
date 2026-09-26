@@ -499,10 +499,6 @@ test("rejects non-finite numbers and unsupported values", () => {
   for (const value of [undefined, 1n, Symbol("x"), () => undefined]) {
     assert.deepStrictEqual(parseJsonValue(value), { ok: false, error: "ERR_INVALID_TYPE" });
   }
-  assert.deepStrictEqual(parseJsonValue({ value: 1 }), {
-    ok: false,
-    error: "ERR_UNSUPPORTED_TYPE",
-  });
 });
 
 test("enforces exact string and array length boundaries", () => {
@@ -690,5 +686,230 @@ test("does not throw for revoked value or limits proxies", () => {
   assert.deepStrictEqual(parseJsonValue([], limitsProxy.proxy), {
     ok: false,
     error: "ERR_INVALID_LIMITS",
+  });
+});
+
+// --- parseJsonValue: plain object support -----------------------------------
+
+test("accepts plain Object.prototype and null-prototype nested objects", () => {
+  const plain = { a: 1, b: [2, "x"] };
+  const resultPlain = parseJsonValue(plain);
+  assert.equal(resultPlain.ok, true);
+
+  const nullProto = Object.create(null);
+  nullProto.a = 3;
+  nullProto.b = [4];
+  const resultNull = parseJsonValue(nullProto);
+  assert.equal(resultNull.ok, true);
+
+  // Verify output has null prototype and is frozen.
+  if (resultPlain.ok) {
+    assert.equal(Object.getPrototypeOf(resultPlain.value), null);
+    assert.equal(Object.isFrozen(resultPlain.value), true);
+  }
+});
+
+test("accepts deeply nested mixed containers", () => {
+  const input: unknown[] = [
+    { a: [1, { b: [2] }] },
+  ];
+  const result = parseJsonValue(input[0], jsonLimits({ maxDepth: 4 }));
+  assert.equal(result.ok, true);
+});
+
+test("enforces exact maxObjectKeys boundary", () => {
+  const limits = jsonLimits({ maxObjectKeys: 2 });
+  const obj1: Record<string, number> = { a: 1, b: 2 };
+  assert.equal(parseJsonValue(obj1, limits).ok, true);
+
+  const obj2: Record<string, number> = { a: 1, b: 2, c: 3 };
+  assert.deepStrictEqual(parseJsonValue(obj2, limits), {
+    ok: false,
+    error: "ERR_LIMIT_EXCEEDED",
+  });
+});
+
+test("rejects overlong object keys", () => {
+  const longKey = "a".repeat(4097);
+  const obj: Record<string, number> = {};
+  (obj as unknown as Record<string, number>)[longKey] = 1;
+  assert.deepStrictEqual(parseJsonValue(obj), {
+    ok: false,
+    error: "ERR_LIMIT_EXCEEDED",
+  });
+});
+
+test("rejects custom prototype objects", () => {
+  const obj = Object.create({ inherited: true }) as Record<string, number>;
+  obj.a = 1;
+  assert.deepStrictEqual(parseJsonValue(obj), {
+    ok: false,
+    error: "ERR_INVALID_TYPE",
+  });
+});
+
+test("rejects symbol-keyed own properties", () => {
+  const symKey = Symbol("k");
+  const obj: Record<string | symbol, number> = { a: 1 };
+  (obj as unknown as Record<string | symbol, number>)[symKey] = 2;
+  assert.deepStrictEqual(parseJsonValue(obj), {
+    ok: false,
+    error: "ERR_INVALID_STRUCTURE",
+  });
+});
+
+test("does not invoke accessors during inspection", () => {
+  let invoked = false;
+  const obj: Record<string, unknown> = {};
+  Object.defineProperty(obj, "a", {
+    enumerable: true,
+    configurable: true,
+    get() {
+      invoked = true;
+      throw new Error("must not run");
+    },
+  });
+  assert.deepStrictEqual(parseJsonValue(obj), {
+    ok: false,
+    error: "ERR_INVALID_STRUCTURE",
+  });
+  assert.equal(invoked, false);
+});
+
+test("handles hostile and revoked proxy objects", () => {
+  const hostileProxy = new Proxy({}, {
+    getPrototypeOf() {
+      throw new Error("hostile proxy");
+    },
+  });
+  assert.doesNotThrow(() => parseJsonValue(hostileProxy));
+  assert.deepStrictEqual(parseJsonValue(hostileProxy), {
+    ok: false,
+    error: "ERR_INVALID_TYPE",
+  });
+
+  const revoked = Proxy.revocable({}, {});
+  revoked.revoke();
+  assert.doesNotThrow(() => parseJsonValue(revoked.proxy));
+  // Revoked proxy with empty-handler still delegates to target (valid plain object).
+  assert.deepStrictEqual(parseJsonValue(revoked.proxy), {
+    ok: false,
+    error: "ERR_INVALID_STRUCTURE",
+  });
+});
+
+test("rejects object cycles (self-reference)", () => {
+  const obj: Record<string, unknown> = {};
+  obj.a = obj;
+  assert.deepStrictEqual(parseJsonValue(obj), {
+    ok: false,
+    error: "ERR_INVALID_STRUCTURE",
+  });
+});
+
+test("rejects shared object references in same array", () => {
+  const obj: Record<string, number> = { a: 1 };
+  assert.deepStrictEqual(parseJsonValue([obj, obj]), {
+    ok: false,
+    error: "ERR_INVALID_STRUCTURE",
+  });
+});
+
+test("rejects mixed array-object cycle and shared ref across containers", () => {
+  const arr: unknown[] = [];
+  const obj: Record<string, unknown> = {};
+  arr.push(obj);
+  obj.arr = arr;
+  assert.deepStrictEqual(parseJsonValue(arr), {
+    ok: false,
+    error: "ERR_INVALID_STRUCTURE",
+  });
+
+  // Shared object ref across containers.
+  const sharedObj: Record<string, number> = { a: 1 };
+  assert.deepStrictEqual(parseJsonValue([sharedObj, [sharedObj]]), {
+    ok: false,
+    error: "ERR_INVALID_STRUCTURE",
+  });
+});
+
+test("deep clone and freeze output", () => {
+  const inner: Record<string, number> = { a: 1 };
+  const input: unknown[] = [inner];
+  const result = parseJsonValue(input);
+  assert.equal(result.ok, true);
+  if (!result.ok) return;
+
+  // Verify all levels frozen.
+  assert.equal(Object.isFrozen(result.value), true);
+  assert.equal(Array.isArray(result.value), true);
+  const outputInner = (result.value as readonly unknown[])[0] as Record<string, number>;
+  assert.equal(Object.getPrototypeOf(outputInner), null);
+  assert.equal(Object.isFrozen(outputInner), true);
+
+  // Mutate input after parse.
+  inner.a = 999;
+  input.push(2);
+  const finalResult = result.value as readonly unknown[];
+  assert.equal(finalResult.length, 1);
+  assert.deepStrictEqual((finalResult[0] as Record<string, number>).a, 1);
+});
+
+test("keeps __proto__, constructor, prototype as inert own data keys", () => {
+  const obj: Record<string, number> = {};
+  Object.defineProperty(obj, "__proto__", { value: 1 });
+  Object.defineProperty(obj, "constructor", { value: 2 });
+  Object.defineProperty(obj, "prototype", { value: 3 });
+
+  const result = parseJsonValue(obj);
+  assert.equal(result.ok, true);
+  if (!result.ok) return;
+
+  const output = result.value as Record<string, number>;
+  // Verify null prototype.
+  assert.equal(Object.getPrototypeOf(output), null);
+  // __proto__ on a null-prototype object is an own property; use descriptor to verify value.
+  const protoDesc = Object.getOwnPropertyDescriptor(output, "__proto__");
+  assert.ok(protoDesc !== undefined);
+  assert.deepStrictEqual((protoDesc as PropertyDescriptor).value, 1);
+  const keys = Reflect.ownKeys(output) as string[];
+  assert.ok(keys.includes("__proto__"));
+  assert.ok(keys.includes("constructor"));
+  assert.ok(keys.includes("prototype"));
+});
+
+test("depth and node accounting across mixed containers", () => {
+  // Object at depth 0, array child at depth 1, object grandchild at depth 2.
+  const result = parseJsonValue(
+    { a: [1] },
+    jsonLimits({ maxDepth: 2 }),
+  );
+  assert.equal(result.ok, true);
+
+  // Depth boundary: obj→arr→obj should fail at depth 3 with maxDepth=2.
+  const deepResult = parseJsonValue(
+    { a: [{ b: 1 }] },
+    jsonLimits({ maxDepth: 2 }),
+  );
+  assert.deepStrictEqual(deepResult, {
+    ok: false,
+    error: "ERR_LIMIT_EXCEEDED",
+  });
+
+  // Node counting across mixed types.
+  const nodeResult = parseJsonValue(
+    { a: [1, 2] },
+    jsonLimits({ maxNodes: 4 }),
+  );
+  assert.equal(nodeResult.ok, true);
+
+  // obj(1) + arr(1) + num(1) + num(1) = 4 nodes; one more should fail.
+  const nodeOverResult = parseJsonValue(
+    { a: [1, 2, 3] },
+    jsonLimits({ maxNodes: 4 }),
+  );
+  assert.deepStrictEqual(nodeOverResult, {
+    ok: false,
+    error: "ERR_LIMIT_EXCEEDED",
   });
 });

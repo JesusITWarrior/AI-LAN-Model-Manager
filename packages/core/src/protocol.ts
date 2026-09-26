@@ -358,15 +358,97 @@ function parseJsonNode(input: unknown, depth: number, context: JsonParseContext)
       ? { ok: true, value: input }
       : { ok: false, error: ERR_LIMIT_EXCEEDED };
   }
+  if (typeof input !== "object" || input === null) {
+    return { ok: false, error: ERR_INVALID_TYPE };
+  }
   const isArray = safelyDetectArray(input);
   if (isArray === null) {
     return { ok: false, error: ERR_INVALID_STRUCTURE };
   }
   if (!isArray) {
-    return {
-      ok: false,
-      error: typeof input === "object" ? ERR_UNSUPPORTED_TYPE : ERR_INVALID_TYPE,
-    };
+    // --- plain object support ---
+
+    // Prototype check via reflection.
+    let proto: unknown | null;
+    try {
+      proto = Object.getPrototypeOf(input);
+    } catch {
+      return { ok: false, error: ERR_INVALID_TYPE };
+    }
+    if (proto !== Object.prototype && proto !== null) {
+      return { ok: false, error: ERR_INVALID_TYPE };
+    }
+
+    // Own keys inspection.
+    let ownKeysResult: PropertyKey[];
+    try {
+      ownKeysResult = Reflect.ownKeys(input);
+    } catch {
+      return { ok: false, error: ERR_INVALID_STRUCTURE };
+    }
+
+    // Filter to string-keyed own properties; reject symbol keys.
+    const stringKeys: string[] = [];
+    for (const key of ownKeysResult) {
+      if (typeof key === "string") {
+        stringKeys.push(key);
+      } else {
+        return { ok: false, error: ERR_INVALID_STRUCTURE };
+      }
+    }
+
+    // maxObjectKeys enforcement at exact boundary.
+    if (stringKeys.length > context.limits.maxObjectKeys) {
+      return { ok: false, error: ERR_LIMIT_EXCEEDED };
+    }
+
+    // Descriptor inspection WITHOUT invoking getters.
+    let descriptorsResult: Record<string | symbol, PropertyDescriptor>;
+    try {
+      descriptorsResult = Object.getOwnPropertyDescriptors(input);
+    } catch {
+      return { ok: false, error: ERR_INVALID_STRUCTURE };
+    }
+
+    // Key length check (maxStringLength on object keys).
+    for (const key of stringKeys) {
+      if (key.length > context.limits.maxStringLength) {
+        return { ok: false, error: ERR_LIMIT_EXCEEDED };
+      }
+    }
+
+    // Cycle detection via shared WeakSet.
+    try {
+      if (context.seen.has(input)) {
+        return { ok: false, error: ERR_INVALID_STRUCTURE };
+      }
+      context.seen.add(input);
+    } catch {
+      return { ok: false, error: ERR_INVALID_STRUCTURE };
+    }
+
+    // Clone into Object.create(null), recursively parse children.
+    const output = Object.create(null) as Record<string, JsonValue>;
+    for (const key of stringKeys) {
+      const descriptor = descriptorsResult[key];
+      if (!descriptor || !("value" in descriptor)) {
+        return { ok: false, error: ERR_INVALID_STRUCTURE };
+      }
+      const child = parseJsonNode(descriptor.value as unknown, depth + 1, context);
+      if (!child.ok) {
+        return child;
+      }
+      output[key] = child.value;
+    }
+
+    // Freeze result.
+    try {
+      Object.freeze(output);
+    } catch {
+      return { ok: false, error: ERR_INVALID_STRUCTURE };
+    }
+
+    return { ok: true, value: output as JsonObject };
   }
 
   const arrayInput = input as unknown[];
@@ -411,7 +493,7 @@ function parseJsonNode(input: unknown, depth: number, context: JsonParseContext)
   }
 }
 
-/** Parse JSON primitives and arrays into an immutable, detached value. */
+/** Parse a bounded JSON value into an immutable, detached value. */
 export function parseJsonValue(input: unknown, limitsInput?: unknown): ParseResult<JsonValue> {
   const limits = parseJsonLimits(limitsInput);
   if (!limits.ok) {
