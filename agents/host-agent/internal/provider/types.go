@@ -36,3 +36,21 @@ type ProviderProbe struct {
 	Version    VersionInfo `json:"version"`
 	ObservedAt string      `json:"observedAt"`
 }
+
+// InstalledModel is provider-neutral metadata for one locally installed model.
+// ModelID is stable for the provider, canonical name, and content digest.
+type InstalledModel struct {
+	ModelID       string   `json:"modelId"`
+	ProviderID    string   `json:"providerId"`
+	CanonicalName string   `json:"canonicalName"`
+	DisplayName   string   `json:"displayName"`
+	Digest        string   `json:"digest"`
+	SizeBytes     uint64   `json:"sizeBytes"`
+	ModifiedAt    string   `json:"modifiedAt"`
+	ParentModel   string   `json:"parentModel"`
+	Format        string   `json:"format"`
+	Family        string   `json:"family"`
+	Families      []string `json:"families"`
+	ParameterSize string   `json:"parameterSize"`
+	Quantization  string   `json:"quantization"`
+}

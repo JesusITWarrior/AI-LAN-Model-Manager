@@ -3,6 +3,8 @@ package ollama
 import (
 	"bytes"
 	"context"
+	"crypto/sha256"
+	"encoding/hex"
 	"encoding/json"
 	"errors"
 	"fmt"
@@ -10,6 +12,7 @@ import (
 	"net/http"
 	"net/url"
 	"regexp"
+	"sort"
 	"strconv"
 	"strings"
 	"time"
@@ -22,7 +25,11 @@ const (
 	MinimumTimeout          = 100 * time.Millisecond
 	MaximumTimeout          = 30 * time.Second
 	MaximumBodySize         = 64 * 1024
+	MaximumListBodySize     = 1024 * 1024
+	MaximumInstalledModels  = 10000
 	maximumProviderIDLength = 128
+	maximumModelNameLength  = 256
+	maximumMetadataLength   = 128
 	maximumVersionLength    = 128
 	maximumVersion          = 65535
 )
@@ -37,8 +44,15 @@ var (
 	ErrInvalidResponse = errors.New("invalid ollama version response")
 	ErrInvalidVersion  = errors.New("invalid ollama version")
 
+	ErrListFailed           = errors.New("ollama installed-model request failed")
+	ErrListHTTPStatus       = errors.New("ollama installed-model request returned unexpected status")
+	ErrListResponseTooLarge = errors.New("ollama installed-model response too large")
+	ErrInvalidListResponse  = errors.New("invalid ollama installed-model response")
+
 	providerIDPattern = regexp.MustCompile(`^[A-Za-z0-9][A-Za-z0-9._:-]{0,127}$`)
 	versionPattern    = regexp.MustCompile(`^v?([0-9]+)\.([0-9]+)\.([0-9]+)(?:-([0-9A-Za-z-]+(?:\.[0-9A-Za-z-]+)*))?$`)
+	digestPattern     = regexp.MustCompile(`^[0-9a-fA-F]{64}$`)
+	metadataPattern   = regexp.MustCompile(`^[A-Za-z0-9][A-Za-z0-9 ._+:/()-]*$`)
 )
 
 // Config contains the complete configuration for one Ollama adapter.
@@ -285,4 +299,338 @@ func decodeVersion(body []byte) (string, error) {
 		return "", ErrInvalidResponse
 	}
 	return version, nil
+}
+
+// ListInstalled fetches and strictly validates the installed-model inventory.
+func (client *Client) ListInstalled(ctx context.Context) ([]provider.InstalledModel, error) {
+	if err := ctx.Err(); err != nil {
+		return nil, err
+	}
+	requestContext, cancel := context.WithTimeout(ctx, client.timeout)
+	defer cancel()
+	request, err := http.NewRequestWithContext(requestContext, http.MethodGet, client.endpoint+"/api/tags", nil)
+	if err != nil {
+		return nil, ErrListFailed
+	}
+	request.Header.Set("Accept", "application/json")
+	response, err := client.doer.Do(request)
+	if response != nil && response.Body != nil {
+		defer response.Body.Close()
+	}
+	if err != nil {
+		if contextErr := requestContext.Err(); contextErr != nil {
+			return nil, contextErr
+		}
+		if errors.Is(err, context.Canceled) || errors.Is(err, context.DeadlineExceeded) {
+			return nil, err
+		}
+		return nil, ErrListFailed
+	}
+	if response == nil || response.Body == nil {
+		return nil, ErrListFailed
+	}
+	if response.StatusCode != http.StatusOK {
+		return nil, ErrListHTTPStatus
+	}
+	body, err := io.ReadAll(io.LimitReader(response.Body, MaximumListBodySize+1))
+	if err != nil {
+		if contextErr := requestContext.Err(); contextErr != nil {
+			return nil, contextErr
+		}
+		if errors.Is(err, context.Canceled) || errors.Is(err, context.DeadlineExceeded) {
+			return nil, err
+		}
+		return nil, ErrInvalidListResponse
+	}
+	if len(body) > MaximumListBodySize {
+		return nil, ErrListResponseTooLarge
+	}
+	models, err := decodeInstalledModels(body, client.providerID)
+	if err != nil {
+		return nil, ErrInvalidListResponse
+	}
+	return models, nil
+}
+
+type tagModel struct {
+	name, model, modifiedAt, digest string
+	size                            uint64
+	details                         tagDetails
+}
+type tagDetails struct {
+	parentModel, format, family string
+	families                    []string
+	parameter, quantization     string
+}
+
+func decodeInstalledModels(body []byte, providerID string) ([]provider.InstalledModel, error) {
+	decoder := json.NewDecoder(bytes.NewReader(body))
+	decoder.UseNumber()
+	if token, err := decoder.Token(); err != nil || token != json.Delim('{') {
+		return nil, ErrInvalidListResponse
+	}
+	seenRoot := false
+	var rawModels []tagModel
+	for decoder.More() {
+		key, err := stringToken(decoder)
+		if err != nil || key != "models" || seenRoot {
+			return nil, ErrInvalidListResponse
+		}
+		seenRoot = true
+		if token, err := decoder.Token(); err != nil || token != json.Delim('[') {
+			return nil, ErrInvalidListResponse
+		}
+		for decoder.More() {
+			if len(rawModels) >= MaximumInstalledModels {
+				return nil, ErrInvalidListResponse
+			}
+			model, err := decodeTagModel(decoder)
+			if err != nil {
+				return nil, err
+			}
+			rawModels = append(rawModels, model)
+		}
+		if token, err := decoder.Token(); err != nil || token != json.Delim(']') {
+			return nil, ErrInvalidListResponse
+		}
+	}
+	if !seenRoot {
+		return nil, ErrInvalidListResponse
+	}
+	if token, err := decoder.Token(); err != nil || token != json.Delim('}') {
+		return nil, ErrInvalidListResponse
+	}
+	var trailing any
+	if err := decoder.Decode(&trailing); !errors.Is(err, io.EOF) {
+		return nil, ErrInvalidListResponse
+	}
+	models := make([]provider.InstalledModel, 0, len(rawModels))
+	canonicalSeen := make(map[string]struct{}, len(rawModels))
+	identitySeen := make(map[string]struct{}, len(rawModels))
+	for _, raw := range rawModels {
+		model, err := normalizeTagModel(raw, providerID)
+		if err != nil {
+			return nil, err
+		}
+		identity := model.Digest + "\x00" + model.CanonicalName
+		if _, exists := canonicalSeen[model.CanonicalName]; exists {
+			return nil, ErrInvalidListResponse
+		}
+		if _, exists := identitySeen[identity]; exists {
+			return nil, ErrInvalidListResponse
+		}
+		canonicalSeen[model.CanonicalName] = struct{}{}
+		identitySeen[identity] = struct{}{}
+		models = append(models, model)
+	}
+	sort.Slice(models, func(i, j int) bool {
+		if models[i].CanonicalName != models[j].CanonicalName {
+			return models[i].CanonicalName < models[j].CanonicalName
+		}
+		return models[i].Digest < models[j].Digest
+	})
+	return models, nil
+}
+
+func decodeTagModel(decoder *json.Decoder) (tagModel, error) {
+	if token, err := decoder.Token(); err != nil || token != json.Delim('{') {
+		return tagModel{}, ErrInvalidListResponse
+	}
+	var model tagModel
+	seen := make(map[string]bool, 6)
+	for decoder.More() {
+		key, err := stringToken(decoder)
+		if err != nil || seen[key] {
+			return tagModel{}, ErrInvalidListResponse
+		}
+		seen[key] = true
+		switch key {
+		case "name":
+			err = decoder.Decode(&model.name)
+		case "model":
+			err = decoder.Decode(&model.model)
+		case "modified_at":
+			err = decoder.Decode(&model.modifiedAt)
+		case "size":
+			var number json.Number
+			if err = decoder.Decode(&number); err == nil {
+				model.size, err = strconv.ParseUint(string(number), 10, 64)
+			}
+		case "digest":
+			err = decoder.Decode(&model.digest)
+		case "details":
+			model.details, err = decodeTagDetails(decoder)
+		default:
+			return tagModel{}, ErrInvalidListResponse
+		}
+		if err != nil {
+			return tagModel{}, ErrInvalidListResponse
+		}
+	}
+	if token, err := decoder.Token(); err != nil || token != json.Delim('}') || len(seen) != 6 {
+		return tagModel{}, ErrInvalidListResponse
+	}
+	for _, key := range []string{"name", "model", "modified_at", "size", "digest", "details"} {
+		if !seen[key] {
+			return tagModel{}, ErrInvalidListResponse
+		}
+	}
+	return model, nil
+}
+
+func decodeTagDetails(decoder *json.Decoder) (tagDetails, error) {
+	if token, err := decoder.Token(); err != nil || token != json.Delim('{') {
+		return tagDetails{}, ErrInvalidListResponse
+	}
+	var details tagDetails
+	seen := make(map[string]bool, 6)
+	for decoder.More() {
+		key, err := stringToken(decoder)
+		if err != nil || seen[key] {
+			return tagDetails{}, ErrInvalidListResponse
+		}
+		seen[key] = true
+		switch key {
+		case "parent_model":
+			err = decoder.Decode(&details.parentModel)
+		case "format":
+			err = decoder.Decode(&details.format)
+		case "family":
+			err = decoder.Decode(&details.family)
+		case "families":
+			details.families, err = decodeFamilies(decoder)
+		case "parameter_size":
+			err = decoder.Decode(&details.parameter)
+		case "quantization_level":
+			err = decoder.Decode(&details.quantization)
+		default:
+			return tagDetails{}, ErrInvalidListResponse
+		}
+		if err != nil {
+			return tagDetails{}, ErrInvalidListResponse
+		}
+	}
+	if token, err := decoder.Token(); err != nil || token != json.Delim('}') || len(seen) != 6 {
+		return tagDetails{}, ErrInvalidListResponse
+	}
+	for _, key := range []string{"parent_model", "format", "family", "families", "parameter_size", "quantization_level"} {
+		if !seen[key] {
+			return tagDetails{}, ErrInvalidListResponse
+		}
+	}
+	return details, nil
+}
+
+func decodeFamilies(decoder *json.Decoder) ([]string, error) {
+	token, err := decoder.Token()
+	if err != nil {
+		return nil, err
+	}
+	if token == nil {
+		return []string{}, nil
+	}
+	if token != json.Delim('[') {
+		return nil, ErrInvalidListResponse
+	}
+	families := make([]string, 0)
+	for decoder.More() {
+		if len(families) >= 32 {
+			return nil, ErrInvalidListResponse
+		}
+		value, err := stringToken(decoder)
+		if err != nil {
+			return nil, err
+		}
+		families = append(families, value)
+	}
+	if token, err = decoder.Token(); err != nil || token != json.Delim(']') {
+		return nil, ErrInvalidListResponse
+	}
+	return families, nil
+}
+
+func stringToken(decoder *json.Decoder) (string, error) {
+	token, err := decoder.Token()
+	if err != nil {
+		return "", err
+	}
+	value, ok := token.(string)
+	if !ok {
+		return "", ErrInvalidListResponse
+	}
+	return value, nil
+}
+
+func normalizeTagModel(raw tagModel, providerID string) (provider.InstalledModel, error) {
+	canonicalName, ok := canonicalModelName(raw.model)
+	if !ok {
+		return provider.InstalledModel{}, ErrInvalidListResponse
+	}
+	displayCanonical, ok := canonicalModelName(raw.name)
+	if !ok || displayCanonical != canonicalName {
+		return provider.InstalledModel{}, ErrInvalidListResponse
+	}
+	if !digestPattern.MatchString(raw.digest) {
+		return provider.InstalledModel{}, ErrInvalidListResponse
+	}
+	digest := strings.ToLower(raw.digest)
+	modified, err := time.Parse(time.RFC3339Nano, raw.modifiedAt)
+	if err != nil {
+		return provider.InstalledModel{}, ErrInvalidListResponse
+	}
+	parent := ""
+	if raw.details.parentModel != "" {
+		parent, ok = canonicalModelName(raw.details.parentModel)
+		if !ok {
+			return provider.InstalledModel{}, ErrInvalidListResponse
+		}
+	}
+	for _, value := range []string{raw.details.format, raw.details.family, raw.details.parameter, raw.details.quantization} {
+		if !validMetadata(value) {
+			return provider.InstalledModel{}, ErrInvalidListResponse
+		}
+	}
+	families := make([]string, len(raw.details.families))
+	familySeen := make(map[string]struct{}, len(families))
+	for index, family := range raw.details.families {
+		if !validMetadata(family) {
+			return provider.InstalledModel{}, ErrInvalidListResponse
+		}
+		normalized := strings.ToLower(family)
+		if _, exists := familySeen[normalized]; exists {
+			return provider.InstalledModel{}, ErrInvalidListResponse
+		}
+		familySeen[normalized] = struct{}{}
+		families[index] = family
+	}
+	identity := sha256.Sum256([]byte(providerID + "\x00" + canonicalName + "\x00" + digest))
+	return provider.InstalledModel{ModelID: "ollama-" + hex.EncodeToString(identity[:]), ProviderID: providerID, CanonicalName: canonicalName, DisplayName: raw.name, Digest: digest, SizeBytes: raw.size, ModifiedAt: modified.UTC().Truncate(time.Millisecond).Format("2006-01-02T15:04:05.000Z"), ParentModel: parent, Format: raw.details.format, Family: raw.details.family, Families: families, ParameterSize: raw.details.parameter, Quantization: raw.details.quantization}, nil
+}
+
+func canonicalModelName(value string) (string, bool) {
+	if len(value) < 1 || len(value) > maximumModelNameLength || strings.TrimSpace(value) != value {
+		return "", false
+	}
+	for _, character := range value {
+		if character > 0x7e || character < 0x21 || strings.ContainsRune("?#\\%", character) || !(character >= 'a' && character <= 'z' || character >= 'A' && character <= 'Z' || character >= '0' && character <= '9' || strings.ContainsRune("._-/:@", character)) {
+			return "", false
+		}
+	}
+	for _, segment := range strings.Split(value, "/") {
+		if segment == "" || segment == "." || segment == ".." || strings.HasPrefix(segment, ".") || strings.HasSuffix(segment, ".") {
+			return "", false
+		}
+	}
+	if strings.Count(value, "@") > 1 {
+		return "", false
+	}
+	if at := strings.IndexByte(value, '@'); at >= 0 {
+		if at == 0 || !strings.HasPrefix(strings.ToLower(value[at+1:]), "sha256:") || !digestPattern.MatchString(value[at+8:]) {
+			return "", false
+		}
+	}
+	return strings.ToLower(value), true
+}
+func validMetadata(value string) bool {
+	return len(value) >= 1 && len(value) <= maximumMetadataLength && strings.TrimSpace(value) == value && metadataPattern.MatchString(value)
 }
