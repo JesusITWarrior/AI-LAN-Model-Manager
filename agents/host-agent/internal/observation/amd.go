@@ -8,7 +8,6 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
-	"io"
 	"os/exec"
 	"path/filepath"
 	"sort"
@@ -123,13 +122,6 @@ func parseAMDJSON(output []byte) ([]AcceleratorObservation, error) {
 		observations = append(observations, value)
 	}
 	return observations, nil
-}
-func ensureJSONEnd(decoder *json.Decoder) error {
-	var extra any
-	if err := decoder.Decode(&extra); errors.Is(err, io.EOF) {
-		return nil
-	}
-	return ErrAcceleratorProbe
 }
 func amdCardIndex(key string) (string, bool) {
 	lower := strings.ToLower(strings.TrimSpace(key))

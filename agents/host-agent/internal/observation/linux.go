@@ -163,24 +163,6 @@ func (o *LinuxObserver) readMemory() (ResourceQuantity, error) {
 	return result, nil
 }
 
-func add3(a, b, c uint64) (uint64, bool) {
-	if a > math.MaxUint64-b {
-		return 0, true
-	}
-	sum := a + b
-	if sum > math.MaxUint64-c {
-		return 0, true
-	}
-	return sum + c, false
-}
-
-func multiply(a, b uint64) (uint64, bool) {
-	if a != 0 && b > math.MaxUint64/a {
-		return 0, true
-	}
-	return a * b, false
-}
-
 func (o *LinuxObserver) readStorage() (ResourceQuantity, error) {
 	var stat syscall.Statfs_t
 	if err := o.deps.statFS(o.config.StoragePath, &stat); err != nil {
