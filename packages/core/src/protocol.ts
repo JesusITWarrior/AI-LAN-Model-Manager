@@ -523,6 +523,8 @@ const ERR_ENVELOPE_REQUEST_ID = "ERR_ENVELOPE_REQUEST_ID";
 const ERR_ENVELOPE_CORRELATION_ID = "ERR_ENVELOPE_CORRELATION_ID";
 const ERR_ENVELOPE_SENT_AT = "ERR_ENVELOPE_SENT_AT";
 const ERR_ENVELOPE_PAYLOAD = "ERR_ENVELOPE_PAYLOAD";
+const ERR_ENVELOPE_OK = "ERR_ENVELOPE_OK";
+const ERR_ENVELOPE_RESULT = "ERR_ENVELOPE_RESULT";
 
 export function parseProtocolMessageType(input: unknown): ParseResult<ProtocolMessageType> {
   if (typeof input !== "string") return { ok: false, error: ERR_INVALID_TYPE };
@@ -539,6 +541,15 @@ export interface ProtocolRequest<T extends JsonValue = JsonValue> {
   readonly correlationId?: CorrelationId;
   readonly sentAt: UtcTimestamp;
   readonly payload: T;
+}
+
+export interface ProtocolSuccessResponse<T extends JsonValue = JsonValue> {
+  readonly protocolVersion: ProtocolVersion;
+  readonly messageType: ProtocolMessageType;
+  readonly requestId: RequestId;
+  readonly sentAt: UtcTimestamp;
+  readonly ok: true;
+  readonly result: T;
 }
 
 function requestDescriptors(input: unknown): ParseResult<Record<string, PropertyDescriptor>> {
@@ -600,4 +611,73 @@ export function parseProtocolRequest(input: unknown): ParseResult<ProtocolReques
   output.sentAt = sentAt.value;
   output.payload = payload.value;
   return { ok: true, value: Object.freeze(output) as unknown as ProtocolRequest };
+}
+
+// ---------------------------------------------------------------------------
+// Strict success responses
+// ---------------------------------------------------------------------------
+
+const SUCCESS_RESPONSE_REQUIRED_KEYS = Object.freeze([
+  "protocolVersion", "messageType", "requestId", "sentAt", "ok", "result",
+] as const);
+
+function successResponseDescriptors(input: unknown): ParseResult<Record<string, PropertyDescriptor>> {
+  if (typeof input !== "object" || input === null) return { ok: false, error: ERR_ENVELOPE };
+  try {
+    if (Array.isArray(input)) return { ok: false, error: ERR_ENVELOPE };
+    const prototype = Object.getPrototypeOf(input);
+    if (prototype !== Object.prototype && prototype !== null) {
+      return { ok: false, error: ERR_ENVELOPE };
+    }
+    const keys = Reflect.ownKeys(input);
+    if (keys.some((key) => typeof key !== "string" || !SUCCESS_RESPONSE_REQUIRED_KEYS.includes(key as (typeof SUCCESS_RESPONSE_REQUIRED_KEYS)[number]))) {
+      return { ok: false, error: ERR_ENVELOPE };
+    }
+    if (!SUCCESS_RESPONSE_REQUIRED_KEYS.every((key) => keys.includes(key))) {
+      return { ok: false, error: ERR_ENVELOPE };
+    }
+    const descriptors = Object.getOwnPropertyDescriptors(input);
+    if (keys.some((key) => typeof key !== "string" || !descriptors[key] || !("value" in descriptors[key]))) {
+      return { ok: false, error: ERR_ENVELOPE };
+    }
+    return { ok: true, value: descriptors };
+  } catch {
+    return { ok: false, error: ERR_ENVELOPE };
+  }
+}
+
+/** Parse, detach, and freeze a strict protocol success response. */
+export function parseProtocolSuccessResponse(input: unknown): ParseResult<ProtocolSuccessResponse> {
+  const parsedDescriptors = successResponseDescriptors(input);
+  if (!parsedDescriptors.ok) return parsedDescriptors;
+  const descriptors = parsedDescriptors.value;
+
+  const version = parseProtocolVersion(descriptors.protocolVersion?.value as unknown);
+  if (!version.ok || !isProtocolVersionCompatible(CURRENT_PROTOCOL_VERSION, version.value)) {
+    return { ok: false, error: ERR_ENVELOPE_VERSION };
+  }
+  const messageType = parseProtocolMessageType(descriptors.messageType?.value as unknown);
+  if (!messageType.ok) return { ok: false, error: ERR_ENVELOPE_MESSAGE_TYPE };
+  const requestId = parseProtocolId("request", descriptors.requestId?.value as unknown);
+  if (!requestId.ok) return { ok: false, error: ERR_ENVELOPE_REQUEST_ID };
+  const sentAt = parseUtcTimestamp(descriptors.sentAt?.value as unknown);
+  if (!sentAt.ok) return { ok: false, error: ERR_ENVELOPE_SENT_AT };
+
+  // ok must be literal boolean true — no coercion.
+  const okValue = descriptors.ok?.value;
+  if (typeof okValue !== "boolean" || okValue !== true) {
+    return { ok: false, error: ERR_ENVELOPE_OK };
+  }
+
+  const result = parseJsonValue(descriptors.result?.value as unknown);
+  if (!result.ok) return { ok: false, error: ERR_ENVELOPE_RESULT };
+
+  const output = Object.create(null) as Record<string, unknown>;
+  output.protocolVersion = version.value;
+  output.messageType = messageType.value;
+  output.requestId = requestId.value;
+  output.sentAt = sentAt.value;
+  output.ok = true;
+  output.result = result.value;
+  return { ok: true, value: Object.freeze(output) as unknown as ProtocolSuccessResponse };
 }

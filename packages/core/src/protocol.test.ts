@@ -9,6 +9,7 @@ import {
   parseProtocolId,
   parseProtocolVersion,
   parseUtcTimestamp,
+  parseProtocolSuccessResponse,
 } from "./protocol.js";
 
 test("current version is a frozen { major: 1, minor: 0 }", () => {
@@ -1006,4 +1007,171 @@ test("returns a detached deeply frozen null-prototype request", () => {
   assert.equal(frozenPayload.model, "example");
   assert.deepStrictEqual(frozenPayload.options, [1, true]);
   assert.equal(Object.prototype.hasOwnProperty.call(result.value, "correlationId"), false);
+});
+
+// --- parseProtocolSuccessResponse ---------------------------------------------
+
+const validSuccess = () => ({
+  protocolVersion: { major: 1, minor: 0 },
+  messageType: "model.load",
+  requestId: "request-1",
+  sentAt: "2026-09-26T08:00:00.000Z",
+  ok: true,
+  result: { data: "hello" },
+});
+
+test("accepts valid plain Object.prototype success response with result", () => {
+  const input = validSuccess();
+  assert.doesNotThrow(() => parseProtocolSuccessResponse(input));
+  const result = parseProtocolSuccessResponse(input);
+  assert.equal(result.ok, true);
+  if (!result.ok) return;
+  assert.deepStrictEqual(result.value.protocolVersion, { major: 1, minor: 0 });
+  assert.equal(result.value.messageType, "model.load");
+  assert.equal(result.value.requestId, "request-1");
+  assert.equal(result.value.sentAt, "2026-09-26T08:00:00.000Z");
+  assert.equal(result.value.ok, true);
+  // result has null prototype (from parseJsonValue), so compare values directly
+  const parsedResult = result.value.result as Record<string, unknown>;
+  assert.equal(Object.getPrototypeOf(parsedResult), null);
+  assert.deepStrictEqual(Reflect.ownKeys(parsedResult), ["data"]);
+  assert.strictEqual(parsedResult.data, "hello");
+});
+
+test("accepts valid null-prototype root success response", () => {
+  const input = Object.assign(Object.create(null), validSuccess());
+  const result = parseProtocolSuccessResponse(input);
+  assert.equal(result.ok, true);
+  if (!result.ok) return;
+  assert.deepStrictEqual(result.value.protocolVersion, { major: 1, minor: 0 });
+});
+
+test("rejects null input with ERR_ENVELOPE", () => {
+  assert.deepStrictEqual(parseProtocolSuccessResponse(null), { ok: false, error: "ERR_ENVELOPE" });
+});
+
+test("rejects array input with ERR_ENVELOPE", () => {
+  assert.deepStrictEqual(parseProtocolSuccessResponse([1]), { ok: false, error: "ERR_ENVELOPE" });
+});
+
+test("rejects primitive inputs (string/number/boolean) with ERR_ENVELOPE", () => {
+  assert.deepStrictEqual(parseProtocolSuccessResponse("request"), { ok: false, error: "ERR_ENVELOPE" });
+  assert.deepStrictEqual(parseProtocolSuccessResponse(123), { ok: false, error: "ERR_ENVELOPE" });
+  assert.deepStrictEqual(parseProtocolSuccessResponse(false), { ok: false, error: "ERR_ENVELOPE" });
+});
+
+test("rejects custom prototype objects with ERR_ENVELOPE", () => {
+  const obj = Object.create({ inherited: true }) as Record<string, unknown>;
+  Object.assign(obj, validSuccess());
+  assert.deepStrictEqual(parseProtocolSuccessResponse(obj), { ok: false, error: "ERR_ENVELOPE" });
+});
+
+test("rejects extra unknown keys with ERR_ENVELOPE", () => {
+  const input = { ...validSuccess(), extraKey: true };
+  assert.deepStrictEqual(parseProtocolSuccessResponse(input), { ok: false, error: "ERR_ENVELOPE" });
+});
+
+test("rejects symbol-keyed own properties with ERR_ENVELOPE", () => {
+  const sym = Symbol("extra");
+  const input = validSuccess();
+  Object.defineProperty(input, sym, { value: true });
+  assert.deepStrictEqual(parseProtocolSuccessResponse(input), { ok: false, error: "ERR_ENVELOPE" });
+});
+
+test("rejects missing required keys with ERR_ENVELOPE", () => {
+  const input = validSuccess();
+  delete (input as Partial<typeof input>).ok;
+  assert.deepStrictEqual(parseProtocolSuccessResponse(input), { ok: false, error: "ERR_ENVELOPE" });
+});
+
+test("rejects success-response accessors without invoking them", () => {
+  let invoked = false;
+  const input = validSuccess();
+  Object.defineProperty(input, "result", {
+    get() {
+      invoked = true;
+      throw new Error("must not run");
+    },
+  });
+  assert.deepStrictEqual(parseProtocolSuccessResponse(input), {
+    ok: false,
+    error: "ERR_ENVELOPE",
+  });
+  assert.equal(invoked, false);
+});
+
+test("rejects incompatible protocol version with ERR_ENVELOPE_VERSION", () => {
+  const input: Record<string, unknown> = validSuccess();
+  input.protocolVersion = { major: 2, minor: 0 };
+  assert.deepStrictEqual(parseProtocolSuccessResponse(input), { ok: false, error: "ERR_ENVELOPE_VERSION" });
+});
+
+test("rejects invalid messageType with ERR_ENVELOPE_MESSAGE_TYPE", () => {
+  const input: Record<string, unknown> = validSuccess();
+  input.messageType = "bad type";
+  assert.deepStrictEqual(parseProtocolSuccessResponse(input), { ok: false, error: "ERR_ENVELOPE_MESSAGE_TYPE" });
+});
+
+test("rejects invalid requestId with ERR_ENVELOPE_REQUEST_ID", () => {
+  const input: Record<string, unknown> = validSuccess();
+  input.requestId = "bad/id";
+  assert.deepStrictEqual(parseProtocolSuccessResponse(input), { ok: false, error: "ERR_ENVELOPE_REQUEST_ID" });
+});
+
+test("rejects invalid sentAt with ERR_ENVELOPE_SENT_AT", () => {
+  const input: Record<string, unknown> = validSuccess();
+  input.sentAt = "not-a-time";
+  assert.deepStrictEqual(parseProtocolSuccessResponse(input), { ok: false, error: "ERR_ENVELOPE_SENT_AT" });
+});
+
+test("rejects invalid result with ERR_ENVELOPE_RESULT", () => {
+  const input: Record<string, unknown> = validSuccess();
+  input.result = undefined;
+  assert.deepStrictEqual(parseProtocolSuccessResponse(input), { ok: false, error: "ERR_ENVELOPE_RESULT" });
+});
+
+test("rejects ok:false with ERR_ENVELOPE_OK", () => {
+  const input: Record<string, unknown> = validSuccess();
+  input.ok = false;
+  assert.deepStrictEqual(parseProtocolSuccessResponse(input), { ok: false, error: "ERR_ENVELOPE_OK" });
+});
+
+test("rejects truthy non-boolean ok with ERR_ENVELOPE_OK", () => {
+  const input1: Record<string, unknown> = validSuccess();
+  input1.ok = 1;
+  assert.deepStrictEqual(parseProtocolSuccessResponse(input1), { ok: false, error: "ERR_ENVELOPE_OK" });
+
+  const input2: Record<string, unknown> = validSuccess();
+  input2.ok = "true";
+  assert.deepStrictEqual(parseProtocolSuccessResponse(input2), { ok: false, error: "ERR_ENVELOPE_OK" });
+});
+
+test("returns detached frozen null-prototype output", () => {
+  const input = validSuccess();
+  const result = parseProtocolSuccessResponse(input);
+  assert.equal(result.ok, true);
+  if (!result.ok) return;
+  assert.equal(Object.getPrototypeOf(result.value), null);
+  assert.equal(Object.isFrozen(result.value), true);
+  assert.equal(Object.isFrozen(result.value.result), true);
+});
+
+test("resists input mutation after parse", () => {
+  const input = validSuccess();
+  const result = parseProtocolSuccessResponse(input);
+  assert.equal(result.ok, true);
+  if (!result.ok) return;
+  input.result.data = "changed";
+  input.protocolVersion.major = 99;
+  assert.deepStrictEqual((result.value.result as Record<string, string>).data, "hello");
+});
+
+test("never throws for hostile inputs", () => {
+  const hostileProxy = new Proxy({}, { ownKeys() { throw new Error("hostile"); } });
+  assert.doesNotThrow(() => parseProtocolSuccessResponse(hostileProxy));
+  assert.deepStrictEqual(parseProtocolSuccessResponse(hostileProxy), { ok: false, error: "ERR_ENVELOPE" });
+
+  const revoked = Proxy.revocable(validSuccess(), {});
+  revoked.revoke();
+  assert.doesNotThrow(() => parseProtocolSuccessResponse(revoked.proxy));
 });
