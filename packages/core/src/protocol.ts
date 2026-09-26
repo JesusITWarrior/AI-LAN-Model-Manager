@@ -28,6 +28,7 @@ const ERR_INVALID_LENGTH = "ERR_INVALID_LENGTH";
 const ERR_INVALID_FORMAT = "ERR_INVALID_FORMAT";
 
 const ID_PATTERN = /^[A-Za-z0-9][A-Za-z0-9._:-]*$/;
+const UTC_TIMESTAMP_PATTERN = /^[0-9]{4}-[0-9]{2}-[0-9]{2}T[0-9]{2}:[0-9]{2}:[0-9]{2}\.[0-9]{3}Z$/;
 
 /**
  * Parse an unknown value into a {@link ProtocolVersion}.
@@ -175,4 +176,46 @@ export function parseProtocolId<K extends IdKind>(
     return { ok: false, error: ERR_INVALID_FORMAT };
   }
   return { ok: true, value: input as unknown as KindToId<K> };
+}
+
+// ---------------------------------------------------------------------------
+// Branded opaque UTC timestamps
+// ---------------------------------------------------------------------------
+
+declare const brandUtcTimestamp: unique symbol;
+
+/** Opaque UTC timestamp: exactly `YYYY-MM-DDTHH:mm:ss.sssZ` that round-trips through Date. */
+export type UtcTimestamp = string & { readonly __brand: typeof brandUtcTimestamp };
+
+/**
+ * Parse an unknown value into a {@link UtcTimestamp}.
+ *
+ * Accepts ONLY strings matching exactly `^\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}\.\d{3}Z$`
+ * AND for which `new Date(input)` is valid (not NaN) AND `.toISOString() === input`.
+ * This four-step gate rejects: non-strings, wrong format, invalid calendar dates, timezone
+ * offsets, missing/short/long ms digits, lowercase t/z, date-only values, whitespace,
+ * expanded/signed years, null/number/object inputs. No trim/coercion. Never throws.
+ */
+export function parseUtcTimestamp(input: unknown): ParseResult<UtcTimestamp> {
+  if (typeof input !== "string") {
+    return { ok: false, error: ERR_INVALID_TYPE };
+  }
+
+  // Step 1: exact ASCII format — four-digit year, T separator, three ms digits, Z suffix.
+  if (!UTC_TIMESTAMP_PATTERN.test(input)) {
+    return { ok: false, error: ERR_INVALID_FORMAT };
+  }
+
+  // Step 2: construct Date — must not be NaN.
+  const date = new Date(input);
+  if (Number.isNaN(date.getTime())) {
+    return { ok: false, error: ERR_OUT_OF_RANGE };
+  }
+
+  // Step 3: round-trip through toISOString must equal the original input exactly.
+  if (date.toISOString() !== input) {
+    return { ok: false, error: ERR_INVALID_FORMAT };
+  }
+
+  return { ok: true, value: input as unknown as UtcTimestamp };
 }

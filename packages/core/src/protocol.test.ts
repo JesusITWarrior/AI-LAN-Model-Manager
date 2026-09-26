@@ -5,6 +5,7 @@ import {
   isProtocolVersionCompatible,
   parseProtocolId,
   parseProtocolVersion,
+  parseUtcTimestamp,
 } from "./protocol.js";
 
 test("current version is a frozen { major: 1, minor: 0 }", () => {
@@ -343,4 +344,122 @@ test("returns a validation failure when proxy reflection throws", () => {
     ok: false,
     error: "ERR_INVALID_TYPE",
   });
+});
+
+// --- parseUtcTimestamp ------------------------------------------------------
+
+test("accepts a standard valid timestamp", () => {
+  assert.deepStrictEqual(parseUtcTimestamp("2024-01-15T12:30:45.123Z"), {
+    ok: true,
+    value: "2024-01-15T12:30:45.123Z",
+  });
+});
+
+test("accepts leap day Feb 29 on a leap year (round-trips)", () => {
+  assert.deepStrictEqual(parseUtcTimestamp("2024-02-29T00:00:00.000Z"), {
+    ok: true,
+    value: "2024-02-29T00:00:00.000Z",
+  });
+});
+
+test("accepts year 0000 if JS round-trips it", () => {
+  const result = parseUtcTimestamp("0000-01-01T00:00:00.000Z");
+  assert.equal(result.ok, true);
+});
+
+test("accepts year 9999 if JS round-trips it", () => {
+  const result = parseUtcTimestamp("9999-12-31T23:59:59.999Z");
+  assert.equal(result.ok, true);
+});
+
+test("rejects invalid leap day Feb 30 (non-existent date)", () => {
+  const result = parseUtcTimestamp("2024-02-30T00:00:00.000Z");
+  assert.equal(result.ok, false);
+});
+
+test("rejects rollover month 13", () => {
+  const result = parseUtcTimestamp("2024-13-01T00:00:00.000Z");
+  assert.equal(result.ok, false);
+});
+
+test("rejects timezone offset +05:00 instead of Z", () => {
+  const result = parseUtcTimestamp("2024-01-15T12:30:45.123+05:00");
+  assert.equal(result.ok, false);
+});
+
+test("rejects missing milliseconds (no dot)", () => {
+  const result = parseUtcTimestamp("2024-01-15T12:30:45Z");
+  assert.equal(result.ok, false);
+});
+
+test("rejects short millisecond count (two digits)", () => {
+  const result = parseUtcTimestamp("2024-01-15T12:30:45.12Z");
+  assert.equal(result.ok, false);
+});
+
+test("rejects long millisecond count (four digits)", () => {
+  const result = parseUtcTimestamp("2024-01-15T12:30:45.1234Z");
+  assert.equal(result.ok, false);
+});
+
+test("rejects lowercase t separator", () => {
+  const result = parseUtcTimestamp("2024-01-15t12:30:45.123Z");
+  assert.equal(result.ok, false);
+});
+
+test("rejects lowercase z suffix", () => {
+  const result = parseUtcTimestamp("2024-01-15T12:30:45.123z");
+  assert.equal(result.ok, false);
+});
+
+test("rejects date-only value (no time)", () => {
+  const result = parseUtcTimestamp("2024-01-15");
+  assert.equal(result.ok, false);
+});
+
+test("rejects leading whitespace", () => {
+  const result = parseUtcTimestamp(" 2024-01-15T12:30:45.123Z");
+  assert.equal(result.ok, false);
+});
+
+test("rejects trailing whitespace", () => {
+  const result = parseUtcTimestamp("2024-01-15T12:30:45.123Z ");
+  assert.equal(result.ok, false);
+});
+
+test("rejects expanded year (five digits)", () => {
+  const result = parseUtcTimestamp("00000-01-15T12:30:45.123Z");
+  assert.equal(result.ok, false);
+});
+
+test("rejects signed year +2024", () => {
+  const result = parseUtcTimestamp("+2024-01-15T12:30:45.123Z");
+  assert.equal(result.ok, false);
+});
+
+test("rejects null input", () => {
+  const result = parseUtcTimestamp(null);
+  assert.deepStrictEqual(result, { ok: false, error: "ERR_INVALID_TYPE" });
+});
+
+test("rejects number input", () => {
+  const result = parseUtcTimestamp(12345);
+  assert.deepStrictEqual(result, { ok: false, error: "ERR_INVALID_TYPE" });
+});
+
+test("rejects object input", () => {
+  const result = parseUtcTimestamp({});
+  assert.deepStrictEqual(result, { ok: false, error: "ERR_INVALID_TYPE" });
+});
+
+test("never throws for any unknown input", () => {
+  const inputs: unknown[] = [null, undefined, 0, -1, NaN, Infinity, true, [], {}, function () {}];
+  for (const inp of inputs) {
+    assert.doesNotThrow(() => parseUtcTimestamp(inp));
+  }
+});
+
+test("rejects Feb 29 on non-leap year", () => {
+  const result = parseUtcTimestamp("2023-02-29T00:00:00.000Z");
+  assert.equal(result.ok, false);
 });
