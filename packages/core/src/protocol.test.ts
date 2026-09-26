@@ -3,6 +3,7 @@ import test from "node:test";
 import {
   CURRENT_PROTOCOL_VERSION,
   isProtocolVersionCompatible,
+  parseJsonValue,
   parseProtocolId,
   parseProtocolVersion,
   parseUtcTimestamp,
@@ -462,4 +463,232 @@ test("never throws for any unknown input", () => {
 test("rejects Feb 29 on non-leap year", () => {
   const result = parseUtcTimestamp("2023-02-29T00:00:00.000Z");
   assert.equal(result.ok, false);
+});
+
+// --- parseJsonValue: primitives and arrays ---------------------------------
+
+const jsonLimits = (overrides: Partial<{
+  maxDepth: number;
+  maxNodes: number;
+  maxObjectKeys: number;
+  maxArrayLength: number;
+  maxStringLength: number;
+}> = {}) => ({
+  maxDepth: 8,
+  maxNodes: 1024,
+  maxObjectKeys: 128,
+  maxArrayLength: 256,
+  maxStringLength: 4096,
+  ...overrides,
+});
+
+test("accepts JSON primitives and nested dense arrays", () => {
+  for (const value of [null, true, false, 0, -1.5, "text"] as const) {
+    assert.deepStrictEqual(parseJsonValue(value), { ok: true, value });
+  }
+  assert.deepStrictEqual(parseJsonValue([null, true, 1, "x", [2]]), {
+    ok: true,
+    value: [null, true, 1, "x", [2]],
+  });
+});
+
+test("rejects non-finite numbers and unsupported values", () => {
+  for (const value of [NaN, Infinity, -Infinity]) {
+    assert.deepStrictEqual(parseJsonValue(value), { ok: false, error: "ERR_NON_FINITE" });
+  }
+  for (const value of [undefined, 1n, Symbol("x"), () => undefined]) {
+    assert.deepStrictEqual(parseJsonValue(value), { ok: false, error: "ERR_INVALID_TYPE" });
+  }
+  assert.deepStrictEqual(parseJsonValue({ value: 1 }), {
+    ok: false,
+    error: "ERR_UNSUPPORTED_TYPE",
+  });
+});
+
+test("enforces exact string and array length boundaries", () => {
+  const limits = jsonLimits({ maxStringLength: 3, maxArrayLength: 2 });
+  assert.equal(parseJsonValue("abc", limits).ok, true);
+  assert.deepStrictEqual(parseJsonValue("abcd", limits), {
+    ok: false,
+    error: "ERR_LIMIT_EXCEEDED",
+  });
+  assert.equal(parseJsonValue([1, 2], limits).ok, true);
+  assert.deepStrictEqual(parseJsonValue([1, 2, 3], limits), {
+    ok: false,
+    error: "ERR_LIMIT_EXCEEDED",
+  });
+});
+
+test("counts root depth and nodes without off-by-one errors", () => {
+  assert.equal(parseJsonValue([[]], jsonLimits({ maxDepth: 1 })).ok, true);
+  assert.deepStrictEqual(parseJsonValue([[[]]], jsonLimits({ maxDepth: 1 })), {
+    ok: false,
+    error: "ERR_LIMIT_EXCEEDED",
+  });
+  assert.equal(parseJsonValue([1, 2], jsonLimits({ maxNodes: 3 })).ok, true);
+  assert.deepStrictEqual(parseJsonValue([1, 2], jsonLimits({ maxNodes: 2 })), {
+    ok: false,
+    error: "ERR_LIMIT_EXCEEDED",
+  });
+});
+
+test("rejects sparse arrays and extra string or symbol properties", () => {
+  const sparse = new Array(2);
+  sparse[0] = 1;
+  assert.deepStrictEqual(parseJsonValue(sparse), {
+    ok: false,
+    error: "ERR_INVALID_STRUCTURE",
+  });
+
+  const withExtra: unknown[] & { note?: string } = [1];
+  withExtra.note = "no";
+  assert.deepStrictEqual(parseJsonValue(withExtra), {
+    ok: false,
+    error: "ERR_INVALID_STRUCTURE",
+  });
+
+  const withSymbol: unknown[] = [1];
+  Object.defineProperty(withSymbol, Symbol("extra"), { value: true });
+  assert.deepStrictEqual(parseJsonValue(withSymbol), {
+    ok: false,
+    error: "ERR_INVALID_STRUCTURE",
+  });
+});
+
+test("rejects array accessors without invoking them", () => {
+  let invoked = false;
+  const value: unknown[] = [];
+  Object.defineProperty(value, "0", {
+    enumerable: true,
+    configurable: true,
+    get() {
+      invoked = true;
+      throw new Error("must not run");
+    },
+  });
+  Object.defineProperty(value, "length", { value: 1 });
+  assert.deepStrictEqual(parseJsonValue(value), {
+    ok: false,
+    error: "ERR_INVALID_STRUCTURE",
+  });
+  assert.equal(invoked, false);
+});
+
+test("rejects cycles and shared array references", () => {
+  const cyclic: unknown[] = [];
+  cyclic.push(cyclic);
+  assert.deepStrictEqual(parseJsonValue(cyclic), {
+    ok: false,
+    error: "ERR_INVALID_STRUCTURE",
+  });
+
+  const shared: unknown[] = [1];
+  assert.deepStrictEqual(parseJsonValue([shared, shared]), {
+    ok: false,
+    error: "ERR_INVALID_STRUCTURE",
+  });
+});
+
+test("returns a detached and deeply frozen array", () => {
+  const child: unknown[] = [1];
+  const input: unknown[] = [child];
+  const result = parseJsonValue(input);
+  assert.equal(result.ok, true);
+  if (!result.ok) return;
+  assert.equal(Object.isFrozen(result.value), true);
+  assert.equal(Array.isArray(result.value), true);
+  const outputChild = (result.value as readonly unknown[])[0];
+  assert.equal(Object.isFrozen(outputChild), true);
+  child[0] = 9;
+  input.push(2);
+  assert.deepStrictEqual(result.value, [[1]]);
+});
+
+test("accepts exact complete limit objects with plain or null prototypes", () => {
+  assert.equal(parseJsonValue([1], jsonLimits()).ok, true);
+  const nullPrototype = Object.assign(Object.create(null), jsonLimits());
+  assert.equal(parseJsonValue([1], nullPrototype).ok, true);
+});
+
+test("rejects malformed limit objects", () => {
+  const malformed: unknown[] = [
+    null,
+    {},
+    { ...jsonLimits(), extra: 1 },
+    { ...jsonLimits(), maxDepth: 0 },
+    { ...jsonLimits(), maxDepth: 1.5 },
+    { ...jsonLimits(), maxNodes: Number.MAX_SAFE_INTEGER + 1 },
+    { ...jsonLimits(), maxDepth: 65 },
+    Object.assign(Object.create({ inherited: true }), jsonLimits()),
+  ];
+  for (const limits of malformed) {
+    assert.deepStrictEqual(parseJsonValue([1], limits), {
+      ok: false,
+      error: "ERR_INVALID_LIMITS",
+    });
+  }
+
+  const symbolLimits = { ...jsonLimits(), [Symbol("extra")]: 1 };
+  assert.deepStrictEqual(parseJsonValue([1], symbolLimits), {
+    ok: false,
+    error: "ERR_INVALID_LIMITS",
+  });
+});
+
+test("rejects limit accessors and hostile proxies without throwing", () => {
+  let invoked = false;
+  const accessorLimits = {
+    ...jsonLimits(),
+    get maxDepth() {
+      invoked = true;
+      throw new Error("must not run");
+    },
+  };
+  assert.deepStrictEqual(parseJsonValue([1], accessorLimits), {
+    ok: false,
+    error: "ERR_INVALID_LIMITS",
+  });
+  assert.equal(invoked, false);
+
+  const proxy = new Proxy({}, {
+    getPrototypeOf() {
+      throw new Error("hostile proxy");
+    },
+  });
+  assert.doesNotThrow(() => parseJsonValue([1], proxy));
+  assert.deepStrictEqual(parseJsonValue([1], proxy), {
+    ok: false,
+    error: "ERR_INVALID_LIMITS",
+  });
+});
+
+test("returns a validation failure for hostile array reflection", () => {
+  const proxy = new Proxy([], {
+    ownKeys() {
+      throw new Error("hostile proxy");
+    },
+  });
+  assert.doesNotThrow(() => parseJsonValue(proxy));
+  assert.deepStrictEqual(parseJsonValue(proxy), {
+    ok: false,
+    error: "ERR_INVALID_STRUCTURE",
+  });
+});
+
+test("does not throw for revoked value or limits proxies", () => {
+  const valueProxy = Proxy.revocable([], {});
+  valueProxy.revoke();
+  assert.doesNotThrow(() => parseJsonValue(valueProxy.proxy));
+  assert.deepStrictEqual(parseJsonValue(valueProxy.proxy), {
+    ok: false,
+    error: "ERR_INVALID_STRUCTURE",
+  });
+
+  const limitsProxy = Proxy.revocable(jsonLimits(), {});
+  limitsProxy.revoke();
+  assert.doesNotThrow(() => parseJsonValue([], limitsProxy.proxy));
+  assert.deepStrictEqual(parseJsonValue([], limitsProxy.proxy), {
+    ok: false,
+    error: "ERR_INVALID_LIMITS",
+  });
 });

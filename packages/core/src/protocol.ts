@@ -26,6 +26,7 @@ const ERR_NEGATIVE_VALUE = "ERR_NEGATIVE_VALUE";
 const ERR_OUT_OF_RANGE = "ERR_OUT_OF_RANGE";
 const ERR_INVALID_LENGTH = "ERR_INVALID_LENGTH";
 const ERR_INVALID_FORMAT = "ERR_INVALID_FORMAT";
+const ERR_UNSUPPORTED_TYPE = "ERR_UNSUPPORTED_TYPE";
 
 const ID_PATTERN = /^[A-Za-z0-9][A-Za-z0-9._:-]*$/;
 const UTC_TIMESTAMP_PATTERN = /^[0-9]{4}-[0-9]{2}-[0-9]{2}T[0-9]{2}:[0-9]{2}:[0-9]{2}\.[0-9]{3}Z$/;
@@ -218,4 +219,203 @@ export function parseUtcTimestamp(input: unknown): ParseResult<UtcTimestamp> {
   }
 
   return { ok: true, value: input as unknown as UtcTimestamp };
+}
+
+// ---------------------------------------------------------------------------
+// Bounded JSON values
+// ---------------------------------------------------------------------------
+
+export type JsonPrimitive = null | boolean | number | string;
+export type JsonArray = readonly JsonValue[];
+export type JsonObject = { readonly [key: string]: JsonValue };
+export type JsonValue = JsonPrimitive | JsonArray | JsonObject;
+
+export interface JsonValueLimits {
+  readonly maxDepth: number;
+  readonly maxNodes: number;
+  readonly maxObjectKeys: number;
+  readonly maxArrayLength: number;
+  readonly maxStringLength: number;
+}
+
+const DEFAULT_JSON_LIMITS: JsonValueLimits = Object.freeze({
+  maxDepth: 8,
+  maxNodes: 1024,
+  maxObjectKeys: 128,
+  maxArrayLength: 256,
+  maxStringLength: 4096,
+});
+
+const JSON_LIMIT_CAPS: JsonValueLimits = Object.freeze({
+  maxDepth: 64,
+  maxNodes: 100_000,
+  maxObjectKeys: 10_000,
+  maxArrayLength: 10_000,
+  maxStringLength: 1_000_000,
+});
+
+const JSON_LIMIT_KEYS = Object.freeze([
+  "maxDepth",
+  "maxNodes",
+  "maxObjectKeys",
+  "maxArrayLength",
+  "maxStringLength",
+] as const);
+
+const ERR_INVALID_LIMITS = "ERR_INVALID_LIMITS";
+const ERR_LIMIT_EXCEEDED = "ERR_LIMIT_EXCEEDED";
+const ERR_INVALID_STRUCTURE = "ERR_INVALID_STRUCTURE";
+
+type JsonParseInternal =
+  | { readonly ok: true; readonly value: JsonValue }
+  | { readonly ok: false; readonly error: string };
+
+function safelyDetectArray(input: unknown): boolean | null {
+  try {
+    return Array.isArray(input);
+  } catch {
+    return null;
+  }
+}
+
+function parseJsonLimits(input: unknown): ParseResult<JsonValueLimits> {
+  if (input === undefined) {
+    return { ok: true, value: DEFAULT_JSON_LIMITS };
+  }
+  const isArray = safelyDetectArray(input);
+  if (isArray === null || typeof input !== "object" || input === null || isArray) {
+    return { ok: false, error: ERR_INVALID_LIMITS };
+  }
+
+  try {
+    const prototype = Object.getPrototypeOf(input);
+    if (prototype !== Object.prototype && prototype !== null) {
+      return { ok: false, error: ERR_INVALID_LIMITS };
+    }
+    const keys = Reflect.ownKeys(input);
+    if (
+      keys.length !== JSON_LIMIT_KEYS.length ||
+      keys.some((key) => typeof key !== "string" || !JSON_LIMIT_KEYS.includes(key as (typeof JSON_LIMIT_KEYS)[number]))
+    ) {
+      return { ok: false, error: ERR_INVALID_LIMITS };
+    }
+
+    const descriptors = Object.getOwnPropertyDescriptors(input);
+    const parsed: Record<(typeof JSON_LIMIT_KEYS)[number], number> = {
+      maxDepth: 0,
+      maxNodes: 0,
+      maxObjectKeys: 0,
+      maxArrayLength: 0,
+      maxStringLength: 0,
+    };
+    for (const key of JSON_LIMIT_KEYS) {
+      const descriptor = descriptors[key];
+      if (!descriptor || !("value" in descriptor)) {
+        return { ok: false, error: ERR_INVALID_LIMITS };
+      }
+      const value = descriptor.value as unknown;
+      if (
+        typeof value !== "number" ||
+        !Number.isSafeInteger(value) ||
+        value <= 0 ||
+        value > JSON_LIMIT_CAPS[key]
+      ) {
+        return { ok: false, error: ERR_INVALID_LIMITS };
+      }
+      parsed[key] = value;
+    }
+    return { ok: true, value: Object.freeze(parsed) };
+  } catch {
+    return { ok: false, error: ERR_INVALID_LIMITS };
+  }
+}
+
+interface JsonParseContext {
+  readonly limits: JsonValueLimits;
+  readonly seen: WeakSet<object>;
+  nodes: number;
+}
+
+function parseJsonNode(input: unknown, depth: number, context: JsonParseContext): JsonParseInternal {
+  if (depth > context.limits.maxDepth) {
+    return { ok: false, error: ERR_LIMIT_EXCEEDED };
+  }
+  context.nodes += 1;
+  if (context.nodes > context.limits.maxNodes) {
+    return { ok: false, error: ERR_LIMIT_EXCEEDED };
+  }
+
+  if (input === null || typeof input === "boolean") {
+    return { ok: true, value: input };
+  }
+  if (typeof input === "number") {
+    return Number.isFinite(input)
+      ? { ok: true, value: input }
+      : { ok: false, error: ERR_NON_FINITE };
+  }
+  if (typeof input === "string") {
+    return input.length <= context.limits.maxStringLength
+      ? { ok: true, value: input }
+      : { ok: false, error: ERR_LIMIT_EXCEEDED };
+  }
+  const isArray = safelyDetectArray(input);
+  if (isArray === null) {
+    return { ok: false, error: ERR_INVALID_STRUCTURE };
+  }
+  if (!isArray) {
+    return {
+      ok: false,
+      error: typeof input === "object" ? ERR_UNSUPPORTED_TYPE : ERR_INVALID_TYPE,
+    };
+  }
+
+  const arrayInput = input as unknown[];
+  try {
+    if (context.seen.has(arrayInput)) {
+      return { ok: false, error: ERR_INVALID_STRUCTURE };
+    }
+    context.seen.add(arrayInput);
+
+    const keys = Reflect.ownKeys(arrayInput);
+    const descriptors = Object.getOwnPropertyDescriptors(arrayInput);
+    const lengthDescriptor: PropertyDescriptor | undefined = Object.getOwnPropertyDescriptor(arrayInput, "length");
+    if (!lengthDescriptor || !Object.prototype.hasOwnProperty.call(lengthDescriptor, "value")) {
+      return { ok: false, error: ERR_INVALID_STRUCTURE };
+    }
+    const length = lengthDescriptor.value as unknown;
+    if (!Number.isSafeInteger(length) || (length as number) < 0) {
+      return { ok: false, error: ERR_INVALID_STRUCTURE };
+    }
+    if ((length as number) > context.limits.maxArrayLength) {
+      return { ok: false, error: ERR_LIMIT_EXCEEDED };
+    }
+    if (keys.some((key) => typeof key !== "string" || (key !== "length" && !/^(0|[1-9][0-9]*)$/.test(key)))) {
+      return { ok: false, error: ERR_INVALID_STRUCTURE };
+    }
+
+    const output: JsonValue[] = [];
+    for (let index = 0; index < (length as number); index += 1) {
+      const descriptor = descriptors[String(index)];
+      if (!descriptor || !("value" in descriptor)) {
+        return { ok: false, error: ERR_INVALID_STRUCTURE };
+      }
+      const child = parseJsonNode(descriptor.value as unknown, depth + 1, context);
+      if (!child.ok) {
+        return child;
+      }
+      output.push(child.value);
+    }
+    return { ok: true, value: Object.freeze(output) };
+  } catch {
+    return { ok: false, error: ERR_INVALID_STRUCTURE };
+  }
+}
+
+/** Parse JSON primitives and arrays into an immutable, detached value. */
+export function parseJsonValue(input: unknown, limitsInput?: unknown): ParseResult<JsonValue> {
+  const limits = parseJsonLimits(limitsInput);
+  if (!limits.ok) {
+    return limits;
+  }
+  return parseJsonNode(input, 0, { limits: limits.value, seen: new WeakSet<object>(), nodes: 0 });
 }
