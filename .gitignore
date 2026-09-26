@@ -1,0 +1,34 @@
+node_modules/
+dist/
+coverage/
+*.tsbuildinfo
+
+# Local configuration and credentials
+.env
+.env.*
+!.env.example
+config/local/
+config/private/
+certs/
+secrets/
+*.pem
+*.key
+*.p12
+*.pfx
+
+# Runtime state, inventories, audit logs, and model artifacts
+data/
+state/
+logs/
+models/
+artifacts/
+transfers/
+*.db
+*.db-*
+
+# Host-specific editor and developer files
+.DS_Store
+Thumbs.db
+.idea/
+.vscode/
+*.local.*

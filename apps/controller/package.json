@@ -1,0 +1,7 @@
+{
+  "name": "@lan-model-manager/controller",
+  "version": "0.0.0",
+  "private": true,
+  "type": "module",
+  "dependencies": { "@lan-model-manager/core": "0.0.0" }
+}
