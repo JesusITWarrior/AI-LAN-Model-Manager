@@ -5,8 +5,9 @@ unloading, placing, and routing to AI models across authorized machines on a
 LAN. It is designed around safe hot-swapping, resource-aware placement, and a
 provider-neutral inventory spanning runtimes such as Ollama and LM Studio.
 
-> **Project status:** architecture and safety foundation. No host mutation or
-> inference proxy is enabled yet.
+> **Status:** Architecture and safety foundation are in place. The controller
+> runs on loopback only; authentication, agent pairing, and model lifecycle
+> features are under development.
 
 ## Architecture
 
@@ -20,8 +21,7 @@ provider-neutral inventory spanning runtimes such as Ollama and LM Studio.
 - **Artifact manager:** uses verified peer transfer first, then approved source
   download, with independent metadata and checksum verification.
 
-See [Architecture](docs/architecture.md), [Security](SECURITY.md), and the
-[Roadmap](docs/roadmap.md).
+See [Architecture](docs/architecture.md) and [Security](SECURITY.md).
 
 ## Development
 
