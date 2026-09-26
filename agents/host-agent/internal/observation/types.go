@@ -1,6 +1,7 @@
 package observation
 
 import (
+	"context"
 	"errors"
 	"regexp"
 	"time"
@@ -8,6 +9,7 @@ import (
 
 type ByteAmount uint64
 type AcceleratorKind string
+
 type HostPlatform string
 
 const (
@@ -21,10 +23,17 @@ const (
 	PlatformWindows   HostPlatform    = "windows"
 )
 
+// AcceleratorObserver probes a specific accelerator class and returns observations.
+// Graceful absence (no executable, no devices) must return an empty non-nil slice with nil error.
+type AcceleratorObserver interface {
+	ObserveAccelerators(ctx context.Context) ([]AcceleratorObservation, error)
+}
+
 var (
 	ErrInvalidObservation = errors.New("invalid observation")
 	ErrInvalidResource    = errors.New("invalid resource quantity")
 	ErrDuplicateID        = errors.New("duplicate accelerator id")
+	ErrAcceleratorProbe   = errors.New("accelerator probe failed")
 	idPattern             = regexp.MustCompile(`^[A-Za-z0-9][A-Za-z0-9._:-]*$`)
 )
 
