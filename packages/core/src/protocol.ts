@@ -501,3 +501,103 @@ export function parseJsonValue(input: unknown, limitsInput?: unknown): ParseResu
   }
   return parseJsonNode(input, 0, { limits: limits.value, seen: new WeakSet<object>(), nodes: 0 });
 }
+
+
+// ---------------------------------------------------------------------------
+// Strict request envelopes
+// ---------------------------------------------------------------------------
+
+declare const brandProtocolMessageType: unique symbol;
+export type ProtocolMessageType = string & { readonly __brand: typeof brandProtocolMessageType };
+
+const PROTOCOL_MESSAGE_TYPE_PATTERN = /^[A-Za-z][A-Za-z0-9]*(?:[._:-][A-Za-z0-9]+)*$/;
+const REQUEST_REQUIRED_KEYS = Object.freeze([
+  "protocolVersion", "messageType", "requestId", "sentAt", "payload",
+] as const);
+const REQUEST_ALLOWED_KEYS = new Set<string>([...REQUEST_REQUIRED_KEYS, "correlationId"]);
+
+const ERR_ENVELOPE = "ERR_ENVELOPE";
+const ERR_ENVELOPE_VERSION = "ERR_ENVELOPE_VERSION";
+const ERR_ENVELOPE_MESSAGE_TYPE = "ERR_ENVELOPE_MESSAGE_TYPE";
+const ERR_ENVELOPE_REQUEST_ID = "ERR_ENVELOPE_REQUEST_ID";
+const ERR_ENVELOPE_CORRELATION_ID = "ERR_ENVELOPE_CORRELATION_ID";
+const ERR_ENVELOPE_SENT_AT = "ERR_ENVELOPE_SENT_AT";
+const ERR_ENVELOPE_PAYLOAD = "ERR_ENVELOPE_PAYLOAD";
+
+export function parseProtocolMessageType(input: unknown): ParseResult<ProtocolMessageType> {
+  if (typeof input !== "string") return { ok: false, error: ERR_INVALID_TYPE };
+  if (input.length < 1 || input.length > 128) return { ok: false, error: ERR_INVALID_LENGTH };
+  return PROTOCOL_MESSAGE_TYPE_PATTERN.test(input)
+    ? { ok: true, value: input as ProtocolMessageType }
+    : { ok: false, error: ERR_INVALID_FORMAT };
+}
+
+export interface ProtocolRequest<T extends JsonValue = JsonValue> {
+  readonly protocolVersion: ProtocolVersion;
+  readonly messageType: ProtocolMessageType;
+  readonly requestId: RequestId;
+  readonly correlationId?: CorrelationId;
+  readonly sentAt: UtcTimestamp;
+  readonly payload: T;
+}
+
+function requestDescriptors(input: unknown): ParseResult<Record<string, PropertyDescriptor>> {
+  if (typeof input !== "object" || input === null) return { ok: false, error: ERR_ENVELOPE };
+  try {
+    if (Array.isArray(input)) return { ok: false, error: ERR_ENVELOPE };
+    const prototype = Object.getPrototypeOf(input);
+    if (prototype !== Object.prototype && prototype !== null) {
+      return { ok: false, error: ERR_ENVELOPE };
+    }
+    const keys = Reflect.ownKeys(input);
+    if (keys.some((key) => typeof key !== "string" || !REQUEST_ALLOWED_KEYS.has(key))) {
+      return { ok: false, error: ERR_ENVELOPE };
+    }
+    if (REQUEST_REQUIRED_KEYS.some((key) => !keys.includes(key))) {
+      return { ok: false, error: ERR_ENVELOPE };
+    }
+    const descriptors = Object.getOwnPropertyDescriptors(input);
+    if (keys.some((key) => typeof key !== "string" || !descriptors[key] || !("value" in descriptors[key]))) {
+      return { ok: false, error: ERR_ENVELOPE };
+    }
+    return { ok: true, value: descriptors };
+  } catch {
+    return { ok: false, error: ERR_ENVELOPE };
+  }
+}
+
+/** Parse, detach, and freeze a strict protocol request envelope. */
+export function parseProtocolRequest(input: unknown): ParseResult<ProtocolRequest> {
+  const parsedDescriptors = requestDescriptors(input);
+  if (!parsedDescriptors.ok) return parsedDescriptors;
+  const descriptors = parsedDescriptors.value;
+
+  const version = parseProtocolVersion(descriptors.protocolVersion?.value as unknown);
+  if (!version.ok || !isProtocolVersionCompatible(CURRENT_PROTOCOL_VERSION, version.value)) {
+    return { ok: false, error: ERR_ENVELOPE_VERSION };
+  }
+  const messageType = parseProtocolMessageType(descriptors.messageType?.value as unknown);
+  if (!messageType.ok) return { ok: false, error: ERR_ENVELOPE_MESSAGE_TYPE };
+  const requestId = parseProtocolId("request", descriptors.requestId?.value as unknown);
+  if (!requestId.ok) return { ok: false, error: ERR_ENVELOPE_REQUEST_ID };
+  const sentAt = parseUtcTimestamp(descriptors.sentAt?.value as unknown);
+  if (!sentAt.ok) return { ok: false, error: ERR_ENVELOPE_SENT_AT };
+  const payload = parseJsonValue(descriptors.payload?.value as unknown);
+  if (!payload.ok) return { ok: false, error: ERR_ENVELOPE_PAYLOAD };
+
+  let correlationId: CorrelationId | undefined;
+  if (Object.prototype.hasOwnProperty.call(descriptors, "correlationId")) {
+    const parsed = parseProtocolId("correlation", descriptors.correlationId?.value as unknown);
+    if (!parsed.ok) return { ok: false, error: ERR_ENVELOPE_CORRELATION_ID };
+    correlationId = parsed.value;
+  }
+
+  const output = Object.create(null) as Record<string, unknown>;
+  output.protocolVersion = version.value;
+  output.messageType = messageType.value;
+  output.requestId = requestId.value;
+  if (correlationId !== undefined) output.correlationId = correlationId;
+  output.sentAt = sentAt.value;
+  output.payload = payload.value;
+  return { ok: true, value: Object.freeze(output) as unknown as ProtocolRequest };
+}

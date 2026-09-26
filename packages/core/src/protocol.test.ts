@@ -4,6 +4,8 @@ import {
   CURRENT_PROTOCOL_VERSION,
   isProtocolVersionCompatible,
   parseJsonValue,
+  parseProtocolMessageType,
+  parseProtocolRequest,
   parseProtocolId,
   parseProtocolVersion,
   parseUtcTimestamp,
@@ -912,4 +914,96 @@ test("depth and node accounting across mixed containers", () => {
     ok: false,
     error: "ERR_LIMIT_EXCEEDED",
   });
+});
+
+// --- parseProtocolRequest ---------------------------------------------------
+
+const validRequest = () => ({
+  protocolVersion: { major: 1, minor: 0 },
+  messageType: "model.load",
+  requestId: "request-1",
+  sentAt: "2026-09-26T08:00:00.000Z",
+  payload: { model: "example", options: [1, true] },
+});
+
+test("validates protocol message-type grammar and boundaries", () => {
+  for (const value of ["A", "model.load", "host_status:v1", `A${"a".repeat(127)}`]) {
+    assert.equal(parseProtocolMessageType(value).ok, true);
+  }
+  for (const value of ["", "1model", "model..load", "model-", "model load", "a/b", "a?b", "a#b", "a%20b", "café", `A${"a".repeat(128)}`]) {
+    assert.equal(parseProtocolMessageType(value).ok, false);
+  }
+});
+
+test("accepts requests with optional correlation and null-prototype roots", () => {
+  const plain = parseProtocolRequest(validRequest());
+  assert.equal(plain.ok, true);
+  const root = Object.assign(Object.create(null), validRequest(), { correlationId: "flow-1" });
+  const correlated = parseProtocolRequest(root);
+  assert.equal(correlated.ok, true);
+  if (correlated.ok) assert.equal(correlated.value.correlationId, "flow-1");
+});
+
+test("rejects malformed request roots and exact-key violations", () => {
+  for (const value of [null, [], "request", Object.create({ inherited: true })]) {
+    assert.deepStrictEqual(parseProtocolRequest(value), { ok: false, error: "ERR_ENVELOPE" });
+  }
+  const missing = validRequest();
+  delete (missing as Partial<typeof missing>).payload;
+  assert.deepStrictEqual(parseProtocolRequest(missing), { ok: false, error: "ERR_ENVELOPE" });
+  assert.deepStrictEqual(parseProtocolRequest({ ...validRequest(), extra: true }), { ok: false, error: "ERR_ENVELOPE" });
+  assert.deepStrictEqual(parseProtocolRequest({ ...validRequest(), [Symbol("extra")]: true }), { ok: false, error: "ERR_ENVELOPE" });
+});
+
+test("rejects request accessors without invoking them", () => {
+  let invoked = false;
+  const request = validRequest();
+  Object.defineProperty(request, "payload", { get() { invoked = true; throw new Error("must not run"); } });
+  assert.deepStrictEqual(parseProtocolRequest(request), { ok: false, error: "ERR_ENVELOPE" });
+  assert.equal(invoked, false);
+});
+
+test("rejects hostile and revoked request proxies without throwing", () => {
+  const hostile = new Proxy({}, { ownKeys() { throw new Error("hostile"); } });
+  assert.doesNotThrow(() => parseProtocolRequest(hostile));
+  assert.deepStrictEqual(parseProtocolRequest(hostile), { ok: false, error: "ERR_ENVELOPE" });
+  const revoked = Proxy.revocable(validRequest(), {});
+  revoked.revoke();
+  assert.doesNotThrow(() => parseProtocolRequest(revoked.proxy));
+  assert.deepStrictEqual(parseProtocolRequest(revoked.proxy), { ok: false, error: "ERR_ENVELOPE" });
+});
+
+test("maps invalid request fields to stable field errors", () => {
+  const cases: Array<[Record<string, unknown>, string]> = [
+    [{ ...validRequest(), protocolVersion: { major: 1, minor: 1 } }, "ERR_ENVELOPE_VERSION"],
+    [{ ...validRequest(), messageType: "bad type" }, "ERR_ENVELOPE_MESSAGE_TYPE"],
+    [{ ...validRequest(), requestId: "bad/id" }, "ERR_ENVELOPE_REQUEST_ID"],
+    [{ ...validRequest(), sentAt: "not-a-time" }, "ERR_ENVELOPE_SENT_AT"],
+    [{ ...validRequest(), payload: undefined }, "ERR_ENVELOPE_PAYLOAD"],
+    [{ ...validRequest(), correlationId: undefined }, "ERR_ENVELOPE_CORRELATION_ID"],
+    [{ ...validRequest(), correlationId: null }, "ERR_ENVELOPE_CORRELATION_ID"],
+  ];
+  for (const [value, error] of cases) {
+    assert.deepStrictEqual(parseProtocolRequest(value), { ok: false, error });
+  }
+});
+
+test("returns a detached deeply frozen null-prototype request", () => {
+  const input = validRequest();
+  const result = parseProtocolRequest(input);
+  assert.equal(result.ok, true);
+  if (!result.ok) return;
+  assert.equal(Object.getPrototypeOf(result.value), null);
+  assert.equal(Object.isFrozen(result.value), true);
+  assert.equal(Object.isFrozen(result.value.protocolVersion), true);
+  assert.equal(Object.isFrozen(result.value.payload), true);
+  const payload = result.value.payload as { readonly options: readonly unknown[] };
+  assert.equal(Object.isFrozen(payload.options), true);
+  input.payload.model = "changed";
+  input.payload.options.push(2);
+  const frozenPayload = result.value.payload as { readonly model: string; readonly options: readonly unknown[] };
+  assert.equal(Object.getPrototypeOf(frozenPayload), null);
+  assert.equal(frozenPayload.model, "example");
+  assert.deepStrictEqual(frozenPayload.options, [1, true]);
+  assert.equal(Object.prototype.hasOwnProperty.call(result.value, "correlationId"), false);
 });
