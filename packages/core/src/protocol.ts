@@ -681,3 +681,141 @@ export function parseProtocolSuccessResponse(input: unknown): ParseResult<Protoc
   output.result = result.value;
   return { ok: true, value: Object.freeze(output) as unknown as ProtocolSuccessResponse };
 }
+
+// ---------------------------------------------------------------------------
+// Bounded public errors and strict error responses
+// ---------------------------------------------------------------------------
+
+declare const brandErrorCode: unique symbol;
+export type ErrorCode = string & { readonly __brand: typeof brandErrorCode };
+
+const ERROR_CODE_PATTERN = /^[A-Z][A-Z0-9]*(?:_[A-Z0-9]+)*$/;
+const PUBLIC_ERROR_REQUIRED_KEYS = Object.freeze(["code", "message", "retryable"] as const);
+const PUBLIC_ERROR_ALLOWED_KEYS = new Set<string>([...PUBLIC_ERROR_REQUIRED_KEYS, "details"]);
+const ERROR_RESPONSE_KEYS = Object.freeze([
+  "protocolVersion", "messageType", "requestId", "sentAt", "ok", "error",
+] as const);
+
+const ERR_PUBLIC_ERROR_CODE = "ERR_PUBLIC_ERROR_CODE";
+const ERR_PUBLIC_ERROR_MESSAGE = "ERR_PUBLIC_ERROR_MESSAGE";
+const ERR_PUBLIC_ERROR_RETRYABLE = "ERR_PUBLIC_ERROR_RETRYABLE";
+const ERR_PUBLIC_ERROR_DETAILS = "ERR_PUBLIC_ERROR_DETAILS";
+const ERR_ERROR_RESPONSE_VERSION = "ERR_ERROR_RESPONSE_VERSION";
+const ERR_ERROR_RESPONSE_MESSAGE_TYPE = "ERR_ERROR_RESPONSE_MESSAGE_TYPE";
+const ERR_ERROR_RESPONSE_REQUEST_ID = "ERR_ERROR_RESPONSE_REQUEST_ID";
+const ERR_ERROR_RESPONSE_SENT_AT = "ERR_ERROR_RESPONSE_SENT_AT";
+const ERR_ERROR_RESPONSE_OK = "ERR_ERROR_RESPONSE_OK";
+const ERR_ERROR_RESPONSE_ERROR = "ERR_ERROR_RESPONSE_ERROR";
+
+export function parseErrorCode(input: unknown): ParseResult<ErrorCode> {
+  if (typeof input !== "string") return { ok: false, error: ERR_INVALID_TYPE };
+  if (input.length < 1 || input.length > 64) return { ok: false, error: ERR_INVALID_LENGTH };
+  return ERROR_CODE_PATTERN.test(input)
+    ? { ok: true, value: input as ErrorCode }
+    : { ok: false, error: ERR_INVALID_FORMAT };
+}
+
+export interface ProtocolPublicError {
+  readonly code: ErrorCode;
+  readonly message: string;
+  readonly retryable: boolean;
+  readonly details?: JsonValue;
+}
+
+function exactDataDescriptors(
+  input: unknown,
+  required: readonly string[],
+  allowed: ReadonlySet<string>,
+): ParseResult<Record<string, PropertyDescriptor>> {
+  if (typeof input !== "object" || input === null) return { ok: false, error: ERR_ENVELOPE };
+  try {
+    if (Array.isArray(input)) return { ok: false, error: ERR_ENVELOPE };
+    const prototype = Object.getPrototypeOf(input);
+    if (prototype !== Object.prototype && prototype !== null) return { ok: false, error: ERR_ENVELOPE };
+    const keys = Reflect.ownKeys(input);
+    if (keys.some((key) => typeof key !== "string" || !allowed.has(key))) {
+      return { ok: false, error: ERR_EXTRA_KEY };
+    }
+    if (required.some((key) => !keys.includes(key))) return { ok: false, error: ERR_MISSING_KEY };
+    const descriptors = Object.getOwnPropertyDescriptors(input);
+    if (keys.some((key) => typeof key !== "string" || !descriptors[key] || !("value" in descriptors[key]))) {
+      return { ok: false, error: ERR_ENVELOPE };
+    }
+    return { ok: true, value: descriptors };
+  } catch {
+    return { ok: false, error: ERR_ENVELOPE };
+  }
+}
+
+export function parseProtocolPublicError(input: unknown): ParseResult<ProtocolPublicError> {
+  const descriptorsResult = exactDataDescriptors(input, PUBLIC_ERROR_REQUIRED_KEYS, PUBLIC_ERROR_ALLOWED_KEYS);
+  if (!descriptorsResult.ok) return descriptorsResult;
+  const descriptors = descriptorsResult.value;
+
+  const code = parseErrorCode(descriptors.code?.value as unknown);
+  if (!code.ok) return { ok: false, error: ERR_PUBLIC_ERROR_CODE };
+  const message = descriptors.message?.value as unknown;
+  if (
+    typeof message !== "string" ||
+    message.length < 1 ||
+    message.length > 1024 ||
+    /[\u0000-\u001f\u007f]/.test(message)
+  ) {
+    return { ok: false, error: ERR_PUBLIC_ERROR_MESSAGE };
+  }
+  const retryable = descriptors.retryable?.value as unknown;
+  if (typeof retryable !== "boolean") return { ok: false, error: ERR_PUBLIC_ERROR_RETRYABLE };
+
+  let details: JsonValue | undefined;
+  if (Object.prototype.hasOwnProperty.call(descriptors, "details")) {
+    const parsed = parseJsonValue(descriptors.details?.value as unknown);
+    if (!parsed.ok) return { ok: false, error: ERR_PUBLIC_ERROR_DETAILS };
+    details = parsed.value;
+  }
+
+  const output = Object.create(null) as Record<string, unknown>;
+  output.code = code.value;
+  output.message = message;
+  output.retryable = retryable;
+  if (details !== undefined) output.details = details;
+  return { ok: true, value: Object.freeze(output) as unknown as ProtocolPublicError };
+}
+
+export interface ProtocolErrorResponse {
+  readonly protocolVersion: ProtocolVersion;
+  readonly messageType: ProtocolMessageType;
+  readonly requestId: RequestId;
+  readonly sentAt: UtcTimestamp;
+  readonly ok: false;
+  readonly error: ProtocolPublicError;
+}
+
+export function parseProtocolErrorResponse(input: unknown): ParseResult<ProtocolErrorResponse> {
+  const allowed = new Set<string>(ERROR_RESPONSE_KEYS);
+  const descriptorsResult = exactDataDescriptors(input, ERROR_RESPONSE_KEYS, allowed);
+  if (!descriptorsResult.ok) return descriptorsResult;
+  const descriptors = descriptorsResult.value;
+
+  const version = parseProtocolVersion(descriptors.protocolVersion?.value as unknown);
+  if (!version.ok || !isProtocolVersionCompatible(CURRENT_PROTOCOL_VERSION, version.value)) {
+    return { ok: false, error: ERR_ERROR_RESPONSE_VERSION };
+  }
+  const messageType = parseProtocolMessageType(descriptors.messageType?.value as unknown);
+  if (!messageType.ok) return { ok: false, error: ERR_ERROR_RESPONSE_MESSAGE_TYPE };
+  const requestId = parseProtocolId("request", descriptors.requestId?.value as unknown);
+  if (!requestId.ok) return { ok: false, error: ERR_ERROR_RESPONSE_REQUEST_ID };
+  const sentAt = parseUtcTimestamp(descriptors.sentAt?.value as unknown);
+  if (!sentAt.ok) return { ok: false, error: ERR_ERROR_RESPONSE_SENT_AT };
+  if (descriptors.ok?.value !== false) return { ok: false, error: ERR_ERROR_RESPONSE_OK };
+  const error = parseProtocolPublicError(descriptors.error?.value as unknown);
+  if (!error.ok) return { ok: false, error: ERR_ERROR_RESPONSE_ERROR };
+
+  const output = Object.create(null) as Record<string, unknown>;
+  output.protocolVersion = version.value;
+  output.messageType = messageType.value;
+  output.requestId = requestId.value;
+  output.sentAt = sentAt.value;
+  output.ok = false;
+  output.error = error.value;
+  return { ok: true, value: Object.freeze(output) as unknown as ProtocolErrorResponse };
+}

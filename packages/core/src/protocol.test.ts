@@ -10,6 +10,13 @@ import {
   parseProtocolVersion,
   parseUtcTimestamp,
   parseProtocolSuccessResponse,
+  parseProtocolPublicError,
+  parseErrorCode,
+  parseProtocolErrorResponse,
+} from "./protocol.js";
+import type {
+  ProtocolPublicError,
+  ProtocolErrorResponse,
 } from "./protocol.js";
 
 test("current version is a frozen { major: 1, minor: 0 }", () => {
@@ -1174,4 +1181,127 @@ test("never throws for hostile inputs", () => {
   const revoked = Proxy.revocable(validSuccess(), {});
   revoked.revoke();
   assert.doesNotThrow(() => parseProtocolSuccessResponse(revoked.proxy));
+});
+
+// --- bounded public errors and strict error responses -----------------------
+
+const publicError = () => ({ code: "BAD_REQUEST", message: "Invalid input", retryable: false });
+const errorResponse = () => ({
+  protocolVersion: { major: 1, minor: 0 },
+  messageType: "model.load",
+  requestId: "request-1",
+  sentAt: "2026-09-26T08:00:00.000Z",
+  ok: false,
+  error: publicError(),
+});
+
+test("validates public error code boundaries and grammar", () => {
+  for (const code of ["A", "BAD_REQUEST", "A".repeat(64)]) assert.equal(parseErrorCode(code).ok, true);
+  for (const code of ["", "A".repeat(65), "bad", "Bad", "A__B", "A_", "_A", "1A", "A-B", "A/B", "A%20B", "É"])
+    assert.equal(parseErrorCode(code).ok, false);
+  for (const value of [null, 1, true]) assert.equal(parseErrorCode(value).ok, false);
+});
+
+test("accepts public errors with optional detached details and null-prototype roots", () => {
+  const plain = parseProtocolPublicError(publicError());
+  assert.equal(plain.ok, true);
+  const input = Object.assign(Object.create(null), publicError(), { details: { field: "email" } });
+  const detailed = parseProtocolPublicError(input);
+  assert.equal(detailed.ok, true);
+  if (!detailed.ok) return;
+  assert.equal(Object.getPrototypeOf(detailed.value), null);
+  assert.equal(Object.isFrozen(detailed.value), true);
+  assert.equal(Object.isFrozen(detailed.value.details), true);
+  input.details.field = "changed";
+  const details = detailed.value.details as { readonly field: string };
+  assert.equal(details.field, "email");
+});
+
+test("enforces public message bounds and control-character policy", () => {
+  assert.equal(parseProtocolPublicError({ ...publicError(), message: "x" }).ok, true);
+  assert.equal(parseProtocolPublicError({ ...publicError(), message: "✓" }).ok, true);
+  assert.equal(parseProtocolPublicError({ ...publicError(), message: "x".repeat(1024) }).ok, true);
+  for (const message of ["", "x".repeat(1025), "line\nbreak", "tab\tvalue", "nul\0value", "delete\u007f"])
+    assert.deepStrictEqual(parseProtocolPublicError({ ...publicError(), message }), { ok: false, error: "ERR_PUBLIC_ERROR_MESSAGE" });
+});
+
+test("maps invalid public error fields to stable errors", () => {
+  const cases: Array<[Record<string, unknown>, string]> = [
+    [{ ...publicError(), code: "bad" }, "ERR_PUBLIC_ERROR_CODE"],
+    [{ ...publicError(), message: 3 }, "ERR_PUBLIC_ERROR_MESSAGE"],
+    [{ ...publicError(), retryable: "false" }, "ERR_PUBLIC_ERROR_RETRYABLE"],
+    [{ ...publicError(), details: undefined }, "ERR_PUBLIC_ERROR_DETAILS"],
+    [{ ...publicError(), details: () => undefined }, "ERR_PUBLIC_ERROR_DETAILS"],
+  ];
+  for (const [value, error] of cases) assert.deepStrictEqual(parseProtocolPublicError(value), { ok: false, error });
+});
+
+test("rejects malformed public error containers without invoking accessors", () => {
+  for (const value of [null, [], "error", Object.create({ inherited: true })]) assert.equal(parseProtocolPublicError(value).ok, false);
+  const missing = publicError(); delete (missing as Partial<typeof missing>).code;
+  assert.deepStrictEqual(parseProtocolPublicError(missing), { ok: false, error: "ERR_MISSING_KEY" });
+  assert.deepStrictEqual(parseProtocolPublicError({ ...publicError(), extra: true }), { ok: false, error: "ERR_EXTRA_KEY" });
+  const symbolValue = publicError(); Object.defineProperty(symbolValue, Symbol("extra"), { value: true });
+  assert.deepStrictEqual(parseProtocolPublicError(symbolValue), { ok: false, error: "ERR_EXTRA_KEY" });
+  let invoked = false;
+  const accessor = publicError(); Object.defineProperty(accessor, "message", { get() { invoked = true; throw new Error("no"); } });
+  assert.deepStrictEqual(parseProtocolPublicError(accessor), { ok: false, error: "ERR_ENVELOPE" });
+  assert.equal(invoked, false);
+});
+
+test("public error parsing does not throw for hostile or revoked proxies", () => {
+  const hostile = new Proxy({}, { ownKeys() { throw new Error("hostile"); } });
+  assert.doesNotThrow(() => parseProtocolPublicError(hostile));
+  const revoked = Proxy.revocable(publicError(), {}); revoked.revoke();
+  assert.doesNotThrow(() => parseProtocolPublicError(revoked.proxy));
+});
+
+test("accepts strict error responses and returns detached frozen values", () => {
+  const input = errorResponse();
+  const parsed = parseProtocolErrorResponse(input);
+  assert.equal(parsed.ok, true);
+  if (!parsed.ok) return;
+  assert.equal(Object.getPrototypeOf(parsed.value), null);
+  assert.equal(Object.isFrozen(parsed.value), true);
+  assert.equal(Object.getPrototypeOf(parsed.value.error), null);
+  assert.equal(Object.isFrozen(parsed.value.error), true);
+  input.error.code = "CHANGED";
+  input.protocolVersion.major = 9;
+  assert.equal(parsed.value.error.code, "BAD_REQUEST");
+  assert.equal(parsed.value.protocolVersion.major, 1);
+  const nullRoot = Object.assign(Object.create(null), errorResponse());
+  assert.equal(parseProtocolErrorResponse(nullRoot).ok, true);
+});
+
+test("rejects malformed error response roots and accessors", () => {
+  for (const value of [null, [], "error", Object.create({ inherited: true })]) assert.equal(parseProtocolErrorResponse(value).ok, false);
+  const missing = errorResponse(); delete (missing as Partial<typeof missing>).error;
+  assert.deepStrictEqual(parseProtocolErrorResponse(missing), { ok: false, error: "ERR_MISSING_KEY" });
+  assert.deepStrictEqual(parseProtocolErrorResponse({ ...errorResponse(), extra: true }), { ok: false, error: "ERR_EXTRA_KEY" });
+  const symbolValue = errorResponse(); Object.defineProperty(symbolValue, Symbol("extra"), { value: true });
+  assert.deepStrictEqual(parseProtocolErrorResponse(symbolValue), { ok: false, error: "ERR_EXTRA_KEY" });
+  let invoked = false;
+  const accessor = errorResponse(); Object.defineProperty(accessor, "error", { get() { invoked = true; throw new Error("no"); } });
+  assert.deepStrictEqual(parseProtocolErrorResponse(accessor), { ok: false, error: "ERR_ENVELOPE" });
+  assert.equal(invoked, false);
+});
+
+test("maps invalid error response fields to stable errors", () => {
+  const cases: Array<[Record<string, unknown>, string]> = [
+    [{ ...errorResponse(), protocolVersion: { major: 1, minor: 1 } }, "ERR_ERROR_RESPONSE_VERSION"],
+    [{ ...errorResponse(), messageType: "bad type" }, "ERR_ERROR_RESPONSE_MESSAGE_TYPE"],
+    [{ ...errorResponse(), requestId: "bad/id" }, "ERR_ERROR_RESPONSE_REQUEST_ID"],
+    [{ ...errorResponse(), sentAt: "bad" }, "ERR_ERROR_RESPONSE_SENT_AT"],
+    [{ ...errorResponse(), ok: true }, "ERR_ERROR_RESPONSE_OK"],
+    [{ ...errorResponse(), ok: 0 }, "ERR_ERROR_RESPONSE_OK"],
+    [{ ...errorResponse(), error: null }, "ERR_ERROR_RESPONSE_ERROR"],
+  ];
+  for (const [value, error] of cases) assert.deepStrictEqual(parseProtocolErrorResponse(value), { ok: false, error });
+});
+
+test("error response parsing does not throw for hostile or revoked proxies", () => {
+  const hostile = new Proxy({}, { getPrototypeOf() { throw new Error("hostile"); } });
+  assert.doesNotThrow(() => parseProtocolErrorResponse(hostile));
+  const revoked = Proxy.revocable(errorResponse(), {}); revoked.revoke();
+  assert.doesNotThrow(() => parseProtocolErrorResponse(revoked.proxy));
 });
