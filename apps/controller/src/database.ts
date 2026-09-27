@@ -130,10 +130,29 @@ CREATE TABLE owners (
 ) STRICT;
 `;
 
+const migration4Sql = `
+CREATE TABLE sessions (
+  session_digest TEXT PRIMARY KEY CHECK(length(session_digest) = 64),
+  csrf_digest TEXT NOT NULL CHECK(length(csrf_digest) = 64),
+  owner_id TEXT NOT NULL REFERENCES owners(owner_id) ON UPDATE RESTRICT ON DELETE CASCADE,
+  credential_version INTEGER NOT NULL CHECK(credential_version > 0),
+  session_version INTEGER NOT NULL CHECK(session_version > 0),
+  created_at TEXT NOT NULL,
+  last_seen_at TEXT NOT NULL,
+  absolute_expires_at TEXT NOT NULL,
+  idle_expires_at TEXT NOT NULL,
+  revoked_at TEXT
+) STRICT;
+CREATE INDEX sessions_owner_idx ON sessions(owner_id, session_digest);
+CREATE INDEX sessions_absolute_expiry_idx ON sessions(absolute_expires_at);
+CREATE INDEX sessions_idle_expiry_idx ON sessions(idle_expires_at);
+`;
+
 export const CONTROLLER_MIGRATIONS: readonly Migration[] = Object.freeze([
   Object.freeze({ version: 1, name: "inventory-v1", sql: migration1Sql, checksum: migrationChecksum(migration1Sql) }),
   Object.freeze({ version: 2, name: "durable-jobs-v1", sql: migration2Sql, checksum: migrationChecksum(migration2Sql) }),
   Object.freeze({ version: 3, name: "owner-credentials-v1", sql: migration3Sql, checksum: migrationChecksum(migration3Sql) }),
+  Object.freeze({ version: 4, name: "private-plan-sessions-v1", sql: migration4Sql, checksum: migrationChecksum(migration4Sql) }),
 ]);
 
 function validateMigrations(migrations: readonly Migration[]): void {

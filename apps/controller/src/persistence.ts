@@ -25,3 +25,12 @@ export {
   OwnerBootstrapError, createOwnerBootstrapService,
   type OwnerAuthenticationInput, type OwnerBootstrapErrorCode, type OwnerBootstrapInput, type OwnerBootstrapService,
 } from "./owner-service.js";
+export { SessionManager, type SessionManagerOptions } from "./session-manager.js";
+export { SessionRepository } from "./session-repository.js";
+export {
+  SESSION_ABSOLUTE_TTL_MS, SESSION_COOKIE_NAME, SESSION_IDLE_TTL_MS, SESSION_TOKEN_BYTES, SessionError,
+  type CreatedSession, type SessionErrorCode, type SessionMetadata, type SessionPolicy, type StoredSession,
+} from "./session-types.js";
+export { clearSessionCookie, parseSessionCookieHeader, serializeSessionCookie } from "./cookie-parser.js";
+export { createAllowedOrigins, originAllowed, type OriginPolicyOptions } from "./origin.js";
+export { guardManagementRequest, type GuardResult } from "./guard.js";

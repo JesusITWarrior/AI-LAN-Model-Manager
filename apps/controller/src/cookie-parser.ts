@@ -1,0 +1,6 @@
+import { SESSION_COOKIE_NAME } from "./session-types.js";
+import { validSessionToken } from "./session-digest.js";
+export const MAX_COOKIE_HEADER_BYTES=4096;
+export function parseSessionCookieHeader(input:unknown):string|null {if(typeof input!=="string"||input.length===0||Buffer.byteLength(input)>MAX_COOKIE_HEADER_BYTES||/[\u0000-\u001f\u007f]/.test(input))return null;let found:string|null=null;for(const segment of input.split(";")){const part=segment.trim(),index=part.indexOf("=");if(index<=0||index!==part.lastIndexOf("="))return null;const name=part.slice(0,index),value=part.slice(index+1);if(!/^[!#$%&'*+.^_`|~0-9A-Za-z-]+$/.test(name)||value.length===0)return null;if(name===SESSION_COOKIE_NAME){if(found!==null||!validSessionToken(value))return null;found=value;}}return found;}
+export function serializeSessionCookie(token:unknown,maxAgeSeconds:unknown):string {if(!validSessionToken(token)||typeof maxAgeSeconds!=="number"||!Number.isSafeInteger(maxAgeSeconds)||maxAgeSeconds<1||maxAgeSeconds>86_400)throw new Error("ERR_COOKIE_POLICY");return `${SESSION_COOKIE_NAME}=${token}; Max-Age=${maxAgeSeconds}; Path=/; Secure; HttpOnly; SameSite=Strict`;}
+export function clearSessionCookie():string{return `${SESSION_COOKIE_NAME}=; Max-Age=0; Path=/; Secure; HttpOnly; SameSite=Strict`;}
