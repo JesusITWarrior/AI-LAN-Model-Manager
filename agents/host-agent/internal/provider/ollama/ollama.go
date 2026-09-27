@@ -10,7 +10,6 @@ import (
 	"fmt"
 	"io"
 	"net/http"
-	"net/url"
 	"regexp"
 	"sort"
 	"strconv"
@@ -21,17 +20,22 @@ import (
 )
 
 const (
-	DefaultTimeout          = 5 * time.Second
-	MinimumTimeout          = 100 * time.Millisecond
-	MaximumTimeout          = 30 * time.Second
-	MaximumBodySize         = 64 * 1024
-	MaximumListBodySize     = 1024 * 1024
-	MaximumInstalledModels  = 10000
-	maximumProviderIDLength = 128
-	maximumModelNameLength  = 256
-	maximumMetadataLength   = 128
-	maximumVersionLength    = 128
-	maximumVersion          = 65535
+	MaximumBodySize        = 64 * 1024
+	MaximumListBodySize    = 1024 * 1024
+	MaximumInstalledModels = 10000
+
+	maximumModelNameLength = 256
+	maximumMetadataLength  = 128
+	maximumVersionLength   = 128
+	maximumVersion         = 65535
+)
+
+// ollama timeout aliases the shared provider bounds so both adapters share one
+// range; tests reference these ollama-qualified names.
+const (
+	DefaultTimeout = provider.DefaultTimeout
+	MinimumTimeout = provider.MinimumTimeout
+	MaximumTimeout = provider.MaximumTimeout
 )
 
 var (
@@ -49,57 +53,43 @@ var (
 	ErrListResponseTooLarge = errors.New("ollama installed-model response too large")
 	ErrInvalidListResponse  = errors.New("invalid ollama installed-model response")
 
-	providerIDPattern = regexp.MustCompile(`^[A-Za-z0-9][A-Za-z0-9._:-]{0,127}$`)
-	versionPattern    = regexp.MustCompile(`^v?([0-9]+)\.([0-9]+)\.([0-9]+)(?:-([0-9A-Za-z-]+(?:\.[0-9A-Za-z-]+)*))?$`)
-	digestPattern     = regexp.MustCompile(`^[0-9a-fA-F]{64}$`)
-	metadataPattern   = regexp.MustCompile(`^[A-Za-z0-9][A-Za-z0-9 ._+:/()-]*$`)
+	versionPattern  = regexp.MustCompile(`^v?([0-9]+)\.([0-9]+)\.([0-9]+)(?:-([0-9A-Za-z-]+(?:\.[0-9A-Za-z-]+)*))?$`)
+	digestPattern   = regexp.MustCompile(`^[0-9a-fA-F]{64}$`)
+	metadataPattern = regexp.MustCompile(`^[A-Za-z0-9][A-Za-z0-9 ._+:/()-]*$`)
 )
+
+// HTTPDoer is the shared HTTP transport interface (re-exported for callers).
+type HTTPDoer = provider.HTTPDoer
+
+// Clock is the shared time interface (re-exported for callers).
+type Clock = provider.Clock
 
 // Config contains the complete configuration for one Ollama adapter.
 type Config struct {
-	// ProviderID is an opaque 1..128 byte ASCII identifier. It starts with an
+	// ProviderID is an opaque 1..128 byte ASCII identifier that starts with an
 	// alphanumeric byte; later bytes may also be '.', '_', ':', or '-'.
 	ProviderID string
 	Endpoint   string
 	Timeout    time.Duration
 }
 
-// HTTPDoer permits deterministic tests without a network listener.
-type HTTPDoer interface {
-	Do(*http.Request) (*http.Response, error)
-}
-
-// Clock permits deterministic observation timestamps.
-type Clock interface {
-	Now() time.Time
-}
-
-type systemClock struct{}
-
-func (systemClock) Now() time.Time { return time.Now() }
-
 // Client probes one normalized Ollama endpoint.
 type Client struct {
 	providerID string
 	endpoint   string
 	timeout    time.Duration
-	doer       HTTPDoer
-	clock      Clock
+	doer       provider.HTTPDoer
+	clock      provider.Clock
 }
 
 // New creates a production client whose HTTP transport never follows redirects.
 func New(config Config) (*Client, error) {
-	doer := &http.Client{
-		CheckRedirect: func(*http.Request, []*http.Request) error {
-			return http.ErrUseLastResponse
-		},
-	}
-	return NewWithDependencies(config, doer, systemClock{})
+	return NewWithDependencies(config, provider.NoRedirectDoer(), provider.SystemClock{})
 }
 
 // NewWithDependencies creates a client with injected HTTP and time dependencies.
-func NewWithDependencies(config Config, doer HTTPDoer, clock Clock) (*Client, error) {
-	if len(config.ProviderID) < 1 || len(config.ProviderID) > maximumProviderIDLength || !providerIDPattern.MatchString(config.ProviderID) {
+func NewWithDependencies(config Config, doer provider.HTTPDoer, clock provider.Clock) (*Client, error) {
+	if !provider.ValidateProviderID(config.ProviderID) {
 		return nil, errors.Join(ErrInvalidConfig, ErrInvalidID)
 	}
 	endpoint, err := NormalizeEndpoint(config.Endpoint)
@@ -108,9 +98,9 @@ func NewWithDependencies(config Config, doer HTTPDoer, clock Clock) (*Client, er
 	}
 	timeout := config.Timeout
 	if timeout == 0 {
-		timeout = DefaultTimeout
+		timeout = provider.DefaultTimeout
 	}
-	if timeout < MinimumTimeout || timeout > MaximumTimeout {
+	if timeout < provider.MinimumTimeout || timeout > provider.MaximumTimeout {
 		return nil, errors.Join(ErrInvalidConfig, ErrInvalidTimeout)
 	}
 	if doer == nil || clock == nil {
@@ -119,58 +109,14 @@ func NewWithDependencies(config Config, doer HTTPDoer, clock Clock) (*Client, er
 	return &Client{providerID: config.ProviderID, endpoint: endpoint, timeout: timeout, doer: doer, clock: clock}, nil
 }
 
-// NormalizeEndpoint validates an HTTP(S) origin and removes its optional root slash.
+// NormalizeEndpoint delegates to the shared provider-origin normalization so
+// Ollama and every future adapter agree on the exact origin rules.
 func NormalizeEndpoint(raw string) (string, error) {
-	if raw == "" || len(raw) > 2048 || strings.TrimSpace(raw) != raw || strings.Contains(raw, "#") {
+	endpoint, err := provider.NormalizeEndpoint(raw)
+	if err != nil {
 		return "", ErrInvalidEndpoint
 	}
-	parsed, err := url.Parse(raw)
-	if err != nil || (parsed.Scheme != "http" && parsed.Scheme != "https") || parsed.Host == "" || parsed.Hostname() == "" {
-		return "", ErrInvalidEndpoint
-	}
-	if !validPort(parsed.Host) {
-		return "", ErrInvalidEndpoint
-	}
-	if parsed.Opaque != "" || parsed.User != nil || parsed.RawQuery != "" || parsed.ForceQuery || parsed.Fragment != "" || parsed.RawFragment != "" {
-		return "", ErrInvalidEndpoint
-	}
-	if parsed.Path != "" && parsed.Path != "/" {
-		return "", ErrInvalidEndpoint
-	}
-	if parsed.RawPath != "" {
-		return "", ErrInvalidEndpoint
-	}
-	return parsed.Scheme + "://" + parsed.Host, nil
-}
-
-func validPort(host string) bool {
-	if strings.HasPrefix(host, "[") {
-		closingBracket := strings.LastIndexByte(host, ']')
-		if closingBracket < 0 {
-			return false
-		}
-		if closingBracket == len(host)-1 {
-			return true
-		}
-		if host[closingBracket+1] != ':' {
-			return false
-		}
-		return portInRange(host[closingBracket+2:])
-	}
-
-	firstColon := strings.IndexByte(host, ':')
-	if firstColon < 0 {
-		return true
-	}
-	if firstColon != strings.LastIndexByte(host, ':') {
-		return false
-	}
-	return portInRange(host[firstColon+1:])
-}
-
-func portInRange(port string) bool {
-	value, err := strconv.ParseUint(port, 10, 16)
-	return err == nil && value > 0
+	return endpoint, nil
 }
 
 // ParseVersion accepts Ollama's optional v prefix and a SemVer-style prerelease.
@@ -261,12 +207,13 @@ func (client *Client) Probe(ctx context.Context) (provider.ProviderProbe, error)
 	}
 	observedAt := client.clock.Now().UTC().Truncate(time.Millisecond).Format("2006-01-02T15:04:05.000Z")
 	return provider.ProviderProbe{
-		ProviderID: client.providerID,
-		Kind:       provider.KindOllama,
-		Endpoint:   client.endpoint,
-		Health:     provider.HealthReady,
-		Version:    version,
-		ObservedAt: observedAt,
+		ProviderID:   client.providerID,
+		Kind:         provider.KindOllama,
+		Endpoint:     client.endpoint,
+		Health:       provider.HealthReady,
+		Version:      version,
+		VersionKnown: true,
+		ObservedAt:   observedAt,
 	}, nil
 }
 

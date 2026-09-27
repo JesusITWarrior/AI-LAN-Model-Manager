@@ -136,12 +136,13 @@ func TestProbeSuccess(t *testing.T) {
 	}))
 	got, err := client.Probe(context.Background())
 	want := provider.ProviderProbe{
-		ProviderID: "ollama-main",
-		Kind:       provider.KindOllama,
-		Endpoint:   "http://127.0.0.1:11434",
-		Health:     provider.HealthReady,
-		Version:    provider.VersionInfo{Raw: "0.5.7-rc.1", Minor: 5, Patch: 7, Prerelease: "rc.1"},
-		ObservedAt: "2026-09-27T03:01:02.987Z",
+		ProviderID:   "ollama-main",
+		Kind:         provider.KindOllama,
+		Endpoint:     "http://127.0.0.1:11434",
+		Health:       provider.HealthReady,
+		Version:      provider.VersionInfo{Raw: "0.5.7-rc.1", Minor: 5, Patch: 7, Prerelease: "rc.1"},
+		VersionKnown: true,
+		ObservedAt:   "2026-09-27T03:01:02.987Z",
 	}
 	if err != nil || got != want {
 		t.Fatalf("Probe() = %#v, %v; want %#v", got, err, want)

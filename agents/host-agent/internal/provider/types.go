@@ -22,19 +22,29 @@ type VersionInfo struct {
 	Prerelease string
 }
 
+// UnknownVersion is the zero-value VersionInfo: the provider did not expose a
+// usable version. It marshals as an empty scalar string, so the probe wire
+// contract stays scalar whether or not a version is known.
+func UnknownVersion() VersionInfo { return VersionInfo{} }
+
 // MarshalJSON keeps VersionInfo's JSON representation a safely escaped string.
 func (version VersionInfo) MarshalJSON() ([]byte, error) {
 	return json.Marshal(version.Raw)
 }
 
 // ProviderProbe is the normalized result of a successful provider health probe.
+// VersionKnown is true only when Version contains a provider-validated version.
+// When VersionKnown is false, Version must equal the comparable zero value from
+// UnknownVersion. ProviderProbe carries no model inventory: a health probe may
+// validate inventory response shape, but never returns model identifiers.
 type ProviderProbe struct {
-	ProviderID string      `json:"providerId"`
-	Kind       Kind        `json:"kind"`
-	Endpoint   string      `json:"endpoint"`
-	Health     Health      `json:"health"`
-	Version    VersionInfo `json:"version"`
-	ObservedAt string      `json:"observedAt"`
+	ProviderID   string      `json:"providerId"`
+	Kind         Kind        `json:"kind"`
+	Endpoint     string      `json:"endpoint"`
+	Health       Health      `json:"health"`
+	Version      VersionInfo `json:"version"`
+	VersionKnown bool        `json:"versionKnown"`
+	ObservedAt   string      `json:"observedAt"`
 }
 
 // InstalledModel is provider-neutral metadata for one locally installed model.
