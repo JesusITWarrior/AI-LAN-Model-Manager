@@ -169,12 +169,41 @@ CREATE INDEX inference_tokens_owner_idx ON inference_tokens(owner_id, token_id);
 CREATE INDEX inference_tokens_expiry_idx ON inference_tokens(expires_at);
 `;
 
+const migration6Sql = `
+CREATE TABLE pairing_challenges (
+  challenge_id TEXT PRIMARY KEY CHECK(length(challenge_id) = 64),
+  state TEXT NOT NULL CHECK(state IN ('created','presented','owner_confirmed','mutually_proven','consumed','expired','cancelled')),
+  version INTEGER NOT NULL CHECK(version > 0),
+  owner_id TEXT NOT NULL REFERENCES owners(owner_id) ON UPDATE RESTRICT ON DELETE CASCADE,
+  owner_version INTEGER NOT NULL CHECK(owner_version > 0),
+  candidate_id TEXT NOT NULL CHECK(length(candidate_id) BETWEEN 1 AND 128),
+  binding_address TEXT NOT NULL,
+  binding_port INTEGER NOT NULL CHECK(binding_port BETWEEN 1 AND 65535),
+  protocol_major INTEGER NOT NULL CHECK(protocol_major >= 0),
+  protocol_minor INTEGER NOT NULL CHECK(protocol_minor >= 0),
+  code_digest TEXT NOT NULL CHECK(length(code_digest) = 64),
+  controller_nonce_digest TEXT NOT NULL CHECK(length(controller_nonce_digest) = 64),
+  agent_nonce_digest TEXT CHECK(agent_nonce_digest IS NULL OR length(agent_nonce_digest) = 64),
+  proof_digest TEXT CHECK(proof_digest IS NULL OR length(proof_digest) = 64),
+  failed_attempts INTEGER NOT NULL CHECK(failed_attempts BETWEEN 0 AND 5),
+  created_at TEXT NOT NULL,
+  expires_at TEXT NOT NULL,
+  updated_at TEXT NOT NULL,
+  consumed_at TEXT,
+  terminal_at TEXT
+) STRICT;
+CREATE INDEX pairing_owner_idx ON pairing_challenges(owner_id, challenge_id);
+CREATE INDEX pairing_state_expiry_idx ON pairing_challenges(state, expires_at);
+CREATE UNIQUE INDEX pairing_one_active_candidate_idx ON pairing_challenges(candidate_id, binding_address) WHERE state IN ('created','presented','owner_confirmed','mutually_proven');
+`;
+
 export const CONTROLLER_MIGRATIONS: readonly Migration[] = Object.freeze([
   Object.freeze({ version: 1, name: "inventory-v1", sql: migration1Sql, checksum: migrationChecksum(migration1Sql) }),
   Object.freeze({ version: 2, name: "durable-jobs-v1", sql: migration2Sql, checksum: migrationChecksum(migration2Sql) }),
   Object.freeze({ version: 3, name: "owner-credentials-v1", sql: migration3Sql, checksum: migrationChecksum(migration3Sql) }),
   Object.freeze({ version: 4, name: "private-plan-sessions-v1", sql: migration4Sql, checksum: migrationChecksum(migration4Sql) }),
   Object.freeze({ version: 5, name: "inference-token-scope-v1", sql: migration5Sql, checksum: migrationChecksum(migration5Sql) }),
+  Object.freeze({ version: 6, name: "private-plan-pairing-v1", sql: migration6Sql, checksum: migrationChecksum(migration6Sql) }),
 ]);
 
 function validateMigrations(migrations: readonly Migration[]): void {

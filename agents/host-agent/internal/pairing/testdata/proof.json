@@ -1,0 +1,14 @@
+{
+  "code": "23456789",
+  "challengeId": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+  "controllerNonce": "BwcHBwcHBwcHBwcHBwcHBwcHBwcHBwcHBwcHBwcHBwc",
+  "agentNonce": "CQkJCQkJCQkJCQkJCQkJCQkJCQkJCQkJCQkJCQkJCQk",
+  "binding": {
+    "candidateId": "agent-1",
+    "address": "192.168.1.20",
+    "port": 7443,
+    "protocolMajor": 1,
+    "protocolMinor": 0
+  },
+  "proof": "1c7489c7f626db75c260e98a1e4b18417ac0901c50f9764f1e7400a5300b7764"
+}
