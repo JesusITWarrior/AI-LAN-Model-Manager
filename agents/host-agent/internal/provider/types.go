@@ -65,6 +65,32 @@ type InstalledModel struct {
 	Quantization  string   `json:"quantization"`
 }
 
+// AvailableModelState is the provider-reported availability of a model.
+type AvailableModelState string
+
+const (
+	// AvailableModelStateAvailable means the provider currently exposes the model.
+	AvailableModelStateAvailable AvailableModelState = "available"
+)
+
+// AvailableModel is provider-neutral metadata for a model exposed by a
+// provider's model inventory. It intentionally contains only source-backed
+// metadata; provider-specific artifact details must not be guessed. Owner and
+// CreatedAt are populated only when their corresponding Known field is true.
+type AvailableModel struct {
+	ModelID        string              `json:"modelId"`
+	ProviderID     string              `json:"providerId"`
+	CanonicalName  string              `json:"canonicalName"`
+	DisplayName    string              `json:"displayName"`
+	State          AvailableModelState `json:"state"`
+	Owner          string              `json:"owner"`
+	OwnerKnown     bool                `json:"ownerKnown"`
+	CreatedAt      string              `json:"createdAt"`
+	CreatedAtKnown bool                `json:"createdAtKnown"`
+	Capabilities   []string            `json:"capabilities"`
+	Modalities     []string            `json:"modalities"`
+}
+
 // RunningModel is a provider-neutral observation of one loaded model.
 // RuntimeID is stable for the provider, canonical name, and content digest.
 // Capabilities contains only capabilities explicitly reported by the source.

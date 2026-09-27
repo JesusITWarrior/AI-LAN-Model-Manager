@@ -1,4 +1,4 @@
-// Package lmstudio implements a health-only LM Studio provider adapter.
+// Package lmstudio implements an LM Studio provider adapter.
 package lmstudio
 
 import (
@@ -107,50 +107,13 @@ func NormalizeEndpoint(raw string) (string, error) {
 // from response headers, so every successful LM Studio probe has an explicitly
 // unknown (zero) version.
 func (client *Client) Probe(ctx context.Context) (provider.ProviderProbe, error) {
-	if err := ctx.Err(); err != nil {
+	body, err := client.doJSON(ctx, "/v1/models", MaximumBodySize, jsonResponseErrors{
+		failed: ErrResponseFailed,
+		status: ErrResponseStatus,
+		large:  ErrResponseTooLarge,
+	})
+	if err != nil {
 		return provider.ProviderProbe{}, err
-	}
-	probeContext, cancel := context.WithTimeout(ctx, client.timeout)
-	defer cancel()
-
-	request, err := http.NewRequestWithContext(probeContext, http.MethodGet, client.endpoint+"/v1/models", nil)
-	if err != nil {
-		return provider.ProviderProbe{}, ErrResponseFailed
-	}
-	request.Header.Set("Accept", "application/json")
-
-	response, err := client.doer.Do(request)
-	if response != nil && response.Body != nil {
-		defer response.Body.Close()
-	}
-	if err != nil {
-		if contextErr := probeContext.Err(); contextErr != nil {
-			return provider.ProviderProbe{}, contextErr
-		}
-		if errors.Is(err, context.Canceled) || errors.Is(err, context.DeadlineExceeded) {
-			return provider.ProviderProbe{}, err
-		}
-		return provider.ProviderProbe{}, ErrResponseFailed
-	}
-	if response == nil || response.Body == nil {
-		return provider.ProviderProbe{}, ErrResponseFailed
-	}
-	if response.StatusCode != http.StatusOK {
-		return provider.ProviderProbe{}, ErrResponseStatus
-	}
-
-	body, err := io.ReadAll(io.LimitReader(response.Body, MaximumBodySize+1))
-	if err != nil {
-		if contextErr := probeContext.Err(); contextErr != nil {
-			return provider.ProviderProbe{}, contextErr
-		}
-		if errors.Is(err, context.Canceled) || errors.Is(err, context.DeadlineExceeded) {
-			return provider.ProviderProbe{}, err
-		}
-		return provider.ProviderProbe{}, ErrResponseFailed
-	}
-	if len(body) > MaximumBodySize {
-		return provider.ProviderProbe{}, ErrResponseTooLarge
 	}
 	if err := validateModels(body); err != nil {
 		return provider.ProviderProbe{}, ErrResponseInvalid
@@ -165,6 +128,64 @@ func (client *Client) Probe(ctx context.Context) (provider.ProviderProbe, error)
 		VersionKnown: false,
 		ObservedAt:   client.clock.Now().UTC().Truncate(time.Millisecond).Format("2006-01-02T15:04:05.000Z"),
 	}, nil
+}
+
+type jsonResponseErrors struct {
+	failed error
+	status error
+	large  error
+}
+
+// doJSON performs one bounded JSON GET while preserving context errors and
+// returning only caller-provided stable errors for transport and protocol
+// failures. Response bodies are closed on every path where one is returned.
+func (client *Client) doJSON(ctx context.Context, path string, maximumBodySize int64, responseErrors jsonResponseErrors) ([]byte, error) {
+	if err := ctx.Err(); err != nil {
+		return nil, err
+	}
+	requestContext, cancel := context.WithTimeout(ctx, client.timeout)
+	defer cancel()
+
+	request, err := http.NewRequestWithContext(requestContext, http.MethodGet, client.endpoint+path, nil)
+	if err != nil {
+		return nil, responseErrors.failed
+	}
+	request.Header.Set("Accept", "application/json")
+
+	response, err := client.doer.Do(request)
+	if response != nil && response.Body != nil {
+		defer response.Body.Close()
+	}
+	if err != nil {
+		if contextErr := requestContext.Err(); contextErr != nil {
+			return nil, contextErr
+		}
+		if errors.Is(err, context.Canceled) || errors.Is(err, context.DeadlineExceeded) {
+			return nil, err
+		}
+		return nil, responseErrors.failed
+	}
+	if response == nil || response.Body == nil {
+		return nil, responseErrors.failed
+	}
+	if response.StatusCode != http.StatusOK {
+		return nil, responseErrors.status
+	}
+
+	body, err := io.ReadAll(io.LimitReader(response.Body, maximumBodySize+1))
+	if err != nil {
+		if contextErr := requestContext.Err(); contextErr != nil {
+			return nil, contextErr
+		}
+		if errors.Is(err, context.Canceled) || errors.Is(err, context.DeadlineExceeded) {
+			return nil, err
+		}
+		return nil, responseErrors.failed
+	}
+	if int64(len(body)) > maximumBodySize {
+		return nil, responseErrors.large
+	}
+	return body, nil
 }
 
 // validateModels accepts exactly the OpenAI-compatible list envelope: root keys
