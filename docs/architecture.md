@@ -20,8 +20,11 @@ always enforced server-side.
 A small Go agent runs on Linux, macOS, and Windows. It owns telemetry, provider
 adapters, guarded lifecycle actions, verified artifact staging, and constrained
 custom manifests. It runs unprivileged by default; narrow privileged helpers are
-isolated. Discovery yields only an untrusted candidate. One-time pairing creates
-mutual identities with replay protection, rotation, and revocation.
+isolated. Discovery yields only an untrusted candidate. The discovery packet
+builder and listener lifecycle are explicit and injectable; operating-system
+multicast sender wiring is deferred to the authenticated transport integration.
+One-time pairing creates mutual identities with replay protection, rotation, and
+revocation.
 
 ### Provider contract
 
