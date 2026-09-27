@@ -79,17 +79,17 @@ test("migration2 registers jobs/job_history/audit_events and migration ledger ha
   const db = openControllerDatabase(":memory:");
   try {
     const n = migrateControllerDatabase(db, CONTROLLER_MIGRATIONS);
-    assert.equal(n, 2);
+    assert.equal(n, 3);
     const names = db
       .prepare("SELECT name FROM sqlite_master WHERE type='table' AND name NOT LIKE 'sqlite_%'")
       .all() as Array<{ name: string }>;
     const set = names.map((r) => r.name).sort();
-    assert.deepEqual(set, ["audit_events", "hosts", "job_history", "jobs", "models", "providers", "schema_migrations"]);
+    assert.deepEqual(set, ["audit_events", "hosts", "job_history", "jobs", "models", "owners", "providers", "schema_migrations"]);
     const cols = db.prepare(`PRAGMA table_info(audit_events)`).all() as Array<{ name: string }>;
     for (const col of ["seq", "event_json", "body_json", "outcome", "previous_hash", "hash", "created_at"]) {
       assert.ok(cols.some((c) => c.name === col), `audit_events has column ${col}`);
     }
-    assert.equal(CONTROLLER_MIGRATIONS.length, 2);
+    assert.equal(CONTROLLER_MIGRATIONS.length, 3);
     assert.equal(CONTROLLER_MIGRATIONS[1]!.name, "durable-jobs-v1");
   } finally {
     db.close();
@@ -105,7 +105,7 @@ test("a migration1 database upgrades transactionally to migration2", () => {
     assert.equal((db.prepare("PRAGMA user_version").get() as { user_version: number }).user_version, 1);
     db.close();
     db = openControllerDatabase(path);
-    assert.equal((db.prepare("PRAGMA user_version").get() as { user_version: number }).user_version, 2);
+    assert.equal((db.prepare("PRAGMA user_version").get() as { user_version: number }).user_version, 3);
     assert.ok(db.prepare("SELECT name FROM sqlite_master WHERE name='jobs'").get());
     db.close();
   } finally { rmSync(dir, { recursive: true, force: true }); }
@@ -444,9 +444,9 @@ test("readOnly store applies migration2 and reads jobs written earlier", () => {
     stores.jobs.create(snapshot("submitted"));
     db.close();
     const ro = openControllerDatabase(path, { readOnly: true });
-    // readOnly + migration2 must be applied (user_version=2).
+    // readOnly + migration3 must be applied (user_version=3).
     const uv = (ro.prepare("PRAGMA user_version").get() as { user_version: number }).user_version;
-    assert.equal(uv, 2);
+    assert.equal(uv, 3);
     // A job created via a write connection is readable in the read-only connection.
     const reopened = createJobStores(ro, { now: () => t1 });
     const list = reopened.jobs.list("submitted");

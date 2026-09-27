@@ -116,9 +116,24 @@ CREATE TABLE audit_events (
 ) STRICT;
 `;
 
+const migration3Sql = `
+CREATE TABLE owners (
+  singleton_key INTEGER PRIMARY KEY CHECK(singleton_key = 1),
+  owner_id TEXT NOT NULL UNIQUE CHECK(length(owner_id) = 32),
+  username_display TEXT NOT NULL CHECK(length(username_display) BETWEEN 1 AND 64),
+  username_normalized TEXT NOT NULL UNIQUE CHECK(length(username_normalized) BETWEEN 1 AND 64),
+  credential_hash TEXT NOT NULL CHECK(length(credential_hash) BETWEEN 64 AND 512),
+  disabled INTEGER NOT NULL CHECK(disabled IN (0,1)),
+  credential_version INTEGER NOT NULL CHECK(credential_version > 0),
+  created_at TEXT NOT NULL,
+  updated_at TEXT NOT NULL
+) STRICT;
+`;
+
 export const CONTROLLER_MIGRATIONS: readonly Migration[] = Object.freeze([
   Object.freeze({ version: 1, name: "inventory-v1", sql: migration1Sql, checksum: migrationChecksum(migration1Sql) }),
   Object.freeze({ version: 2, name: "durable-jobs-v1", sql: migration2Sql, checksum: migrationChecksum(migration2Sql) }),
+  Object.freeze({ version: 3, name: "owner-credentials-v1", sql: migration3Sql, checksum: migrationChecksum(migration3Sql) }),
 ]);
 
 function validateMigrations(migrations: readonly Migration[]): void {
