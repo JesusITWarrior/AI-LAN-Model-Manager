@@ -406,21 +406,15 @@ func decodeInstalledModels(body []byte, providerID string) ([]provider.Installed
 	}
 	models := make([]provider.InstalledModel, 0, len(rawModels))
 	canonicalSeen := make(map[string]struct{}, len(rawModels))
-	identitySeen := make(map[string]struct{}, len(rawModels))
 	for _, raw := range rawModels {
 		model, err := normalizeTagModel(raw, providerID)
 		if err != nil {
 			return nil, err
 		}
-		identity := model.Digest + "\x00" + model.CanonicalName
 		if _, exists := canonicalSeen[model.CanonicalName]; exists {
 			return nil, ErrInvalidListResponse
 		}
-		if _, exists := identitySeen[identity]; exists {
-			return nil, ErrInvalidListResponse
-		}
 		canonicalSeen[model.CanonicalName] = struct{}{}
-		identitySeen[identity] = struct{}{}
 		models = append(models, model)
 	}
 	sort.Slice(models, func(i, j int) bool {
@@ -585,26 +579,29 @@ func normalizeTagModel(raw tagModel, providerID string) (provider.InstalledModel
 			return provider.InstalledModel{}, ErrInvalidListResponse
 		}
 	}
-	for _, value := range []string{raw.details.format, raw.details.family, raw.details.parameter, raw.details.quantization} {
-		if !validMetadata(value) {
-			return provider.InstalledModel{}, ErrInvalidListResponse
-		}
+	if err := normalizeMetadata(raw.details, ErrInvalidListResponse); err != nil {
+		return provider.InstalledModel{}, err
 	}
-	families := make([]string, len(raw.details.families))
-	familySeen := make(map[string]struct{}, len(families))
-	for index, family := range raw.details.families {
-		if !validMetadata(family) {
-			return provider.InstalledModel{}, ErrInvalidListResponse
-		}
-		normalized := strings.ToLower(family)
-		if _, exists := familySeen[normalized]; exists {
-			return provider.InstalledModel{}, ErrInvalidListResponse
-		}
-		familySeen[normalized] = struct{}{}
-		families[index] = family
+	families, err := normalizeFamilies(raw.details.families, ErrInvalidListResponse)
+	if err != nil {
+		return provider.InstalledModel{}, err
 	}
-	identity := sha256.Sum256([]byte(providerID + "\x00" + canonicalName + "\x00" + digest))
-	return provider.InstalledModel{ModelID: "ollama-" + hex.EncodeToString(identity[:]), ProviderID: providerID, CanonicalName: canonicalName, DisplayName: raw.name, Digest: digest, SizeBytes: raw.size, ModifiedAt: modified.UTC().Truncate(time.Millisecond).Format("2006-01-02T15:04:05.000Z"), ParentModel: parent, Format: raw.details.format, Family: raw.details.family, Families: families, ParameterSize: raw.details.parameter, Quantization: raw.details.quantization}, nil
+	runtimeID := sha256.Sum256([]byte(providerID + "\x00" + canonicalName + "\x00" + digest))
+	return provider.InstalledModel{
+		ModelID:       "ollama-" + hex.EncodeToString(runtimeID[:]),
+		ProviderID:    providerID,
+		CanonicalName: canonicalName,
+		DisplayName:   raw.name,
+		Digest:        digest,
+		SizeBytes:     raw.size,
+		ModifiedAt:    formatTimestamp(modified),
+		ParentModel:   parent,
+		Format:        raw.details.format,
+		Family:        raw.details.family,
+		Families:      families,
+		ParameterSize: raw.details.parameter,
+		Quantization:  raw.details.quantization,
+	}, nil
 }
 
 func canonicalModelName(value string) (string, bool) {
@@ -633,4 +630,42 @@ func canonicalModelName(value string) (string, bool) {
 }
 func validMetadata(value string) bool {
 	return len(value) >= 1 && len(value) <= maximumMetadataLength && strings.TrimSpace(value) == value && metadataPattern.MatchString(value)
+}
+
+// normalizeMetadata validates the provider-neutral metadata strings shared by
+// installed and running responses: format, family, parameter size, and
+// quantization. Both decoders apply this single rule; the sentinel differs by
+// caller so strict-response assertions stay provider-specific.
+func normalizeMetadata(detail tagDetails, errResponse error) error {
+	for _, value := range []string{detail.format, detail.family, detail.parameter, detail.quantization} {
+		if !validMetadata(value) {
+			return errResponse
+		}
+	}
+	return nil
+}
+
+// normalizeFamilies canonicalizes (lowercases) every family, rejects invalid
+// values, and de-duplicates the list case-insensitively. The returned list is
+// already canonicalized, so installed and running store identical families.
+func normalizeFamilies(families []string, errResponse error) ([]string, error) {
+	normalized := make([]string, len(families))
+	seen := make(map[string]struct{}, len(families))
+	for index, value := range families {
+		if !validMetadata(value) {
+			return nil, errResponse
+		}
+		normalized[index] = strings.ToLower(value)
+		if _, exists := seen[normalized[index]]; exists {
+			return nil, errResponse
+		}
+		seen[normalized[index]] = struct{}{}
+	}
+	return normalized, nil
+}
+
+// formatTimestamp renders an observation time in the canonical UTC form shared
+// by installed and running responses.
+func formatTimestamp(value time.Time) string {
+	return value.UTC().Truncate(time.Millisecond).Format("2006-01-02T15:04:05.000Z")
 }

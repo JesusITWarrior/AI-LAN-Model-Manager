@@ -54,3 +54,42 @@ type InstalledModel struct {
 	ParameterSize string   `json:"parameterSize"`
 	Quantization  string   `json:"quantization"`
 }
+
+// RunningModel is a provider-neutral observation of one loaded model.
+// RuntimeID is stable for the provider, canonical name, and content digest.
+// Capabilities contains only capabilities explicitly reported by the source.
+type RunningModel struct {
+	RuntimeID     string    `json:"runtimeId"`
+	ProviderID    string    `json:"providerId"`
+	CanonicalName string    `json:"canonicalName"`
+	DisplayName   string    `json:"displayName"`
+	Digest        string    `json:"digest"`
+	SizeBytes     uint64    `json:"sizeBytes"`
+	SizeVRAMBytes uint64    `json:"sizeVramBytes"`
+	ExpiresAt     string    `json:"expiresAt"`
+	ContextLength uint64    `json:"contextLength"`
+	ParentModel   string    `json:"parentModel"`
+	Format        string    `json:"format"`
+	Family        string    `json:"family"`
+	Families      []string  `json:"families"`
+	ParameterSize string    `json:"parameterSize"`
+	Quantization  string    `json:"quantization"`
+	Capabilities  []string  `json:"capabilities"`
+	ObservedAt    string    `json:"observedAt"`
+	Residency     Residency `json:"residency"`
+	Modalities    []string  `json:"modalities"`
+}
+
+// Residency identifies how a running model's tensors are distributed across
+// device memory. It is provider-neutral and normalized from size and size_vram
+// only; it is never inferred from the model family, name, or capabilities.
+type Residency string
+
+const (
+	// ResidencyCPU indicates no tensors were staged in device memory (size_vram is 0).
+	ResidencyCPU Residency = "cpu"
+	// ResidencyGPU indicates every tensor is staged in device memory (size_vram == size, size > 0).
+	ResidencyGPU Residency = "gpu"
+	// ResidencySplit indicates tensors span both host and device memory (0 < size_vram < size).
+	ResidencySplit Residency = "split"
+)
