@@ -11,7 +11,7 @@ import (
 const lifecycleModel = "acme/bert:latest"
 
 func TestLifecycleConstructorsAndBoundaries(t *testing.T) {
-	for _, keepAlive := range []time.Duration{time.Second, 24 * time.Hour} {
+	for _, keepAlive := range []time.Duration{0, time.Second, 24 * time.Hour} {
 		command, err := NewLoadModelCommand(strings.Repeat("a", 128), strings.Repeat("p", 128), "Acme/Bert:Latest", keepAlive, Metadata{})
 		if err != nil {
 			t.Fatalf("boundary command: %v", err)
@@ -47,7 +47,6 @@ func TestLifecycleConstructorsRejectInvalidValues(t *testing.T) {
 		{"long provider", valid("c", strings.Repeat("p", 129), lifecycleModel, time.Second, Metadata{})},
 		{"bad provider", valid("c", "bad/provider", lifecycleModel, time.Second, Metadata{})},
 		{"bad model", valid("c", "p", "../model", time.Second, Metadata{})},
-		{"zero keep alive", valid("c", "p", lifecycleModel, 0, Metadata{})},
 		{"subsecond", valid("c", "p", lifecycleModel, 1500*time.Millisecond, Metadata{})},
 		{"over 24h", valid("c", "p", lifecycleModel, 24*time.Hour+time.Second, Metadata{})},
 		{"known zero context", valid("c", "p", lifecycleModel, time.Second, Metadata{Known: true})},

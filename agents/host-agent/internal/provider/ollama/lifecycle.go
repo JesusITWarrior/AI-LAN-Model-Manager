@@ -93,6 +93,9 @@ func (client *Client) Load(ctx context.Context, command provider.LoadModelComman
 	if err := command.Validate(); err != nil {
 		return provider.LifecycleResult{}, err
 	}
+	if command.KeepAlive() == 0 {
+		return provider.LifecycleResult{}, provider.ErrInvalidCommand
+	}
 	if command.ProviderID() != client.providerID {
 		return provider.LifecycleResult{}, ErrLifecycleProviderConflict
 	}

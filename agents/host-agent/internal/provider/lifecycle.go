@@ -99,7 +99,7 @@ func (c UnloadModelCommand) ContextLengthKnown() bool { return c.contextLengthKn
 func (c UnloadModelCommand) Action() Action           { return ActionUnload }
 
 func (c LoadModelCommand) Validate() error {
-	if !validCommandIdentity(c.commandID, c.providerID, c.canonicalName) || c.keepAlive < KeepAliveMinimum || c.keepAlive > KeepAliveMaximum || c.keepAlive%time.Second != 0 || !validContext(c.contextLength, c.contextLengthKnown) {
+	if !validCommandIdentity(c.commandID, c.providerID, c.canonicalName) || !validLoadKeepAlive(c.keepAlive) || !validContext(c.contextLength, c.contextLengthKnown) {
 		return ErrInvalidCommand
 	}
 	return nil
@@ -115,6 +115,10 @@ func (c UnloadModelCommand) Validate() error {
 func validCommandIdentity(commandID, providerID, model string) bool {
 	canonical, ok := CanonicalOllamaModelName(model)
 	return commandIDPattern.MatchString(commandID) && ValidateProviderID(providerID) && ok && canonical == model
+}
+
+func validLoadKeepAlive(value time.Duration) bool {
+	return value == 0 || value >= KeepAliveMinimum && value <= KeepAliveMaximum && value%time.Second == 0
 }
 
 func validContext(value uint64, known bool) bool {
