@@ -81,8 +81,44 @@ CREATE INDEX models_host_idx ON models(host_id, canonical_name, model_id);
 CREATE INDEX models_state_idx ON models(state, model_id);
 `;
 
+const migration2Sql = `
+CREATE TABLE jobs (
+  job_id TEXT PRIMARY KEY,
+  state TEXT NOT NULL CHECK(state IN ('submitted','validated','authorized','dispatched','accepted','running','succeeded','failed','timed-out','cancelled')),
+  host_id TEXT NOT NULL,
+  submitted_at TEXT NOT NULL,
+  updated_at TEXT NOT NULL,
+  attempt INTEGER NOT NULL CHECK(attempt > 0),
+  idempotency_key TEXT NOT NULL UNIQUE,
+  payload_json TEXT NOT NULL CHECK(json_valid(payload_json)),
+  created_at TEXT NOT NULL
+) STRICT;
+CREATE INDEX jobs_state_idx ON jobs(state, updated_at, job_id);
+CREATE INDEX jobs_host_idx ON jobs(host_id, updated_at, job_id);
+CREATE TABLE job_history (
+  history_id INTEGER PRIMARY KEY,
+  job_id TEXT NOT NULL REFERENCES jobs(job_id) ON DELETE CASCADE,
+  from_state TEXT NOT NULL,
+  to_state TEXT NOT NULL,
+  attempt INTEGER NOT NULL CHECK(attempt BETWEEN 1 AND 100),
+  occurred_at TEXT NOT NULL,
+  created_at TEXT NOT NULL
+) STRICT;
+CREATE INDEX job_history_job_idx ON job_history(job_id, history_id);
+CREATE TABLE audit_events (
+  seq INTEGER PRIMARY KEY CHECK(seq > 0),
+  event_json TEXT NOT NULL CHECK(json_valid(event_json)),
+  body_json TEXT NOT NULL CHECK(json_valid(body_json)),
+  outcome TEXT NOT NULL CHECK(outcome IN ('observed','allowed','denied','started','succeeded','failed','cancelled')),
+  previous_hash TEXT CHECK(previous_hash IS NULL OR length(previous_hash) = 64),
+  hash TEXT NOT NULL UNIQUE CHECK(length(hash) = 64),
+  created_at TEXT NOT NULL
+) STRICT;
+`;
+
 export const CONTROLLER_MIGRATIONS: readonly Migration[] = Object.freeze([
   Object.freeze({ version: 1, name: "inventory-v1", sql: migration1Sql, checksum: migrationChecksum(migration1Sql) }),
+  Object.freeze({ version: 2, name: "durable-jobs-v1", sql: migration2Sql, checksum: migrationChecksum(migration2Sql) }),
 ]);
 
 function validateMigrations(migrations: readonly Migration[]): void {

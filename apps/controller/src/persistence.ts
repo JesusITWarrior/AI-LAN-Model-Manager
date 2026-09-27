@@ -9,6 +9,18 @@ export {
   type PersistenceErrorCode,
 } from "./database.js";
 export {
+  AuditRepository,
+  JobRepository,
+  JobStoreError,
+  createJobStores,
+  type AuditRecord,
+  type CoupledContext,
+  type HistoryRecord,
+  type JobRecord,
+  type JobStores,
+  type JobStoreErrorCode,
+} from "./jobs-store.js";
+export {
   ControllerRepositories,
   HostRepository,
   ModelRepository,
