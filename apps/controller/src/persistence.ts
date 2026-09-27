@@ -34,3 +34,9 @@ export {
 export { clearSessionCookie, parseSessionCookieHeader, serializeSessionCookie } from "./cookie-parser.js";
 export { createAllowedOrigins, originAllowed, type OriginPolicyOptions } from "./origin.js";
 export { guardManagementRequest, type GuardResult } from "./guard.js";
+export { InferenceTokenManager, createInferenceTokenManager, type InferenceTokenManagerOptions, type ManagementAuthorizer } from "./inference-manager.js";
+export { generateInferenceToken, inferenceTokenDigest, parseAuthorizationBearer, validInferenceToken } from "./inference-bearer.js";
+export {
+  INFERENCE_DEFAULT_TTL_MS, INFERENCE_MAX_TTL_MS, INFERENCE_MIN_TTL_MS, INFERENCE_SCOPES, INFERENCE_TOKEN_BYTES, InferenceTokenError,
+  type InferenceAuthorizationResult, type InferenceScope, type InferenceTokenErrorCode, type InferenceTokenMetadata, type IssuedInferenceToken, type StoredInferenceToken,
+} from "./inference-types.js";

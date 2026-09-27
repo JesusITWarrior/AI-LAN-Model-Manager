@@ -148,11 +148,33 @@ CREATE INDEX sessions_absolute_expiry_idx ON sessions(absolute_expires_at);
 CREATE INDEX sessions_idle_expiry_idx ON sessions(idle_expires_at);
 `;
 
+// Separate management/inference credential scopes. Management owner-session
+// credentials never authenticate inference requests, and inference Bearer
+// tokens never authenticate management routes. The token_digest column holds
+// the SHA-256 of the one-time raw bearer; the raw token is never stored.
+const migration5Sql = `
+CREATE TABLE inference_tokens (
+  token_digest TEXT PRIMARY KEY CHECK(length(token_digest) = 64),
+  token_id TEXT NOT NULL UNIQUE CHECK(length(token_id) = 32),
+  owner_id TEXT NOT NULL REFERENCES owners(owner_id) ON UPDATE RESTRICT ON DELETE CASCADE,
+  label TEXT NOT NULL CHECK(length(label) BETWEEN 1 AND 64),
+  scopes_json TEXT NOT NULL CHECK(scopes_json = '["inference:invoke","model:list"]'),
+  credential_version INTEGER NOT NULL CHECK(credential_version > 0),
+  created_at TEXT NOT NULL,
+  last_used_at TEXT,
+  expires_at TEXT,
+  revoked_at TEXT
+) STRICT;
+CREATE INDEX inference_tokens_owner_idx ON inference_tokens(owner_id, token_id);
+CREATE INDEX inference_tokens_expiry_idx ON inference_tokens(expires_at);
+`;
+
 export const CONTROLLER_MIGRATIONS: readonly Migration[] = Object.freeze([
   Object.freeze({ version: 1, name: "inventory-v1", sql: migration1Sql, checksum: migrationChecksum(migration1Sql) }),
   Object.freeze({ version: 2, name: "durable-jobs-v1", sql: migration2Sql, checksum: migrationChecksum(migration2Sql) }),
   Object.freeze({ version: 3, name: "owner-credentials-v1", sql: migration3Sql, checksum: migrationChecksum(migration3Sql) }),
   Object.freeze({ version: 4, name: "private-plan-sessions-v1", sql: migration4Sql, checksum: migrationChecksum(migration4Sql) }),
+  Object.freeze({ version: 5, name: "inference-token-scope-v1", sql: migration5Sql, checksum: migrationChecksum(migration5Sql) }),
 ]);
 
 function validateMigrations(migrations: readonly Migration[]): void {
