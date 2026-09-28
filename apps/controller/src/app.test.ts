@@ -16,3 +16,13 @@ test("health reports a loopback-only development surface", async (context) => {
     status: "ok", exposure: "development-loopback-only"
   });
 });
+
+test("controller delegates only versioned management paths to an injected handler", async (context) => {
+  let calls=0;
+  const server=createControllerServer((_request,response)=>{calls++;response.writeHead(204);response.end();});
+  server.listen(0,"127.0.0.1");await once(server,"listening");context.after(()=>server.close());
+  const address=server.address();assert.ok(address&&typeof address==="object");const base=`http://127.0.0.1:${address.port}`;
+  assert.equal((await fetch(`${base}/api/v1/fleet/summary`)).status,204);
+  assert.equal((await fetch(`${base}/health`)).status,200);
+  assert.equal(calls,1);
+});

@@ -11,6 +11,16 @@ export function handleRequest(request: IncomingMessage, response: ServerResponse
   response.end(JSON.stringify({ error: "not_found" }));
 }
 
-export function createControllerServer() {
-  return createServer(handleRequest);
+export type ControllerRequestHandler = (request: IncomingMessage, response: ServerResponse) => void;
+
+/** Create the HTTP server without listening. An injected management handler owns /api/v1. */
+export function createControllerServer(management?: ControllerRequestHandler) {
+  return createServer((request, response) => {
+    const path = request.url?.split("?", 1)[0] ?? "";
+    if (management && (path === "/api/v1" || path.startsWith("/api/v1/"))) {
+      management(request, response);
+      return;
+    }
+    handleRequest(request, response);
+  });
 }
