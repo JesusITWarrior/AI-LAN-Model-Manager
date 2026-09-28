@@ -4,6 +4,7 @@ import type { PolicyService } from "./policy-service.js";
 import type { CommandDispatcher, DispatchResult } from "./command-dispatch.js";
 import type { ControllerRepositories, ModelRecord } from "./repositories.js";
 import type { AdmissionController } from "./admission-accounting.js";
+import type { ArtifactCacheRegistry } from "@lan-model-manager/core";
 
 export type LifecycleError =
   | "ERR_LIFECYCLE_INPUT" | "ERR_LIFECYCLE_DENIED" | "ERR_LIFECYCLE_CAPABILITY"
@@ -41,7 +42,7 @@ function freshObservation(response: CommandResponse, before: string, request: Co
 }
 
 export class LifecycleService {
-  constructor(private readonly policy: PolicyService, private readonly dispatcher: CommandDispatcher, private readonly repositories: ControllerRepositories, private readonly admissions?: AdmissionController) {}
+  constructor(private readonly policy: PolicyService, private readonly dispatcher: CommandDispatcher, private readonly repositories: ControllerRepositories, private readonly admissions?: AdmissionController, private readonly cache?: ArtifactCacheRegistry) {}
 
   execute(input: LifecycleExecution): LifecycleResult {
     const parsed = parseCommandRequest(input?.request);
@@ -64,6 +65,8 @@ export class LifecycleService {
     const approvalOnly = authorization.value.requiresApproval && authorization.value.reasons.every(reason => reason === "approval-required");
     if ((!authorization.value.allowed && !approvalOnly) || !this.policy.validateCapability(request.capability, input.intent, authorization.value)) return fail("ERR_LIFECYCLE_CAPABILITY");
     const before = model?.observedAt ?? "1970-01-01T00:00:00.000Z";
+    let evictionStarted=false,evictionArtifact:string|null=null;
+    if(request.operation==="remove-managed-artifact"&&model&&this.cache){const value=snapshot(model)?.artifactId;if(typeof value!=="string")return fail("ERR_LIFECYCLE_STATE");try{this.cache.beginEviction(value);evictionStarted=true;evictionArtifact=value;}catch{return fail("ERR_LIFECYCLE_STATE");}}
 
     if (request.operation === "unload" && activeRequests !== null && activeRequests > 0) {
       if (!input.drainIntent || !input.drainRequest) return fail("ERR_LIFECYCLE_STATE");
@@ -71,7 +74,8 @@ export class LifecycleService {
       if (!drained.ok || drained.state !== "succeeded") return drained;
     }
     const result = this.dispatcher.dispatch(request, response => freshObservation(response, before, request));
-    if (!result.ok) return fail(result.error === "ERR_DISPATCH_OBSERVATION" ? "ERR_LIFECYCLE_OBSERVATION" : "ERR_LIFECYCLE_DISPATCH");
+    if (!result.ok) {if(evictionStarted&&evictionArtifact)try{this.cache?.cancelEviction(evictionArtifact);}catch{/* preserve dispatch error */}return fail(result.error === "ERR_DISPATCH_OBSERVATION" ? "ERR_LIFECYCLE_OBSERVATION" : "ERR_LIFECYCLE_DISPATCH");}
+    if(evictionStarted&&evictionArtifact)try{this.cache?.finishEviction(evictionArtifact);}catch{return fail("ERR_LIFECYCLE_STATE");}
     return result as LifecycleResult;
   }
 
