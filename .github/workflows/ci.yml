@@ -1,9 +1,8 @@
 name: CI
 
+# Automatic hosted builds are disabled by project policy.
 on:
-  push:
-    branches: [main]
-  pull_request:
+  workflow_dispatch:
 
 jobs:
   check:
