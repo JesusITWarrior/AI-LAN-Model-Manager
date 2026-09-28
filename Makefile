@@ -6,7 +6,7 @@ build:
 	npm run build
 
 test:
-	npx tsx --test packages/core/src/*.test.ts apps/controller/src/*.test.ts
+	npx tsx --test packages/core/src/*.test.ts apps/controller/src/*.test.ts apps/controller/src/transport/*.test.ts
 
 go-test:
 	cd agents/host-agent && go test ./...

@@ -238,6 +238,20 @@ CREATE INDEX host_certificates_ca_idx ON host_certificates(ca_id);
 CREATE UNIQUE INDEX host_certificates_active_candidate_idx ON host_certificates(candidate_id) WHERE status = 'active';
 `;
 
+const migration8Sql = `
+CREATE TABLE transport_replay_state (
+  certificate_fingerprint TEXT PRIMARY KEY CHECK(length(certificate_fingerprint) = 64),
+  certificate_serial TEXT NOT NULL CHECK(length(certificate_serial) BETWEEN 2 AND 40),
+  host_id TEXT NOT NULL CHECK(length(host_id) BETWEEN 1 AND 128),
+  high_water INTEGER NOT NULL CHECK(high_water >= 0),
+  request_id TEXT NOT NULL,
+  nonce TEXT NOT NULL,
+  sent_at TEXT NOT NULL,
+  updated_at TEXT NOT NULL
+) STRICT;
+CREATE INDEX transport_replay_host_idx ON transport_replay_state(host_id, certificate_fingerprint);
+`;
+
 export const CONTROLLER_MIGRATIONS: readonly Migration[] = Object.freeze([
   Object.freeze({ version: 1, name: "inventory-v1", sql: migration1Sql, checksum: migrationChecksum(migration1Sql) }),
   Object.freeze({ version: 2, name: "durable-jobs-v1", sql: migration2Sql, checksum: migrationChecksum(migration2Sql) }),
@@ -246,6 +260,7 @@ export const CONTROLLER_MIGRATIONS: readonly Migration[] = Object.freeze([
   Object.freeze({ version: 5, name: "inference-token-scope-v1", sql: migration5Sql, checksum: migrationChecksum(migration5Sql) }),
   Object.freeze({ version: 6, name: "private-plan-pairing-v1", sql: migration6Sql, checksum: migrationChecksum(migration6Sql) }),
   Object.freeze({ version: 7, name: "private-plan-certificate-v1", sql: migration7Sql, checksum: migrationChecksum(migration7Sql) }),
+  Object.freeze({ version: 8, name: "private-plan-transport-replay-v1", sql: migration8Sql, checksum: migrationChecksum(migration8Sql) }),
 ]);
 
 function validateMigrations(migrations: readonly Migration[]): void {
