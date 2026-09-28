@@ -78,6 +78,7 @@ export interface ControllerPathPlan {
   readonly stagingDir: string;
   readonly quarantineDir: string;
   readonly auditDir: string;
+  readonly certificateDir: string;
 }
 
 export type ControllerPathFlavor = "posix" | "win32";
@@ -204,6 +205,7 @@ export function createControllerPathPlan(
       stagingDir: api.join(rootDir, "staging"),
       quarantineDir: api.join(rootDir, "quarantine"),
       auditDir: api.join(rootDir, "audit"),
+      certificateDir: api.join(rootDir, "certificates"),
     } as const;
     for (const child of Object.values(children)) {
       const relative = api.relative(rootDir, child);

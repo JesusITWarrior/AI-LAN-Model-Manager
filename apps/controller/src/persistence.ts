@@ -36,6 +36,10 @@ export { createAllowedOrigins, originAllowed, type OriginPolicyOptions } from ".
 export { guardManagementRequest, type GuardResult } from "./guard.js";
 export { PairingManager, pairingProof, pairingTranscript, type PairingManagementAuthorizer, type PairingManagerOptions } from "./pairing-manager.js";
 export { PairingRepository } from "./pairing-repository.js";
+export { OpenSslCertificateEngine } from "./certificate-adapter.js";
+export { CertificateManager, type CertificateManagerOptions } from "./certificate-manager.js";
+export { CertificateRepository } from "./certificate-repository.js";
+export { CertificateError, type CertificateEngine, type CertificateEnrollmentAuthorization, type CertificateEnrollmentResult, type CertificateSigningRequest } from "./certificate-types.js";
 export { PAIRING_CODE_ALPHABET, PAIRING_CODE_LENGTH, PAIRING_MAX_ATTEMPTS, PAIRING_MAX_TTL_MS, PairingError, type EnrollmentAuthorization, type PairingErrorCode, type PairingPresentation, type PairingProofInput } from "./pairing-types.js";
 export { InferenceTokenManager, createInferenceTokenManager, type InferenceTokenManagerOptions, type ManagementAuthorizer } from "./inference-manager.js";
 export { generateInferenceToken, inferenceTokenDigest, parseAuthorizationBearer, validInferenceToken } from "./inference-bearer.js";
