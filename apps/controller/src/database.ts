@@ -252,6 +252,20 @@ CREATE TABLE transport_replay_state (
 CREATE INDEX transport_replay_host_idx ON transport_replay_state(host_id, certificate_fingerprint);
 `;
 
+const migration9Sql = `
+CREATE TABLE fleet_liveness (
+  host_id TEXT PRIMARY KEY REFERENCES hosts(host_id) ON UPDATE RESTRICT ON DELETE CASCADE,
+  certificate_fingerprint TEXT NOT NULL CHECK(length(certificate_fingerprint) = 64),
+  protocol_minor INTEGER NOT NULL CHECK(protocol_minor >= 0),
+  last_sequence INTEGER NOT NULL CHECK(last_sequence >= 0),
+  last_observed_at TEXT NOT NULL,
+  last_request_id TEXT NOT NULL,
+  idle INTEGER NOT NULL CHECK(idle IN (0,1)),
+  updated_at TEXT NOT NULL
+) STRICT;
+CREATE INDEX fleet_liveness_observed_idx ON fleet_liveness(last_observed_at,host_id);
+`;
+
 export const CONTROLLER_MIGRATIONS: readonly Migration[] = Object.freeze([
   Object.freeze({ version: 1, name: "inventory-v1", sql: migration1Sql, checksum: migrationChecksum(migration1Sql) }),
   Object.freeze({ version: 2, name: "durable-jobs-v1", sql: migration2Sql, checksum: migrationChecksum(migration2Sql) }),
@@ -261,6 +275,7 @@ export const CONTROLLER_MIGRATIONS: readonly Migration[] = Object.freeze([
   Object.freeze({ version: 6, name: "private-plan-pairing-v1", sql: migration6Sql, checksum: migrationChecksum(migration6Sql) }),
   Object.freeze({ version: 7, name: "private-plan-certificate-v1", sql: migration7Sql, checksum: migrationChecksum(migration7Sql) }),
   Object.freeze({ version: 8, name: "private-plan-transport-replay-v1", sql: migration8Sql, checksum: migrationChecksum(migration8Sql) }),
+  Object.freeze({ version: 9, name: "private-plan-fleet-liveness-v1", sql: migration9Sql, checksum: migrationChecksum(migration9Sql) }),
 ]);
 
 function validateMigrations(migrations: readonly Migration[]): void {

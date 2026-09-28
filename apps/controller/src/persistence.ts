@@ -39,6 +39,7 @@ export { PairingRepository } from "./pairing-repository.js";
 export { OpenSslCertificateEngine } from "./certificate-adapter.js";
 export { CertificateManager, type CertificateManagerOptions } from "./certificate-manager.js";
 export { CertificateRepository } from "./certificate-repository.js";
+export { FleetService, type FleetServiceOptions } from "./fleet-service.js";
 export { ControllerTransport, type ControllerTransportOptions, type ManagedServer, type TransportAcceptResult } from "./transport/controller-transport.js";
 export { createMutualTlsServer, type MutualTlsServerFactoryOptions } from "./transport/https-server.js";
 export { PersistentReplayStore, type ReplayDecision, type ReplayPolicy } from "./transport/replay-store.js";

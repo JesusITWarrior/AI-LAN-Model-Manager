@@ -11,3 +11,4 @@ export * from "./discovery.js";
 export * from "./pairing.js";
 export * from './certificates.js';
 export * from './transport.js';
+export * from './fleet.js';
