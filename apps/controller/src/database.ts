@@ -273,6 +273,79 @@ ALTER TABLE fleet_liveness ADD COLUMN revoked_at TEXT;
 CREATE INDEX fleet_liveness_health_idx ON fleet_liveness(health,last_observed_at,host_id);
 `;
 
+// P8.3: durable policy + operation-authorization controls.
+//
+//   * policy_documents      — the versioned policy document content + content hash
+//                             (stable across rule ordering).
+//   * authorization_requests — the durable log of every authorization request,
+//                             bound to an actor/host/model and carrying the
+//                             policy version + policy/request digest.
+//   * approvals             — durable, single-use, owner-management-session-only,
+//                             exact request-digest/version/policy-bound, expiring,
+//                             revocable, consumable.
+//   * decisions             — the tamper-evident (hash-linked) outcome of each
+//                             authorization, auditable via the transaction pattern.
+const POLICY_OPERATION_TYPES = `'observe','provider-status','model-status','model-load','model-unload','model-set-options','model-drain','artifact-install','artifact-remove','artifact-evict','model-substitute'`;
+const POLICY_TARGET_KINDS = `'host','provider','model','artifact','fleet'`;
+const POLICY_ACTORS = `'owner','controller','agent'`;
+const POLICY_OUTCOME = `'permitted','denied'`;
+const migration11Sql = `
+CREATE TABLE policy_documents (
+  version INTEGER PRIMARY KEY CHECK(version > 0),
+  policy_hash TEXT NOT NULL CHECK(length(policy_hash) = 64),
+  canonical_json TEXT NOT NULL CHECK(json_valid(canonical_json)),
+  created_at TEXT NOT NULL
+) STRICT;
+CREATE TABLE authorization_requests (
+  request_id TEXT PRIMARY KEY CHECK(length(request_id) = 64),
+  policy_version INTEGER NOT NULL CHECK(policy_version > 0),
+  policy_hash TEXT NOT NULL CHECK(length(policy_hash) = 64),
+  request_digest TEXT NOT NULL CHECK(length(request_digest) = 64),
+  actor_kind TEXT NOT NULL CHECK(actor_kind IN (${POLICY_ACTORS})),
+  operation_type TEXT NOT NULL CHECK(operation_type IN (${POLICY_OPERATION_TYPES})),
+  target_kind TEXT NOT NULL CHECK(target_kind IN (${POLICY_TARGET_KINDS})),
+  target_id TEXT NOT NULL CHECK(length(target_id) BETWEEN 1 AND 128),
+  required_approval INTEGER NOT NULL CHECK(required_approval IN (0,1)),
+  created_at TEXT NOT NULL
+) STRICT;
+CREATE INDEX authorization_requests_policy_idx ON authorization_requests(policy_version, policy_hash);
+CREATE TABLE approvals (
+  approval_id TEXT PRIMARY KEY CHECK(length(approval_id) = 64),
+  request_id TEXT NOT NULL REFERENCES authorization_requests(request_id) ON UPDATE RESTRICT ON DELETE CASCADE,
+  owner_session_id TEXT NOT NULL CHECK(length(owner_session_id) BETWEEN 1 AND 128),
+  policy_version INTEGER NOT NULL CHECK(policy_version > 0),
+  policy_hash TEXT NOT NULL CHECK(length(policy_hash) = 64),
+  request_digest TEXT NOT NULL CHECK(length(request_digest) = 64),
+  operation_type TEXT NOT NULL CHECK(operation_type IN (${POLICY_OPERATION_TYPES})),
+  target_kind TEXT NOT NULL CHECK(target_kind IN (${POLICY_TARGET_KINDS})),
+  target_id TEXT NOT NULL CHECK(length(target_id) BETWEEN 1 AND 128),
+  granted_at TEXT NOT NULL,
+  expires_at TEXT NOT NULL,
+  revoked_at TEXT,
+  consumed_at TEXT,
+  created_at TEXT NOT NULL
+) STRICT;
+CREATE INDEX approvals_request_idx ON approvals(request_id);
+CREATE TABLE decisions (
+  decision_id TEXT PRIMARY KEY CHECK(length(decision_id) = 64),
+  request_id TEXT NOT NULL REFERENCES authorization_requests(request_id) ON UPDATE RESTRICT ON DELETE CASCADE,
+  outcome TEXT NOT NULL CHECK(outcome IN (${POLICY_OUTCOME})),
+  reasons_json TEXT NOT NULL CHECK(json_valid(reasons_json)),
+  required_approval INTEGER NOT NULL CHECK(required_approval IN (0,1)),
+  policy_version INTEGER NOT NULL CHECK(policy_version > 0),
+  policy_hash TEXT NOT NULL CHECK(length(policy_hash) = 64),
+  actor_kind TEXT NOT NULL CHECK(actor_kind IN (${POLICY_ACTORS})),
+  operation_type TEXT NOT NULL CHECK(operation_type IN (${POLICY_OPERATION_TYPES})),
+  target_kind TEXT NOT NULL CHECK(target_kind IN (${POLICY_TARGET_KINDS})),
+  target_id TEXT NOT NULL CHECK(length(target_id) BETWEEN 1 AND 128),
+  approval_expires_at TEXT,
+  previous_hash TEXT CHECK(previous_hash IS NULL OR length(previous_hash) = 64),
+  hash TEXT NOT NULL UNIQUE CHECK(length(hash) = 64),
+  created_at TEXT NOT NULL
+) STRICT;
+CREATE INDEX decisions_request_idx ON decisions(request_id);
+`;
+
 export const CONTROLLER_MIGRATIONS: readonly Migration[] = Object.freeze([
   Object.freeze({ version: 1, name: "inventory-v1", sql: migration1Sql, checksum: migrationChecksum(migration1Sql) }),
   Object.freeze({ version: 2, name: "durable-jobs-v1", sql: migration2Sql, checksum: migrationChecksum(migration2Sql) }),
@@ -284,6 +357,7 @@ export const CONTROLLER_MIGRATIONS: readonly Migration[] = Object.freeze([
   Object.freeze({ version: 8, name: "private-plan-transport-replay-v1", sql: migration8Sql, checksum: migrationChecksum(migration8Sql) }),
   Object.freeze({ version: 9, name: "private-plan-fleet-liveness-v1", sql: migration9Sql, checksum: migrationChecksum(migration9Sql) }),
   Object.freeze({ version: 10, name: "private-plan-fleet-health-v1", sql: migration10Sql, checksum: migrationChecksum(migration10Sql) }),
+  Object.freeze({ version: 11, name: "private-plan-authorization-v1", sql: migration11Sql, checksum: migrationChecksum(migration11Sql) }),
 ]);
 
 function validateMigrations(migrations: readonly Migration[]): void {
