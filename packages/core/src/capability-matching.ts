@@ -147,7 +147,7 @@ export interface CapabilityMatchResult {
 // ---------------------------------------------------------------------------
 
 /** Canonical order for hard-failure codes. Matcher output is filtered by this array. */
-const HARD_REASON_ORDER: readonly string[] = Object.freeze([
+export const HARD_REASON_ORDER: readonly string[] = Object.freeze([
   "PROFILE_INVALID",
   "OBSERVATION_INVALID",
   "OBSERVATION_STALE",
