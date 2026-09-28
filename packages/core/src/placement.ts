@@ -1,6 +1,7 @@
 import type {
   HostSnapshot, PlacementCandidate, PlacementPlan, PlacementRequest
 } from "./types.js";
+import { selectCapabilityCandidate,type CapabilityCandidate,type CapabilityProfile,type CapabilitySelection,type UtcTimestamp } from "./capability-matching.js";
 
 const usable = (available: number, reserve: number): number => Math.max(0, available - reserve);
 
@@ -39,6 +40,9 @@ function evaluateHost(host: HostSnapshot, request: PlacementRequest): {
     }
   };
 }
+
+/** Capability-first model selection seam used before host/resource placement. */
+export function planCapabilityPlacement(profile:CapabilityProfile,candidates:readonly CapabilityCandidate[],now:UtcTimestamp,staleThresholdMs:number):CapabilitySelection{return selectCapabilityCandidate(profile,candidates,now,staleThresholdMs);}
 
 export function planPlacement(request: PlacementRequest, hosts: readonly HostSnapshot[]): PlacementPlan {
   const candidates: PlacementCandidate[] = [];
