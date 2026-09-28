@@ -464,6 +464,16 @@ export class JobRepository {
     );
   }
 
+  /** Cursor page for a fixed state, ordered strictly after job id. */
+  listAfter(state: unknown, cursor: unknown, limit = 64): readonly JobRecord[] {
+    const stateStr = state as string;
+    assertJobState(stateStr);
+    if (typeof cursor !== "string" || (cursor !== "" && !parseProtocolId("job", cursor).ok)) throw new JobStoreError("ERR_JOB_INPUT");
+    const limitNum = Number(limit);
+    if (!Number.isInteger(limitNum) || limitNum < 0 || limitNum > 1024) throw new JobStoreError("ERR_JOB_STATE");
+    return Object.freeze(query<JobRecord[]>(() => readJobRows(this.db, "SELECT * FROM jobs WHERE state = ? AND job_id > ? ORDER BY job_id LIMIT ?", [stateStr, cursor, limitNum as SQLInputValue]).map((r) => decodeJobRow(r as JobRow))));
+  }
+
   /** Per-host list (bounded, ordered by job id). */
   listByHost(hostId: unknown, limit = 64): readonly JobRecord[] {
     if (!parseProtocolId("host", hostId).ok) throw new JobStoreError("ERR_JOB_INPUT");
@@ -492,6 +502,14 @@ export class JobRepository {
         ]).map((r) => decodeHistoryRow(r as unknown as HistoryRow)),
       ),
     );
+  }
+
+  /** Cursor page of transition history, ordered strictly after history id. */
+  listHistoryAfter(jobId: unknown, cursor: unknown, limit = 256): readonly (HistoryRecord & { readonly cursor: number })[] {
+    if (!parseProtocolId("job", jobId).ok || typeof cursor !== "number" || !Number.isSafeInteger(cursor) || cursor < 0) throw new JobStoreError("ERR_JOB_INPUT");
+    const limitNum = Number(limit);
+    if (!Number.isInteger(limitNum) || limitNum < 0 || limitNum > 1024) throw new JobStoreError("ERR_JOB_STATE");
+    return Object.freeze(query<Array<HistoryRecord & { readonly cursor: number }>>(() => (this.db.prepare("SELECT history_id,job_id,from_state,to_state,attempt,occurred_at,created_at FROM job_history WHERE job_id=? AND history_id>? ORDER BY history_id LIMIT ?").all(jobId as SQLInputValue,cursor,limitNum) as Array<HistoryRow & {history_id:number}>).map(r => frozen<HistoryRecord & {readonly cursor:number}>({...decodeHistoryRow(r),cursor:r.history_id}))));
   }
 
   /** True when the snapshot is retryable (idempotent, failed/timed-out, attempt < 100). */
@@ -576,6 +594,13 @@ export class AuditRepository {
         this.readStoredRowsBounded(limitNum).map((r) => this.toRecordRow(r)),
       ),
     );
+  }
+
+  /** Cursor page ordered strictly after audit sequence. */
+  listAfter(sequence: unknown, limit = 256): readonly AuditRecord[] {
+    if (typeof sequence !== "number" || !Number.isSafeInteger(sequence) || sequence < 0) throw new JobStoreError("ERR_JOB_STATE");
+    const limitNum=Number(limit);if(!Number.isInteger(limitNum)||limitNum<0||limitNum>10_000)throw new JobStoreError("ERR_JOB_STATE");
+    return Object.freeze(auditQuery<AuditRecord[]>(()=>{this.verifyPersistedChain();return(this.db.prepare("SELECT seq,event_json,body_json,outcome,previous_hash,hash,created_at FROM audit_events WHERE seq>? ORDER BY seq LIMIT ?").all(sequence,limitNum) as unknown as StoredRow[]).map(r=>this.toRecordRow(r));}));
   }
 
   /** The tail event (or null when empty), verifying integrity first. */

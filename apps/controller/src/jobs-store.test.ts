@@ -434,6 +434,8 @@ test("audit sequence and integrity continue across restart and tamper blocks reo
   } finally { rmSync(dir, { recursive: true, force: true }); }
 });
 
+test("cursor reads advance jobs, history, and audit without overlap",()=>{const db=openControllerDatabase(":memory:");try{const stores=createJobStores(db,{now:()=>"2026-09-26T12:00:09.000Z"});for(const id of ["job-a","job-b","job-c"])stores.jobs.create(snapshot("submitted",{jobId:id,requestId:`request-${id}`,idempotencyKey:`idem-${id}`}));assert.deepEqual(stores.jobs.listAfter("submitted","job-a",10).map(v=>v.jobId),["job-b","job-c"]);stores.jobs.transition("job-a","validated","2026-09-26T12:00:02.000Z");stores.jobs.transition("job-a","authorized","2026-09-26T12:00:03.000Z");const first=stores.jobs.listHistoryAfter("job-a",0,1);assert.equal(first.length,1);assert.equal(stores.jobs.listHistoryAfter("job-a",first[0]!.cursor,10).length,1);stores.audit.append(audit({action:"load"}));stores.audit.append(audit({action:"drain",occurredAt:"2026-09-26T12:00:03.000Z"}));assert.deepEqual(stores.audit.listAfter(1,10).map(v=>v.sequence),[2]);}finally{db.close();}});
+
 test("readOnly store applies migration2 and reads jobs written earlier", () => {
   const dir = mkdtempSync(join(tmpdir(), "lanmm-jobs-"));
   try {
