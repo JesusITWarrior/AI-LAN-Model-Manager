@@ -69,31 +69,31 @@ func (e *Executor) Execute(ctx context.Context, r Request) (Response, error) {
 	sum := sha256.Sum256(raw)
 	digest := hex.EncodeToString(sum[:])
 	e.mu.Lock()
-	if prior, ok := e.seen[r.IdempotencyKey]; ok {
-		e.mu.Unlock()
-		if prior.digest != digest {
-			return Response{}, ErrCommand
-		}
-		return prior.response, nil
-	}
-	e.mu.Unlock()
-	observation, runErr := e.adapter.Execute(ctx, r.Operation, r.Params)
-	status := "succeeded"
-	var code *string
-	if runErr != nil {
-		status = "failed"
-		redacted := "ADAPTER_FAILED"
-		code = &redacted
-	}
-	response := Response{RequestID: r.RequestID, JobID: r.JobID, HostID: r.HostID, Sequence: r.Sequence, Status: status, ObservedAt: e.now().UTC().Format("2006-01-02T15:04:05.000Z"), Observation: observation, ErrorCode: code}
-	e.mu.Lock()
 	defer e.mu.Unlock()
 	if prior, ok := e.seen[r.IdempotencyKey]; ok {
 		if prior.digest != digest {
 			return Response{}, ErrCommand
 		}
-		return prior.response, nil
+		if prior.response.Status != "running" {
+			return prior.response, nil
+		}
 	}
+	runCtx, cancel := context.WithTimeout(ctx, deadline.Sub(e.now()))
+	defer cancel()
+	observation, runErr := e.adapter.Execute(runCtx, r.Operation, r.Params)
+	status := "succeeded"
+	var progress *uint8
+	var code *string
+	if errors.Is(runErr, ErrServingActive) {
+		status = "running"
+		value := uint8(50)
+		progress = &value
+	} else if runErr != nil {
+		status = "failed"
+		redacted := "ADAPTER_FAILED"
+		code = &redacted
+	}
+	response := Response{RequestID: r.RequestID, JobID: r.JobID, HostID: r.HostID, Sequence: r.Sequence, Status: status, Progress: progress, ObservedAt: e.now().UTC().Format("2006-01-02T15:04:05.000Z"), Observation: observation, ErrorCode: code}
 	e.seen[r.IdempotencyKey] = entry{digest: digest, response: response}
 	return response, nil
 }

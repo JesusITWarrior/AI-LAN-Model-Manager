@@ -56,3 +56,5 @@ export {
   INFERENCE_DEFAULT_TTL_MS, INFERENCE_MAX_TTL_MS, INFERENCE_MIN_TTL_MS, INFERENCE_SCOPES, INFERENCE_TOKEN_BYTES, InferenceTokenError,
   type InferenceAuthorizationResult, type InferenceScope, type InferenceTokenErrorCode, type InferenceTokenMetadata, type IssuedInferenceToken, type StoredInferenceToken,
 } from "./inference-types.js";
+
+export { LifecycleService, type LifecycleExecution, type LifecycleError, type LifecycleResult } from "./lifecycle-service.js";

@@ -64,3 +64,27 @@ func TestRejectsDivergenceUnknownExpiredAndRedactsFailure(t *testing.T) {
 		t.Fatal("expired")
 	}
 }
+
+type retryDrainAdapter struct{ calls int }
+
+func (a *retryDrainAdapter) Execute(context.Context, string, json.RawMessage) (any, error) {
+	a.calls++
+	if a.calls == 1 {
+		return nil, ErrServingActive
+	}
+	return map[string]any{"activeRequests": 0}, nil
+}
+func TestRunningDrainReplayReexecutesAfterRequestsComplete(t *testing.T) {
+	a := &retryDrainAdapter{}
+	e := New("host-1", a, func() time.Time { return time.Date(2026, 9, 28, 8, 0, 0, 0, time.UTC) })
+	r := req()
+	r.Operation = "drain"
+	first, err := e.Execute(context.Background(), r)
+	if err != nil || first.Status != "running" {
+		t.Fatalf("first = %#v, %v", first, err)
+	}
+	second, err := e.Execute(context.Background(), r)
+	if err != nil || second.Status != "succeeded" || a.calls != 2 {
+		t.Fatalf("second/calls = %#v/%d, %v", second, a.calls, err)
+	}
+}
