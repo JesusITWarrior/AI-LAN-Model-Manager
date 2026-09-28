@@ -13,14 +13,12 @@ export function handleRequest(request: IncomingMessage, response: ServerResponse
 
 export type ControllerRequestHandler = (request: IncomingMessage, response: ServerResponse) => void;
 
-/** Create the HTTP server without listening. An injected management handler owns /api/v1. */
-export function createControllerServer(management?: ControllerRequestHandler) {
+/** Create the HTTP server without listening. Injected handlers keep management and inference planes separate. */
+export function createControllerServer(management?: ControllerRequestHandler, inference?: ControllerRequestHandler) {
   return createServer((request, response) => {
     const path = request.url?.split("?", 1)[0] ?? "";
-    if (management && (path === "/api/v1" || path.startsWith("/api/v1/"))) {
-      management(request, response);
-      return;
-    }
+    if (management && (path === "/api/v1" || path.startsWith("/api/v1/"))) { management(request, response); return; }
+    if (inference && (path === "/v1" || path.startsWith("/v1/"))) { inference(request, response); return; }
     handleRequest(request, response);
   });
 }

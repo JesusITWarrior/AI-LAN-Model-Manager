@@ -26,3 +26,5 @@ test("controller delegates only versioned management paths to an injected handle
   assert.equal((await fetch(`${base}/health`)).status,200);
   assert.equal(calls,1);
 });
+
+test("controller keeps inference and management handlers on separate namespaces",async context=>{let management=0,inference=0;const server=createControllerServer((_request,response)=>{management++;response.writeHead(204);response.end();},(_request,response)=>{inference++;response.writeHead(200,{"content-type":"application/json"});response.end("{}");});server.listen(0,"127.0.0.1");await once(server,"listening");context.after(()=>server.close());const address=server.address();assert.ok(address&&typeof address==="object");const base=`http://127.0.0.1:${address.port}`;assert.equal((await fetch(`${base}/v1/models`)).status,200);assert.equal((await fetch(`${base}/api/v1/fleet/summary`)).status,204);assert.equal((await fetch(`${base}/v1x/models`)).status,404);assert.equal(management,1);assert.equal(inference,1);});
