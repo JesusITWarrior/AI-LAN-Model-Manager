@@ -17,3 +17,4 @@ export * from './transport.js';
 export * from './fleet.js';
 export * from './fallback.js';
 export * from './inference-queue.js';
+export * from './artifact.js';
