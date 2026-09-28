@@ -266,6 +266,13 @@ CREATE TABLE fleet_liveness (
 CREATE INDEX fleet_liveness_observed_idx ON fleet_liveness(last_observed_at,host_id);
 `;
 
+const migration10Sql = `
+ALTER TABLE fleet_liveness ADD COLUMN health TEXT NOT NULL DEFAULT 'active' CHECK(health IN ('active','degraded','offline','revoked'));
+ALTER TABLE fleet_liveness ADD COLUMN health_updated_at TEXT;
+ALTER TABLE fleet_liveness ADD COLUMN revoked_at TEXT;
+CREATE INDEX fleet_liveness_health_idx ON fleet_liveness(health,last_observed_at,host_id);
+`;
+
 export const CONTROLLER_MIGRATIONS: readonly Migration[] = Object.freeze([
   Object.freeze({ version: 1, name: "inventory-v1", sql: migration1Sql, checksum: migrationChecksum(migration1Sql) }),
   Object.freeze({ version: 2, name: "durable-jobs-v1", sql: migration2Sql, checksum: migrationChecksum(migration2Sql) }),
@@ -276,6 +283,7 @@ export const CONTROLLER_MIGRATIONS: readonly Migration[] = Object.freeze([
   Object.freeze({ version: 7, name: "private-plan-certificate-v1", sql: migration7Sql, checksum: migrationChecksum(migration7Sql) }),
   Object.freeze({ version: 8, name: "private-plan-transport-replay-v1", sql: migration8Sql, checksum: migrationChecksum(migration8Sql) }),
   Object.freeze({ version: 9, name: "private-plan-fleet-liveness-v1", sql: migration9Sql, checksum: migrationChecksum(migration9Sql) }),
+  Object.freeze({ version: 10, name: "private-plan-fleet-health-v1", sql: migration10Sql, checksum: migrationChecksum(migration10Sql) }),
 ]);
 
 function validateMigrations(migrations: readonly Migration[]): void {

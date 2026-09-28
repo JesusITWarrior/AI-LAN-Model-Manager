@@ -89,7 +89,7 @@ test("migration2 registers jobs/job_history/audit_events and migration ledger ha
     for (const col of ["seq", "event_json", "body_json", "outcome", "previous_hash", "hash", "created_at"]) {
       assert.ok(cols.some((c) => c.name === col), `audit_events has column ${col}`);
     }
-    assert.equal(CONTROLLER_MIGRATIONS.length, 9);
+    assert.equal(CONTROLLER_MIGRATIONS.length, 10);
     assert.equal(CONTROLLER_MIGRATIONS[1]!.name, "durable-jobs-v1");
   } finally {
     db.close();
