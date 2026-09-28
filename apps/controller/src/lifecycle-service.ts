@@ -3,6 +3,7 @@ import { commandPolicyOperation, parseCommandRequest } from "@lan-model-manager/
 import type { PolicyService } from "./policy-service.js";
 import type { CommandDispatcher, DispatchResult } from "./command-dispatch.js";
 import type { ControllerRepositories, ModelRecord } from "./repositories.js";
+import type { AdmissionController } from "./admission-accounting.js";
 
 export type LifecycleError =
   | "ERR_LIFECYCLE_INPUT" | "ERR_LIFECYCLE_DENIED" | "ERR_LIFECYCLE_CAPABILITY"
@@ -40,7 +41,7 @@ function freshObservation(response: CommandResponse, before: string, request: Co
 }
 
 export class LifecycleService {
-  constructor(private readonly policy: PolicyService, private readonly dispatcher: CommandDispatcher, private readonly repositories: ControllerRepositories) {}
+  constructor(private readonly policy: PolicyService, private readonly dispatcher: CommandDispatcher, private readonly repositories: ControllerRepositories, private readonly admissions?: AdmissionController) {}
 
   execute(input: LifecycleExecution): LifecycleResult {
     const parsed = parseCommandRequest(input?.request);
@@ -49,6 +50,14 @@ export class LifecycleService {
     const model = input.intent.modelId === null ? null : this.repositories.models.get(input.intent.modelId);
     const activeRequests = active(model);
     if (!this.targetMatches(request, model) || !this.precondition(request.operation, model) || (model !== null && activeRequests === null)) return fail("ERR_LIFECYCLE_STATE");
+    if (model !== null && this.admissions) {
+      try {
+        if (request.operation === "drain") void this.admissions.stopAdmission(model.modelId);
+        const authoritative = this.admissions.snapshot(model.modelId);
+        if (request.operation === "drain" && authoritative.active !== 0) return fail("ERR_LIFECYCLE_STATE");
+        if (request.operation === "unload" && (!authoritative.draining || authoritative.active !== 0)) return fail("ERR_LIFECYCLE_STATE");
+      } catch { return fail("ERR_LIFECYCLE_STATE"); }
+    }
     if (request.operation === "unload" && activeRequests !== null && activeRequests > 0 && (!input.drainIntent || !input.drainRequest)) return fail("ERR_LIFECYCLE_STATE");
     const authorization = this.policy.authorize(input.intent);
     if (!authorization.ok) return fail("ERR_LIFECYCLE_DENIED");
