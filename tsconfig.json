@@ -2,6 +2,7 @@
   "files": [],
   "references": [
     { "path": "./packages/core" },
-    { "path": "./apps/controller" }
+    { "path": "./apps/controller" },
+    { "path": "./apps/web" }
   ]
 }

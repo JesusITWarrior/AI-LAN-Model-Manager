@@ -6,10 +6,10 @@
   "type": "module",
   "workspaces": ["apps/*", "packages/*"],
   "scripts": {
-    "build": "tsc -b",
+    "build": "tsc -b && npm run build -w @lan-model-manager/web",
     "check": "npm run build && npm test",
     "dev:controller": "tsx apps/controller/src/main.ts",
-    "test": "tsx --test packages/core/src/*.test.ts apps/controller/src/*.test.ts"
+    "test": "tsx --test packages/core/src/*.test.ts apps/controller/src/*.test.ts apps/web/src/*.test.ts"
   },
   "devDependencies": {
     "@types/node": "^24.0.0",
