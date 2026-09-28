@@ -41,6 +41,7 @@ export { CertificateManager, type CertificateManagerOptions } from "./certificat
 export { CertificateRepository } from "./certificate-repository.js";
 export { FleetService, type FleetServiceOptions } from "./fleet-service.js";
 export { PolicyService, type ApprovalGrant, type OperationCapability, type PolicyServiceError, type PolicyServiceResult } from "./policy-service.js";
+export { CommandDispatcher, type CommandWire, type DispatchResult } from "./command-dispatch.js";
 export { FleetQueryService, type FleetCounts, type FleetHealth, type FleetPage, type FleetQueryError, type FleetQueryOptions, type FleetQueryResult, type PublicHost, type PublicModel, type PublicProvider } from "./fleet-queries.js";
 export { ControllerTransport, type ControllerTransportOptions, type ManagedServer, type TransportAcceptResult } from "./transport/controller-transport.js";
 export { createMutualTlsServer, type MutualTlsServerFactoryOptions } from "./transport/https-server.js";
