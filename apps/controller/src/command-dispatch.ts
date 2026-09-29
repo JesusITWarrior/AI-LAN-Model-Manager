@@ -51,6 +51,7 @@ export class CommandDispatcher {
       const current = this.stores.jobs.get(request.jobId);
       if (!current) return { ok: false, error: "ERR_DISPATCH_NOT_FOUND" };
       if(terminal.has(current.payload.state))return{ok:true,state:current.payload.state,observation:null};
+      if(current.payload.state==="running"&&response.status==="accepted")return{ok:true,state:"running",observation:null};
       const patch = { progressPercent: response.progress, terminalCode: response.errorCode, terminalMessage: response.errorCode };
       this.stores.withAuditTransaction(tx => {
         let currentState = current.payload.state;

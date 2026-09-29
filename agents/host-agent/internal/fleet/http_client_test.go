@@ -72,13 +72,14 @@ func TestCrossLanguageFleetHelper(t *testing.T) {
 		}
 		var adapter command.Adapter = crossCommandAdapter{}
 		inference := false
+		var registry *command.Registry
 		if endpoint := os.Getenv("LANMM_CROSS_FLEET_INFERENCE_ENDPOINT"); endpoint != "" {
 			inference = true
 			ollamaClient, clientErr := ollama.New(ollama.Config{ProviderID: "ollama-1", Endpoint: endpoint, Timeout: 2 * time.Second})
 			if clientErr != nil {
 				t.Fatal(clientErr)
 			}
-			registry := command.NewRegistry(time.Now)
+			registry = command.NewRegistry(time.Now)
 			registry.RegisterOllama("ollama-1", ollamaClient)
 			adapter = registry
 		}
@@ -95,6 +96,38 @@ func TestCrossLanguageFleetHelper(t *testing.T) {
 				t.Fatalf("inference replay = %#v, %v", replay, replayErr)
 			}
 			fmt.Println("LANMM_CROSS_COMMAND_REPLAY=succeeded")
+		}
+		if os.Getenv("LANMM_CROSS_FLEET_LIFECYCLE") == "1" {
+			if registry == nil {
+				t.Fatal("lifecycle registry unavailable")
+			}
+			for _, expected := range []string{"load", "drain", "unload"} {
+				value, _, pollErr := restarted.PollCommand(context.Background(), time.Second)
+				if pollErr != nil || value == nil || value.Operation != expected {
+					t.Fatalf("lifecycle poll %s = %#v, %v", expected, value, pollErr)
+				}
+				if expected == "drain" {
+					lease, acquireErr := registry.Acquire(context.Background(), "ollama-1", "qwen:latest")
+					if acquireErr != nil {
+						t.Fatal(acquireErr)
+					}
+					blocked, executeErr := executor.Execute(context.Background(), *value)
+					if executeErr != nil || blocked.Status != "running" || restarted.SendCommandResult(context.Background(), blocked) != nil {
+						t.Fatalf("blocked drain = %#v, %v", blocked, executeErr)
+					}
+					_ = registry.Complete(context.Background(), lease)
+					value, _, pollErr = restarted.PollCommand(context.Background(), time.Second)
+					if pollErr != nil || value == nil || value.Operation != expected {
+						t.Fatalf("drain replay = %#v, %v", value, pollErr)
+					}
+					fmt.Println("LANMM_CROSS_LIFECYCLE_BLOCKED=drain")
+				}
+				completed, executeErr := executor.Execute(context.Background(), *value)
+				if executeErr != nil || completed.Status != "succeeded" || restarted.SendCommandResult(context.Background(), completed) != nil {
+					t.Fatalf("lifecycle %s = %#v, %v", expected, completed, executeErr)
+				}
+				fmt.Printf("LANMM_CROSS_LIFECYCLE=%s:%s\n", expected, completed.Status)
+			}
 		}
 	}
 	value, _ := json.Marshal(map[string]uint64{"hello": hello.Sequence, "heartbeat": heartbeat, "resumed": resumed})

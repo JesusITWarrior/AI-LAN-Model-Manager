@@ -85,4 +85,5 @@ export {
   type InferenceAuthorizationResult, type InferenceScope, type InferenceTokenErrorCode, type InferenceTokenMetadata, type IssuedInferenceToken, type StoredInferenceToken,
 } from "./inference-types.js";
 
-export { LifecycleService, type LifecycleExecution, type LifecycleError, type LifecycleResult } from "./lifecycle-service.js";
+export { LifecycleService, verifyLifecycleObservation, type LifecycleExecution, type LifecycleError, type LifecycleResult } from "./lifecycle-service.js";
+export { RemoteLifecycleController } from "./remote-lifecycle.js";

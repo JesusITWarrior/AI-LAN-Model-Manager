@@ -24,7 +24,7 @@ const snapshot = (model: ModelRecord | null): Record<string, unknown> | null => 
 const active = (model: ModelRecord | null): number | null => { const value = snapshot(model)?.activeRequests; return Number.isSafeInteger(value) && Number(value) >= 0 ? Number(value) : null; };
 const runtime = (model: ModelRecord | null): string => String(snapshot(model)?.runtimeState ?? (model?.state === "running" ? "loaded-idle" : model?.state ?? "absent"));
 
-function freshObservation(response: CommandResponse, before: string, request: CommandRequest): boolean {
+export function verifyLifecycleObservation(response: CommandResponse, before: string, request: CommandRequest): boolean {
   if (response.status !== "succeeded") return true;
   const value = record(response.observation);
   if (!value || typeof value.observedAt !== "string" || Number.isNaN(Date.parse(value.observedAt)) || Date.parse(value.observedAt) <= Date.parse(before)) return false;
@@ -73,10 +73,15 @@ export class LifecycleService {
       const drained = this.execute({ intent: input.drainIntent, request: input.drainRequest });
       if (!drained.ok || drained.state !== "succeeded") return drained;
     }
-    const result = this.dispatcher.dispatch(request, response => freshObservation(response, before, request));
+    const result = this.dispatcher.dispatch(request, response => verifyLifecycleObservation(response, before, request));
     if (!result.ok) {if(evictionStarted&&evictionArtifact)try{this.cache?.cancelEviction(evictionArtifact);}catch{/* preserve dispatch error */}return fail(result.error === "ERR_DISPATCH_OBSERVATION" ? "ERR_LIFECYCLE_OBSERVATION" : "ERR_LIFECYCLE_DISPATCH");}
     if(evictionStarted&&evictionArtifact)try{this.cache?.finishEviction(evictionArtifact);}catch{return fail("ERR_LIFECYCLE_STATE");}
     return result as LifecycleResult;
+  }
+
+  cancel(jobId: string): LifecycleResult {
+    const result = this.dispatcher.cancel(jobId);
+    return result.ok ? result as LifecycleResult : fail("ERR_LIFECYCLE_DISPATCH");
   }
 
   private targetMatches(request: CommandRequest, model: ModelRecord | null): boolean {
