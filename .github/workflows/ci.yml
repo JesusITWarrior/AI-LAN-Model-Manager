@@ -1,28 +1,68 @@
 name: CI
 
-# Automatic hosted builds are disabled by project policy.
+# Project policy: hosted builds are manual-only. Do not add push, pull_request,
+# schedule, repository_dispatch, or workflow_call triggers without owner approval.
 on:
   workflow_dispatch:
 
+permissions:
+  contents: read
+
 jobs:
-  check:
-    runs-on: ubuntu-latest
+  matrix-check:
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, macos-latest, windows-latest]
+    runs-on: ${{ matrix.os }}
     steps:
-      - name: Checkout
-        uses: actions/checkout@v4
-
-      - name: Setup Node.js
-        uses: actions/setup-node@v4
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
         with:
-          node-version: 24
-
-      - name: Install Node deps
-        run: npm ci --ignore-scripts
-
-      - name: Setup Go
-        uses: actions/setup-go@v5
+          node-version: '24'
+          cache: npm
+      - uses: actions/setup-go@v5
         with:
           go-version: '1.24'
+      - run: npm ci --ignore-scripts
+      - run: npm run build
+      - run: npm test
+      - name: Go test and vet
+        working-directory: agents/host-agent
+        run: |
+          go test ./...
+          go vet ./...
+      - name: Verify Go formatting
+        shell: pwsh
+        run: |
+          $dirty = gofmt -l agents/host-agent
+          if ($dirty) { Write-Error "Go files require gofmt: $dirty"; exit 1 }
+      - run: npx tsx --test scripts/packaging/tests/agents.test.ts
 
-      - name: Run make check
-        run: make check
+  package-skeleton:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: '24'
+          cache: npm
+      - uses: actions/setup-go@v5
+        with:
+          go-version: '1.24'
+      - run: npm ci --ignore-scripts
+      - name: Build unsigned cross-platform package skeleton
+        run: node scripts/packaging/build.js artifacts/host-agent
+      - name: Prove signing gate fails closed without release material
+        shell: bash
+        run: |
+          if node scripts/packaging/check.js artifacts/host-agent; then
+            echo 'unsigned artifacts passed signing gate' >&2
+            exit 1
+          fi
+      - uses: actions/upload-artifact@v4
+        with:
+          name: unsigned-host-agent-package-skeleton
+          path: artifacts/host-agent/
+          if-no-files-found: error
+          retention-days: 1
