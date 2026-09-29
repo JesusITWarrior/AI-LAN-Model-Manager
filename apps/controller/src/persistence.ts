@@ -65,6 +65,7 @@ export { OpenSslCertificateEngine } from "./certificate-adapter.js";
 export { CertificateManager, type CertificateManagerOptions } from "./certificate-manager.js";
 export { CertificateRepository } from "./certificate-repository.js";
 export { FleetService, type FleetServiceOptions } from "./fleet-service.js";
+export { createFleetAgentHttpHandler, FLEET_AGENT_BODY_LIMIT, FLEET_AGENT_RATE_LIMIT, FLEET_AGENT_RATE_WINDOW_MS, type FleetAgentHttpDependencies, type FleetAgentHttpOptions } from "./fleet-agent-http.js";
 export { PolicyService, type ApprovalGrant, type OperationCapability, type PolicyServiceError, type PolicyServiceResult } from "./policy-service.js";
 export { CommandDispatcher, type CommandWire, type DispatchResult } from "./command-dispatch.js";
 export { FleetQueryService, type FleetCounts, type FleetHealth, type FleetPage, type FleetQueryError, type FleetQueryOptions, type FleetQueryResult, type PublicHost, type PublicModel, type PublicProvider } from "./fleet-queries.js";

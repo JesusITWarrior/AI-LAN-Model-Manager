@@ -18,14 +18,17 @@ import (
 	"os/signal"
 	"path/filepath"
 	"regexp"
+	"runtime"
 	"strconv"
 	"strings"
 	"syscall"
 	"time"
 
 	"github.com/JesusITWarrior/AI-LAN-Model-Manager/agents/host-agent/internal/enrollment"
+	"github.com/JesusITWarrior/AI-LAN-Model-Manager/agents/host-agent/internal/fleet"
 	"github.com/JesusITWarrior/AI-LAN-Model-Manager/agents/host-agent/internal/observation"
 	"github.com/JesusITWarrior/AI-LAN-Model-Manager/agents/host-agent/internal/service"
+	"github.com/JesusITWarrior/AI-LAN-Model-Manager/agents/host-agent/internal/snapshot"
 )
 
 // Exit codes: 0 success, 2 rejected configuration.
@@ -35,7 +38,21 @@ const (
 )
 
 // version is reported only in safe startup/shutdown summaries.
-var version = "18.8c"
+var version = "18.9a"
+
+type snapshotSource interface{ LatestSnapshot() (snapshot.State, bool) }
+type fleetCollector struct{ source snapshotSource }
+
+func (c fleetCollector) Collect(ctx context.Context) (fleet.Snapshot, error) {
+	if ctx.Err() != nil {
+		return fleet.Snapshot{}, fleet.ErrFleet
+	}
+	state, ok := c.source.LatestSnapshot()
+	if !ok {
+		return fleet.Snapshot{}, fleet.ErrFleet
+	}
+	return fleet.Snapshot{Platform: state.Record.Platform, Idle: true}, nil
+}
 
 func main() {
 	cfg, err := loadConfig()
@@ -63,6 +80,16 @@ func main() {
 	if err := host.Start(ctx); err != nil {
 		slog.Error("host-service failed to start", "reason", safeErr(err))
 		os.Exit(exitGeneral)
+	}
+	// Enrollment is the only switch that enables the outbound fleet plane. A
+	// missing/incomplete enrollment remains network-free; the fleet client has
+	// no management or inference credentials to fall back to.
+	certDir := cfg.CertDir
+	if certDir == "" {
+		certDir = filepath.Join(cfg.StateDir, "cert")
+	}
+	if client, fleetErr := fleet.NewHTTPSClient(certDir); fleetErr == nil {
+		go func() { _ = client.Run(ctx, fleetCollector{source: host}, runtime.GOOS, "") }()
 	}
 	slog.Info("host-service started", "hostID", host.HostID(), "version", version)
 

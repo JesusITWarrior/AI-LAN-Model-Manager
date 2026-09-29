@@ -1,0 +1,43 @@
+import assert from "node:assert/strict";
+import { execFileSync, spawn } from "node:child_process";
+import { X509Certificate } from "node:crypto";
+import { once } from "node:events";
+import { chmodSync, mkdtempSync, mkdirSync, readFileSync, rmSync, writeFileSync } from "node:fs";
+import { createServer } from "node:https";
+import { tmpdir } from "node:os";
+import { join, resolve } from "node:path";
+import test from "node:test";
+import { OpenSslCertificateEngine } from "./certificate-adapter.js";
+import { CertificateRepository } from "./certificate-repository.js";
+import { openControllerDatabase } from "./database.js";
+import { createFleetAgentHttpHandler } from "./fleet-agent-http.js";
+import { FleetService } from "./fleet-service.js";
+import { createControllerRepositories } from "./repositories.js";
+import { ControllerTransport } from "./transport/controller-transport.js";
+import { PersistentReplayStore } from "./transport/replay-store.js";
+import { buildTransportNativeVerifier } from "./transport/transport-signer.js";
+
+function serverCertificate(root:string, caDir:string){const d=join(root,"server");mkdirSync(d,{mode:0o700});execFileSync("openssl",["genpkey","-algorithm","EC","-pkeyopt","ec_paramgen_curve:P-256","-out","key.pem"],{cwd:d,stdio:"ignore"});execFileSync("openssl",["req","-new","-key","key.pem","-subj","/CN=127.0.0.1","-addext","subjectAltName=IP:127.0.0.1","-out","request.pem"],{cwd:d,stdio:"ignore"});writeFileSync(join(d,"ext"),"basicConstraints=critical,CA:FALSE\nkeyUsage=critical,digitalSignature\nextendedKeyUsage=serverAuth\nsubjectAltName=IP:127.0.0.1\n");execFileSync("openssl",["x509","-req","-in","request.pem","-CA",join(caDir,"ca-cert.pem"),"-CAkey",join(caDir,"ca-key.pem"),"-set_serial","0x2001","-days","1","-extfile","ext","-out","cert.pem"],{cwd:d,stdio:"ignore"});return{key:readFileSync(join(d,"key.pem")),cert:readFileSync(join(d,"cert.pem"))};}
+
+test("Go enrollment identity drives real TypeScript mTLS hello, heartbeat inventory, and restart sequence",{timeout:30_000},async()=>{
+  execFileSync("go",["version"],{stdio:"ignore"});execFileSync("openssl",["version"],{stdio:"ignore"});
+  const root=mkdtempSync(join(tmpdir(),"lanmm-fleet-cross-")),caDir=join(root,"ca"),agentDir=join(root,"agent");mkdirSync(agentDir,{mode:0o700});chmodSync(agentDir,0o700);
+  const db=openControllerDatabase(":memory:");let server:ReturnType<typeof createServer>|undefined;
+  try{
+    const engine=new OpenSslCertificateEngine(),now=new Date().toISOString(),ca=engine.initializeCa({directory:caDir,now});
+    execFileSync("openssl",["genpkey","-algorithm","EC","-pkeyopt","ec_paramgen_curve:P-256","-out",join(agentDir,"host-key.pem")],{stdio:"ignore"});chmodSync(join(agentDir,"host-key.pem"),0o600);
+    execFileSync("openssl",["req","-new","-key",join(agentDir,"host-key.pem"),"-subj","/CN=agent-1","-addext","subjectAltName=IP:127.0.0.1,URI:spiffe://lanmodelmanager/host/agent-1","-out",join(agentDir,"request.pem")],{stdio:"ignore"});
+    const binding={candidateId:"agent-1",address:"127.0.0.1",port:7443,protocolMajor:1,protocolMinor:0},issued=engine.issueHost({directory:caDir,csrPem:readFileSync(join(agentDir,"request.pem"),"utf8"),binding,serial:"1234ABCD",now});
+    const certificates=new CertificateRepository(db);certificates.insertCa(ca);certificates.insertHost({certificateId:issued.fingerprint,serial:issued.serial,fingerprint:issued.fingerprint,certificatePem:issued.certificatePem,caId:ca.caId,caVersion:1,binding,spiffeUri:"spiffe://lanmodelmanager/host/agent-1",challengeId:"c".repeat(64),transcriptDigest:"d".repeat(64),notBefore:issued.notBefore,notAfter:issued.notAfter,status:"active",version:1,issuedAt:now,revokedAt:null});
+    const leaf=new X509Certificate(issued.certificatePem),parsed:any={fingerprint:issued.fingerprint,serial:issued.serial,commonName:"agent-1",address:"127.0.0.1",spiffe:"spiffe://lanmodelmanager/host/agent-1",notBefore:issued.notBefore,notAfter:issued.notAfter,issuerFingerprint:ca.fingerprint,isCa:false};
+    const verifier=buildTransportNativeVerifier(leaf.publicKey.export({type:"spki",format:"pem"}).toString(),parsed);assert.equal(verifier.ok,true);if(!verifier.ok)return;
+    const transport=new ControllerTransport({certificateRepository:certificates,replayStore:new PersistentReplayStore(db),verifier:()=>verifier.value});const transportErrors:string[]=[];const traced={accept(input:unknown){const value=transport.accept(input);if(!value.ok)transportErrors.push(value.error);return value}};const repos=createControllerRepositories(db),fleet=new FleetService(db,traced as never,certificates,repos);const tls=serverCertificate(root,caDir);const handler=createFleetAgentHttpHandler({fleet,certificates});const responses:string[]=[];
+    server=createServer({key:tls.key,cert:tls.cert,ca:ca.certificatePem,minVersion:"TLSv1.3",maxVersion:"TLSv1.3",requestCert:true,rejectUnauthorized:true},(req,res)=>{const end=res.end.bind(res);(res as any).end=(chunk?:any)=>{responses.push(String(chunk??""));return end(chunk)};handler(req,res)});server.listen(0,"127.0.0.1");await once(server,"listening");const address=server.address();assert.ok(address&&typeof address==="object");
+    writeFileSync(join(agentDir,"enrollment.json"),JSON.stringify({controllerUrl:`https://127.0.0.1:${address.port}`,pinnedCaFingerprintSha256:ca.fingerprint,challengeId:"c".repeat(64),binding,certificatePem:issued.certificatePem,caPem:ca.certificatePem,enrolledAt:now})+"\n",{mode:0o600});
+    const runGo=async(mode:"ok"|"reject"|"stale"="ok")=>{const child=spawn("go",["test","./internal/fleet","-run","^TestCrossLanguageFleetHelper$","-count=1","-v"],{cwd:join(resolve(import.meta.dirname,"../../.."),"agents/host-agent"),env:{...process.env,LANMM_CROSS_FLEET_CERT_DIR:agentDir,...(mode!=="ok"?{LANMM_CROSS_FLEET_EXPECT_REJECT:"1"}:{}),...(mode==="stale"?{LANMM_CROSS_FLEET_STALE:"1"}:{})}});let output="",errors="";child.stdout.setEncoding("utf8");child.stderr.setEncoding("utf8");child.stdout.on("data",v=>output+=v);child.stderr.on("data",v=>errors+=v);const code=await new Promise<number|null>((done,rejectChild)=>{child.once("error",rejectChild);child.once("close",done)});assert.equal(code,0,output+errors+JSON.stringify({responses,transportErrors}));return output};
+    const output=await runGo();const match=/LANMM_CROSS_FLEET_RESULT=(\{[^\n]+\})/.exec(output);assert.ok(match,output);assert.deepEqual(JSON.parse(match[1]!),{heartbeat:2,hello:1,resumed:3});
+    assert.equal(repos.providers.listByHost("agent-1").length,1);assert.equal(repos.models.listByHost("agent-1").length,1);assert.equal((db.prepare("SELECT last_sequence FROM fleet_liveness WHERE host_id='agent-1'").get() as any).last_sequence,3);
+    assert.match(await runGo("stale"),/LANMM_CROSS_FLEET_REJECTED=true/);assert.ok(responses.some(value=>value.includes("ERR_OBSERVATION_STALE")));writeFileSync(join(agentDir,"fleet-sequence"),"3\n",{mode:0o600});assert.match(await runGo("reject"),/LANMM_CROSS_FLEET_REJECTED=true/);assert.ok(transportErrors.some(value=>value.includes("REPLAY")));assert.equal((db.prepare("SELECT last_sequence FROM fleet_liveness WHERE host_id='agent-1'").get() as any).last_sequence,3);
+    assert.equal(certificates.revoke(issued.fingerprint,new Date().toISOString()),true);assert.match(await runGo("reject"),/LANMM_CROSS_FLEET_REJECTED=true/);assert.equal((db.prepare("SELECT last_sequence FROM fleet_liveness WHERE host_id='agent-1'").get() as any).last_sequence,3);
+  }finally{if(server)await new Promise<void>(r=>server!.close(()=>r()));db.close();rmSync(root,{recursive:true,force:true});}
+});

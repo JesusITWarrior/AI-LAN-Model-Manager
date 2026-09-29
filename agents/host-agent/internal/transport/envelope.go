@@ -10,6 +10,7 @@ import (
 	"encoding/json"
 	"encoding/pem"
 	"errors"
+	"sort"
 	"strconv"
 	"strings"
 	"sync"
@@ -40,7 +41,70 @@ type Envelope struct {
 func SignedFields(e Envelope) string {
 	return strings.Join([]string{"lanmm-transport-signed-v1", "ecdsa-p256-sha256", e.HostID, e.RequestID, strconv.FormatUint(e.Sequence, 10), e.SentAt, e.Nonce, e.CertFingerprint, e.CertSerial, e.BodyDigest}, "\x1f")
 }
-func bodyDigest(body []byte) string { h := sha256.Sum256(body); return hex.EncodeToString(h[:]) }
+func bodyDigest(body []byte) string {
+	decoder := json.NewDecoder(bytes.NewReader(body))
+	decoder.UseNumber()
+	var value any
+	if decoder.Decode(&value) != nil {
+		return ""
+	}
+	var canonical bytes.Buffer
+	if writeCanonical(&canonical, value) != nil {
+		return ""
+	}
+	h := sha256.Sum256(canonical.Bytes())
+	return hex.EncodeToString(h[:])
+}
+func writeCanonical(out *bytes.Buffer, value any) error {
+	switch typed := value.(type) {
+	case nil:
+		out.WriteString("null")
+	case bool:
+		if typed {
+			out.WriteString("true")
+		} else {
+			out.WriteString("false")
+		}
+	case json.Number:
+		out.WriteString(typed.String())
+	case string:
+		raw, _ := json.Marshal(typed)
+		out.Write(raw)
+	case []any:
+		out.WriteByte('[')
+		for index, child := range typed {
+			if index > 0 {
+				out.WriteByte(',')
+			}
+			if err := writeCanonical(out, child); err != nil {
+				return err
+			}
+		}
+		out.WriteByte(']')
+	case map[string]any:
+		keys := make([]string, 0, len(typed))
+		for key := range typed {
+			keys = append(keys, key)
+		}
+		sort.Strings(keys)
+		out.WriteByte('{')
+		for index, key := range keys {
+			if index > 0 {
+				out.WriteByte(',')
+			}
+			raw, _ := json.Marshal(key)
+			out.Write(raw)
+			out.WriteByte(':')
+			if err := writeCanonical(out, typed[key]); err != nil {
+				return err
+			}
+		}
+		out.WriteByte('}')
+	default:
+		return ErrTransport
+	}
+	return nil
+}
 func Sign(e *Envelope, privateKeyPEM []byte) error {
 	if e == nil || e.Sequence == 0 || e.ProtocolVersion.Major != 1 || len(e.Payload) == 0 {
 		return ErrTransport
