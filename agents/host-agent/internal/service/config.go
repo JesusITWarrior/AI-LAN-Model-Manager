@@ -20,6 +20,7 @@ import (
 
 	"github.com/JesusITWarrior/AI-LAN-Model-Manager/agents/host-agent/internal/observation"
 	"github.com/JesusITWarrior/AI-LAN-Model-Manager/agents/host-agent/internal/provider"
+	"github.com/JesusITWarrior/AI-LAN-Model-Manager/agents/host-agent/internal/snapshot"
 )
 
 var (
@@ -60,6 +61,14 @@ type Config struct {
 	InitialObservation *bool
 	Output             chan ObservationRecord
 	Log                OutputLogger
+	SnapshotStore      SnapshotStore
+}
+
+// SnapshotStore is the injected durable-state boundary. Implementations must
+// preserve the previous committed state when Save fails before its commit.
+type SnapshotStore interface {
+	Load(context.Context) (snapshot.State, error)
+	Save(context.Context, snapshot.State) error
 }
 
 // ProviderRegistry is an injectable collection of observation sources and local
@@ -124,6 +133,7 @@ type resolved struct {
 	InitialObservation bool
 	Output             chan ObservationRecord
 	Log                OutputLogger
+	SnapshotStore      SnapshotStore
 }
 
 // New validates and sanitizes cfg, resolving a canonical absolute state tree
@@ -147,7 +157,21 @@ func New(cfg Config) (*Service, error) {
 	if err := ensureContainment(normalized.RuntimeDir); err != nil {
 		return nil, ErrStateContainment
 	}
-	return &Service{cfg: normalized}, nil
+	service := &Service{cfg: normalized}
+	loaded, loadErr := normalized.SnapshotStore.Load(context.Background())
+	switch {
+	case loadErr == nil && loaded.Valid():
+		loaded.Fresh = false
+		service.latest = loaded
+		service.hasLatest = true
+	case loadErr == nil:
+		return nil, ErrInvalidConfig
+	case errors.Is(loadErr, snapshot.ErrNotFound), errors.Is(loadErr, snapshot.ErrCorrupt):
+		// First start and quarantined corruption both continue without replay.
+	default:
+		return nil, ErrInvalidConfig
+	}
+	return service, nil
 }
 
 // sanitize validates and defaults every Config field, resolving platform
@@ -196,6 +220,11 @@ func (c Config) sanitize() (resolved, error) {
 	}
 
 	out.RuntimeDir = filepath.Join(stateRoot, "state")
+	if c.SnapshotStore != nil {
+		out.SnapshotStore = c.SnapshotStore
+	} else {
+		out.SnapshotStore = snapshot.FileStore{Dir: filepath.Join(out.RuntimeDir, "snapshot")}
+	}
 
 	switch {
 	case c.PollInterval == 0:

@@ -10,6 +10,7 @@ import (
 
 	"github.com/JesusITWarrior/AI-LAN-Model-Manager/agents/host-agent/internal/observation"
 	"github.com/JesusITWarrior/AI-LAN-Model-Manager/agents/host-agent/internal/provider"
+	"github.com/JesusITWarrior/AI-LAN-Model-Manager/agents/host-agent/internal/snapshot"
 )
 
 // Service owns the bounded, persistent, network-free host-service lifecycle.
@@ -28,11 +29,13 @@ type Service struct {
 	cfg resolved
 
 	// mu guards the closed lifecycle state so Start/Stop/Close cannot race.
-	mu      sync.Mutex
-	cancel  context.CancelFunc
-	done    chan struct{}
-	started bool
-	closed  bool
+	mu        sync.Mutex
+	cancel    context.CancelFunc
+	done      chan struct{}
+	started   bool
+	closed    bool
+	latest    snapshot.State
+	hasLatest bool
 }
 
 // Start performs an initial observation (unless InitialObservation is false),
@@ -199,8 +202,48 @@ func (s *Service) runObservation(ctx context.Context) (ObservationRecord, error)
 	if record.SafeErr == "" {
 		record.SafeErr = sanitizeStr(firstErr)
 	}
+
+	// Persist only a complete host observation. Provider failures are represented
+	// solely by public counts; endpoints and provider-specific data never cross
+	// the SnapshotStore boundary.
+	if record.ObservedAt != "" && ctx.Err() == nil {
+		state, stateErr := snapshot.New(snapshot.Record{
+			HostID:           record.HostID,
+			Platform:         record.Platform,
+			NAccelerators:    record.NAccelerators,
+			ObservedAt:       record.ObservedAt,
+			SafeErr:          record.SafeErr,
+			ProvidersHealthy: record.ProvidersHealthy,
+			ProvidersFailed:  record.ProvidersFailed,
+		}, time.Now())
+		if stateErr == nil {
+			stateErr = s.cfg.SnapshotStore.Save(ctx, state)
+		}
+		if stateErr == nil {
+			s.mu.Lock()
+			s.latest = state
+			s.hasLatest = true
+			s.mu.Unlock()
+		} else if firstErr == nil {
+			firstErr = stateErr
+			record.SafeErr = sanitizeStr(stateErr)
+		}
+	}
+
 	record.Err = firstErr
 	return record, sanitize(firstErr)
+}
+
+// LatestSnapshot returns an isolated copy of the latest validated snapshot.
+// A state loaded during New has Fresh=false; one saved by this process has
+// Fresh=true. The boolean is false when no trustworthy state exists.
+func (s *Service) LatestSnapshot() (snapshot.State, bool) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	if !s.hasLatest {
+		return snapshot.State{}, false
+	}
+	return s.latest, true
 }
 
 // loop performs repeated observation passes until the loop context is cancelled.
