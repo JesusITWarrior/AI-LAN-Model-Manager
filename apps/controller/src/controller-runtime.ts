@@ -10,6 +10,9 @@ import { PairingManager } from "./pairing-manager.js";
 import { FleetQueryService } from "./fleet-queries.js";
 import { PolicyService } from "./policy-service.js";
 import { PersistentReplayStore } from "./transport/replay-store.js";
+import { CertificateManager } from "./certificate-manager.js";
+import { OpenSslCertificateEngine } from "./certificate-adapter.js";
+import type { CertificateEngine } from "./certificate-types.js";
 
 import { openControllerDatabase } from "./database.js";
 import type { ControllerRepositories } from "./repositories.js";
@@ -53,6 +56,7 @@ export interface ControllerCoreServices {
   readonly sessions: SessionManager;
   readonly inferenceTokens: InferenceTokenManager;
   readonly pairing: PairingManager;
+  readonly certificates: CertificateManager;
   readonly fleet: FleetQueryService;
   readonly policy: PolicyService;
   readonly replay: PersistentReplayStore;
@@ -63,6 +67,7 @@ export interface CoreServiceDependencies {
   readonly random?: (size: number) => Uint8Array;
   readonly ownerId?: () => string;
   readonly passwordCrypto?: PasswordCryptoEngine;
+  readonly certificateEngine?: CertificateEngine;
 }
 
 /** Stable, redacted runtime error-code namespace. Message === code. */
@@ -233,6 +238,7 @@ class RuntimeImpl {
   private readonly random: (size: number) => Uint8Array;
   private readonly ownerId: () => string;
   private readonly passwordCrypto: PasswordCryptoEngine | undefined;
+  private readonly certificateEngine: CertificateEngine;
 
   private state: RuntimeLifecycleState = "created";
   private db: DatabaseSync | null = null;
@@ -249,6 +255,7 @@ class RuntimeImpl {
     this.random = rawOptions.dependencies?.random ?? ((size) => randomBytes(size));
     this.ownerId = rawOptions.dependencies?.ownerId ?? (() => Buffer.from(this.random(16)).toString("hex"));
     this.passwordCrypto = rawOptions.dependencies?.passwordCrypto;
+    this.certificateEngine = rawOptions.dependencies?.certificateEngine ?? new OpenSslCertificateEngine();
     const options = this.#validate(rawOptions);
     this.plan = options.plan;
     this.rootDir = options.plan.rootDir;
@@ -390,6 +397,7 @@ class RuntimeImpl {
         sessions,
         inferenceTokens: createInferenceTokenManager(this.db, authorizeSession, { clock: this.now, random: this.random }),
         pairing: new PairingManager(this.db, authorizeOwner, { clock: this.now, random: this.random }),
+        certificates: new CertificateManager(this.db, this.certificateEngine, this.plan.certificateDir, { clock: this.now, random: this.random }),
         fleet: new FleetQueryService(this.db, this.repositoriesValue, { clock: this.now }),
         policy: new PolicyService(this.db, { clock: this.now, random: this.random, stores: this.jobStoresValue }),
         replay: new PersistentReplayStore(this.db),

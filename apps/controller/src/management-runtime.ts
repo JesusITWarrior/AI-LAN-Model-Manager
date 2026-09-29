@@ -20,6 +20,7 @@
 import type { ControllerRuntimeHandle } from "./controller-runtime.js";
 import type { OriginPolicyOptions } from "./origin.js";
 import type { ManagementApiDependencies } from "./management-api.js";
+import { ControllerOperatorService, type OperatorServiceOptions } from "./operator-service.js";
 
 /**
  * The read-facing subset of {@link ManagementApiDependencies} that this module
@@ -41,6 +42,7 @@ export function createReadManagementDependencies(
   runtime: ControllerRuntimeHandle,
   allowedOrigins: readonly string[],
   originOptions: OriginPolicyOptions = {},
+  operatorOptions: OperatorServiceOptions = {},
 ): ReadManagementApiDependencies {
   const services = runtime.services;
   return {
@@ -50,6 +52,7 @@ export function createReadManagementDependencies(
     jobs: runtime.jobStores,
     policy: services.policy,
     inference: services.inferenceTokens,
+    operator: new ControllerOperatorService(runtime, operatorOptions),
     originOptions,
   };
 }

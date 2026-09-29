@@ -11,7 +11,7 @@ provider-neutral inventory spanning runtimes such as Ollama and LM Studio.
 > foundations are implemented and tested; native-host qualification, release
 > signing, and publication are not complete.
 
-Installation and upgrade packaging foundations are documented in [docs/operations/installation-and-upgrades.md](docs/operations/installation-and-upgrades.md).
+Installation and upgrade packaging foundations are documented in [docs/operations/installation-and-upgrades.md](docs/operations/installation-and-upgrades.md). First-run trust, pairing, certificate recovery, backup, and redacted diagnostics are documented in [docs/operations/operator-console.md](docs/operations/operator-console.md).
 
 ## Architecture
 
