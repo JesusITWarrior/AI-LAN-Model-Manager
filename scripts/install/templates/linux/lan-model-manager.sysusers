@@ -1,0 +1,2 @@
+u lanmodel-controller - "LAN Model Manager Controller" /var/lib/lan-model-manager/controller /usr/sbin/nologin
+u lanmodel-agent - "LAN Model Manager Host Agent" /var/lib/lan-model-manager/agent /usr/sbin/nologin

@@ -1,0 +1,5 @@
+d /var/lib/lan-model-manager/controller 0700 lanmodel-controller lanmodel-controller -
+d /var/lib/lan-model-manager/agent 0700 lanmodel-agent lanmodel-agent -
+d /etc/lan-model-manager/controller 0750 root lanmodel-controller -
+d /etc/lan-model-manager/agent 0750 root lanmodel-agent -
+d /var/log/lan-model-manager 0750 root root -

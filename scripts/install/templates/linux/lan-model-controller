@@ -1,0 +1,5 @@
+#!/bin/sh
+set -eu
+release=$(CDPATH= cd -- "$(dirname -- "$0")/.." && pwd -P)
+export LAN_MODEL_MANAGER_WEB_ROOT="$release/app/web/dist"
+exec node "$release/app/controller/dist/main.js"

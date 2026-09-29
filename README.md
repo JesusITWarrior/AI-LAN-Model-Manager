@@ -11,6 +11,8 @@ provider-neutral inventory spanning runtimes such as Ollama and LM Studio.
 > foundations are implemented and tested; native-host qualification, release
 > signing, and publication are not complete.
 
+Installation and upgrade packaging foundations are documented in [docs/operations/installation-and-upgrades.md](docs/operations/installation-and-upgrades.md).
+
 ## Architecture
 
 - **Controller:** TypeScript API and React UI for inventory, policy, planning,

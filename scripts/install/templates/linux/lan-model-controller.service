@@ -1,0 +1,26 @@
+[Unit]
+Description=LAN Model Manager Controller
+After=network-online.target
+Wants=network-online.target
+ConditionPathExists=/opt/lan-model-manager/controller.current
+
+[Service]
+Type=simple
+User=lanmodel-controller
+Group=lanmodel-controller
+ExecStart=/opt/lan-model-manager/bin/launch controller
+Restart=on-failure
+RestartSec=5s
+TimeoutStopSec=30s
+UMask=0027
+Environment=LANMM_DATA_DIR=/var/lib/lan-model-manager/controller
+NoNewPrivileges=yes
+PrivateTmp=yes
+ProtectSystem=strict
+ProtectHome=yes
+ReadWritePaths=/var/lib/lan-model-manager/controller /var/log/lan-model-manager
+RestrictSUIDSGID=yes
+LockPersonality=yes
+
+[Install]
+WantedBy=multi-user.target

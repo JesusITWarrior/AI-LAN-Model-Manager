@@ -15,13 +15,11 @@ import (
 	"io"
 	"log/slog"
 	"os"
-	"os/signal"
 	"path/filepath"
 	"regexp"
 	"runtime"
 	"strconv"
 	"strings"
-	"syscall"
 	"time"
 
 	"github.com/JesusITWarrior/AI-LAN-Model-Manager/agents/host-agent/internal/enrollment"
@@ -54,13 +52,17 @@ func (c fleetCollector) Collect(ctx context.Context) (fleet.Snapshot, error) {
 	return fleet.Snapshot{Platform: state.Record.Platform, Idle: true}, nil
 }
 
-func main() {
+func main() { os.Exit(runPlatformService(runHost)) }
+
+// runHost owns one cancellable service lifetime. Platform adapters provide the
+// cancellation source (signals on Unix and SCM control messages on Windows).
+func runHost(ctx context.Context) int {
 	cfg, err := loadConfig()
 	if err != nil {
 		// A rejected configuration is a safe, redacted failure: never print
 		// internal details to the operator.
 		slog.Error("host-service configuration rejected", "reason", safeErr(err))
-		os.Exit(exitConfig)
+		return exitConfig
 	}
 
 	// The service owns a canonical absolute state tree; anything resolving
@@ -68,18 +70,12 @@ func main() {
 	host, err := service.New(cfg)
 	if err != nil {
 		slog.Error("host-service failed to start", "reason", safeErr(err))
-		os.Exit(exitConfig)
+		return exitConfig
 	}
-
-	// The lifecycle is governed by a context that main cancels on a signal.
-	// Signal handling lives here so the service stays platform-agnostic and
-	// network-free.
-	ctx, stop := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
-	defer stop()
 
 	if err := host.Start(ctx); err != nil {
 		slog.Error("host-service failed to start", "reason", safeErr(err))
-		os.Exit(exitGeneral)
+		return exitGeneral
 	}
 	// Enrollment is the only switch that enables the outbound fleet plane. A
 	// missing/incomplete enrollment remains network-free; the fleet client has
@@ -104,9 +100,10 @@ func main() {
 		// Close only returns an error if the loop failed to observe
 		// cancellation in time; log the safe summary and exit normally.
 		slog.Error("host-service shutdown incomplete", "reason", safeErr(err))
-		os.Exit(exitGeneral)
+		return exitGeneral
 	}
 	slog.Info("host-service stopped")
+	return 0
 }
 
 // loadConfig builds a service.Config from environment with a strict allowlist.

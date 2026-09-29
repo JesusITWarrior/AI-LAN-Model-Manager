@@ -1,0 +1,9 @@
+import test from "node:test";
+import assert from "node:assert/strict";
+import {packageInventory,packageComponents} from "../package-inventory.js";
+import {buildSBOM} from "../sbom.js";
+import {readFile} from "node:fs/promises";
+import {resolve} from "node:path";
+const commit="a".repeat(40),records=[{name:"lan-model-agent-windows-amd64.tar.gz",role:"agent",target:"windows-amd64",size:20,sha256:"b".repeat(64)},{name:"lan-model-agent-linux-amd64.tar.gz",role:"agent",target:"linux-amd64",size:10,sha256:"c".repeat(64)}];
+test("package inventory and SBOM package components are deterministic and digest-bound",async()=>{const a=packageInventory(records,commit),b=packageInventory([...records].reverse(),commit);assert.deepEqual(a,b);assert.deepEqual(a.packages.map(x=>x.target),["linux-amd64","windows-amd64"]);const components=packageComponents(a);assert.equal(components[0]?.hashes[0]?.content,a.packages[0]?.sha256);const root=resolve(import.meta.dirname,"../../.."),lock=JSON.parse(await readFile(resolve(root,"package-lock.json"),"utf8")),manifest=JSON.parse(await readFile(resolve(root,"package.json"),"utf8")),sbom=buildSBOM(lock,manifest,a);assert.equal(sbom.components.filter((x:any)=>x.type==="file").length,2);assert.deepEqual(sbom.components.map((x:any)=>x.name),[...sbom.components.map((x:any)=>x.name)].sort());});
+test("package inventory rejects duplicate, malformed, and unbounded records",()=>{assert.throws(()=>packageInventory([...records,records[0]],commit),/ERR_PACKAGE_INVENTORY/);assert.throws(()=>packageInventory([{...records[0],name:"../escape.tar.gz"}],commit),/ERR_PACKAGE_INVENTORY/);assert.throws(()=>packageInventory([{...records[0],size:-1}],commit),/ERR_PACKAGE_INVENTORY/);const inventory=packageInventory(records,commit);assert.throws(()=>packageComponents({...inventory,packages:inventory.packages.map((x,i)=>i?x:{...x,size:x.size+1})}),/ERR_PACKAGE_INVENTORY/);});

@@ -1,0 +1,22 @@
+{
+  "schemaVersion": 1,
+  "startup": "disabled",
+  "startAfterInstall": false,
+  "firewallChanges": false,
+  "accounts": {
+    "controller": "NT SERVICE\\LANModelController",
+    "agent": "NT SERVICE\\LANModelAgent"
+  },
+  "environments": {
+    "controller": [
+      "LANMM_DATA_DIR=%ProgramData%\\LANModelManager\\state\\controller"
+    ],
+    "agent": [
+      "LANMM_STATE_DIR=%ProgramData%\\LANModelManager\\state\\agent",
+      "LANMM_CERT_DIR=%ProgramData%\\LANModelManager\\state\\agent\\cert",
+      "LANMM_CACHE_DIR=%ProgramData%\\LANModelManager\\state\\agent\\cache"
+    ]
+  },
+  "stateAcl": "service-modify;system-admin-full",
+  "preserveStateOnUninstall": true
+}

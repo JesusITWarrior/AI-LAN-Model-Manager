@@ -1,0 +1,28 @@
+[Unit]
+Description=LAN Model Manager Host Agent
+After=network-online.target
+Wants=network-online.target
+ConditionPathExists=/opt/lan-model-manager/agent.current
+
+[Service]
+Type=simple
+User=lanmodel-agent
+Group=lanmodel-agent
+ExecStart=/opt/lan-model-manager/bin/launch agent
+Restart=on-failure
+RestartSec=5s
+TimeoutStopSec=30s
+UMask=0077
+Environment=LANMM_STATE_DIR=/var/lib/lan-model-manager/agent
+Environment=LANMM_CERT_DIR=/var/lib/lan-model-manager/agent/cert
+Environment=LANMM_CACHE_DIR=/var/lib/lan-model-manager/agent/cache
+NoNewPrivileges=yes
+PrivateTmp=yes
+ProtectSystem=strict
+ProtectHome=read-only
+ReadWritePaths=/var/lib/lan-model-manager/agent /var/log/lan-model-manager
+RestrictSUIDSGID=yes
+LockPersonality=yes
+
+[Install]
+WantedBy=multi-user.target
