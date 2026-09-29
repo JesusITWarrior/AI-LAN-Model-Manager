@@ -382,12 +382,14 @@ class RuntimeImpl {
       this.repositoriesValue = this.buildRepositories(this.db, this.now);
       this.jobStoresValue = this.buildJobStores(this.db, this.now);
       const owner = createOwnerBootstrapService(this.db, { now: this.now, ownerId: this.ownerId, ...(this.passwordCrypto ? { crypto: this.passwordCrypto } : {}) });
-      const authorize = (value: unknown) => owner.authenticate(value);
+      const sessions = new SessionManager(this.db, owner, { clock: this.now, random: this.random });
+      const authorizeOwner = (value: unknown) => owner.authenticate(value);
+      const authorizeSession = async (value: unknown) => sessions.authenticate(value) !== null;
       this.servicesValue = Object.freeze({
         owner,
-        sessions: new SessionManager(this.db, owner, { clock: this.now, random: this.random }),
-        inferenceTokens: createInferenceTokenManager(this.db, authorize, { clock: this.now, random: this.random }),
-        pairing: new PairingManager(this.db, authorize, { clock: this.now, random: this.random }),
+        sessions,
+        inferenceTokens: createInferenceTokenManager(this.db, authorizeSession, { clock: this.now, random: this.random }),
+        pairing: new PairingManager(this.db, authorizeOwner, { clock: this.now, random: this.random }),
         fleet: new FleetQueryService(this.db, this.repositoriesValue, { clock: this.now }),
         policy: new PolicyService(this.db, { clock: this.now, random: this.random, stores: this.jobStoresValue }),
         replay: new PersistentReplayStore(this.db),

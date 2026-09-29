@@ -195,7 +195,7 @@ test("runtime owns one immutable non-network service graph with shared determini
     const session = await services.sessions.create({ username: "admin", password: "owner-password-123" });
     assert.ok(session);
     assert.equal(session.metadata.createdAt, t0);
-    const token = await services.inferenceTokens.issue({ username: "admin", password: "owner-password-123" }, { label: "alpha" });
+    const token = await services.inferenceTokens.issue(session.sessionToken, { label: "alpha" });
     assert.ok(token);
     assert.equal(token.metadata.tokenId, "09".repeat(16));
     runtime.close();
