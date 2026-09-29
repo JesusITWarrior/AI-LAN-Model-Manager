@@ -6,6 +6,8 @@ export {
   ERR_DATABASE_BACKUP, DatabaseBackupError, createDatabaseBackup, restoreDatabaseBackup,
   type DatabaseBackupManifest,
 } from "./database-backup.js";
+export { routeAuthRequest, type AuthApiDependencies, type AuthHttpRequest, type AuthHttpResponse } from "./owner-auth.js";
+export { createAuthHttpHandler } from "./owner-http.js";
 export {
   ControllerApplicationError, createControllerApplication,
   type ApplicationServer, type ControllerApplication, type ControllerApplicationErrorCode, type ControllerApplicationOptions, type SignalSource,
