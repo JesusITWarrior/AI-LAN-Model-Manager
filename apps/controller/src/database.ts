@@ -364,6 +364,23 @@ CREATE TABLE agent_commands (
 CREATE INDEX agent_commands_poll_idx ON agent_commands(host_id,state,created_at,job_id);
 `;
 
+const migration13Sql = `
+CREATE TABLE artifact_download_tickets (
+  ticket_digest TEXT PRIMARY KEY CHECK(length(ticket_digest) = 64),
+  host_id TEXT NOT NULL,
+  artifact_id TEXT NOT NULL,
+  manifest_digest TEXT NOT NULL CHECK(length(manifest_digest) = 64),
+  content_digest TEXT NOT NULL CHECK(length(content_digest) = 64),
+  size_bytes INTEGER NOT NULL CHECK(size_bytes > 0),
+  next_offset INTEGER NOT NULL DEFAULT 0 CHECK(next_offset >= 0 AND next_offset <= size_bytes),
+  serving INTEGER NOT NULL DEFAULT 0 CHECK(serving IN (0,1)),
+  expires_at TEXT NOT NULL,
+  consumed_at TEXT,
+  created_at TEXT NOT NULL
+) STRICT;
+CREATE INDEX artifact_download_tickets_host_idx ON artifact_download_tickets(host_id,expires_at);
+`;
+
 export const CONTROLLER_MIGRATIONS: readonly Migration[] = Object.freeze([
   Object.freeze({ version: 1, name: "inventory-v1", sql: migration1Sql, checksum: migrationChecksum(migration1Sql) }),
   Object.freeze({ version: 2, name: "durable-jobs-v1", sql: migration2Sql, checksum: migrationChecksum(migration2Sql) }),
@@ -377,6 +394,7 @@ export const CONTROLLER_MIGRATIONS: readonly Migration[] = Object.freeze([
   Object.freeze({ version: 10, name: "private-plan-fleet-health-v1", sql: migration10Sql, checksum: migrationChecksum(migration10Sql) }),
   Object.freeze({ version: 11, name: "private-plan-authorization-v1", sql: migration11Sql, checksum: migrationChecksum(migration11Sql) }),
   Object.freeze({ version: 12, name: "private-plan-agent-commands-v1", sql: migration12Sql, checksum: migrationChecksum(migration12Sql) }),
+  Object.freeze({ version: 13, name: "verified-artifact-delivery-v1", sql: migration13Sql, checksum: migrationChecksum(migration13Sql) }),
 ]);
 
 function validateMigrations(migrations: readonly Migration[]): void {

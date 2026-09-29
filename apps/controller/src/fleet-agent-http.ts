@@ -18,7 +18,7 @@ const PATHS = new Map([
 ]);
 
 type Rate = { count: number; resetAt: number };
-export interface FleetAgentHttpDependencies { readonly fleet: FleetService; readonly certificates: CertificateRepository; readonly commands?: AgentCommandService }
+export interface FleetAgentHttpDependencies { readonly fleet: FleetService; readonly certificates: CertificateRepository; readonly commands?: AgentCommandService; readonly artifacts?: { handle(request:IncomingMessage,response:ServerResponse):Promise<boolean> } }
 export interface FleetAgentHttpOptions { readonly clock?: () => number; readonly bodyLimit?: number; readonly rateLimit?: number; readonly rateWindowMs?: number }
 
 function send(response: ServerResponse, status: number, body: unknown): void {
@@ -51,6 +51,7 @@ export function createFleetAgentHttpHandler(deps: FleetAgentHttpDependencies, op
   if (![bodyLimit, rateLimit, windowMs].every(v => Number.isSafeInteger(v) && v > 0) || bodyLimit > FLEET_AGENT_BODY_LIMIT || rateLimit > FLEET_AGENT_RATE_LIMIT || windowMs > FLEET_AGENT_RATE_WINDOW_MS) throw new Error("ERR_FLEET_HTTP_OPTIONS");
   const rates = new Map<string, Rate>();
   return (request, response) => {
+    if(request.method==="GET"&&request.url?.startsWith("/agent/v1/artifacts/")){if(!deps.artifacts){request.resume();fail(response,404);return;}void deps.artifacts.handle(request,response).catch(()=>fail(response,500));return;}
     const expectedType = request.url ? PATHS.get(request.url) : undefined;
     if (request.method !== "POST" || !expectedType) { request.resume(); fail(response, 404); return; }
     if ((request.headers["content-type"] ?? "").toString().toLowerCase() !== "application/json") { request.resume(); fail(response, 415); return; }

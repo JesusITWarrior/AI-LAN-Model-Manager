@@ -115,6 +115,7 @@ func (s SequenceStore) Reserve(next uint64) error {
 type HTTPSClient struct {
 	mu           sync.Mutex
 	http         *http.Client
+	artifactHTTP *http.Client
 	base         string
 	hostID       string
 	minor        uint64
@@ -168,8 +169,10 @@ func NewHTTPSClient(certDir string) (*HTTPSClient, error) {
 	digest := sha256.Sum256(leaf.Raw)
 	serial := strings.ToUpper(leaf.SerialNumber.Text(16))
 	transport := &http.Transport{Proxy: nil, TLSClientConfig: tlsConfig, DisableCompression: true, ForceAttemptHTTP2: false, MaxIdleConns: 1, MaxIdleConnsPerHost: 1, IdleConnTimeout: 90 * time.Second, TLSHandshakeTimeout: 5 * time.Second, ResponseHeaderTimeout: 8 * time.Second}
-	client := &http.Client{Transport: transport, Timeout: 10 * time.Second, CheckRedirect: func(*http.Request, []*http.Request) error { return http.ErrUseLastResponse }}
-	return &HTTPSClient{http: client, base: result.ControllerURL, hostID: result.Binding.CandidateID, minor: uint64(result.Binding.ProtocolMinor), fingerprint: hex.EncodeToString(digest[:]), serial: serial, privateKey: keyPEM, sequence: sequence, store: store, now: time.Now}, nil
+	noRedirect := func(*http.Request, []*http.Request) error { return http.ErrUseLastResponse }
+	client := &http.Client{Transport: transport, Timeout: 10 * time.Second, CheckRedirect: noRedirect}
+	artifactClient := &http.Client{Transport: transport, CheckRedirect: noRedirect}
+	return &HTTPSClient{http: client, artifactHTTP: artifactClient, base: result.ControllerURL, hostID: result.Binding.CandidateID, minor: uint64(result.Binding.ProtocolMinor), fingerprint: hex.EncodeToString(digest[:]), serial: serial, privateKey: keyPEM, sequence: sequence, store: store, now: time.Now}, nil
 }
 
 func (c *HTTPSClient) observedAt() string {
@@ -271,7 +274,12 @@ func (c *HTTPSClient) Send(ctx context.Context, snapshot Snapshot) (uint64, erro
 	}
 	return ack.Sequence, nil
 }
-func (c *HTTPSClient) CloseIdleConnections() { c.http.CloseIdleConnections() }
+func (c *HTTPSClient) CloseIdleConnections() {
+	c.http.CloseIdleConnections()
+	if c.artifactHTTP != nil {
+		c.artifactHTTP.CloseIdleConnections()
+	}
+}
 
 // Avoid accidental acceptance of private-key material as a CA bundle in future edits.
 func publicCertificatesOnly(value string) bool {

@@ -89,15 +89,23 @@ type inferenceAdapter interface {
 	Chat(context.Context, ollama.ChatRequest) (ollama.ChatCompletion, error)
 }
 
+// ArtifactInstaller is deliberately injected. A registry without one rejects
+// artifact installation, so merely enabling the command plane cannot enable
+// remote acquisition.
+type ArtifactInstaller interface {
+	Install(context.Context, ArtifactInstallParams) (ArtifactInstallResult, error)
+}
+
 // Registry binds each fixed lifecycle operation to exactly one provider client.
 // No adapter may be added through any other path.
 type Registry struct {
-	now      func() time.Time
-	mu       sync.Mutex
-	clients  map[string]providerAdapter     // providerId -> adapter
-	running  map[string]struct{}            // modelKey -> currently loaded
-	draining map[string]struct{}            // modelKey -> admission stopped
-	active   map[string]map[string]struct{} // modelKey -> outstanding request handles
+	now       func() time.Time
+	mu        sync.Mutex
+	clients   map[string]providerAdapter     // providerId -> adapter
+	running   map[string]struct{}            // modelKey -> currently loaded
+	draining  map[string]struct{}            // modelKey -> admission stopped
+	active    map[string]map[string]struct{} // modelKey -> outstanding request handles
+	installer ArtifactInstaller
 }
 
 // NewRegistry creates an empty registry using the supplied clock (or time.Now
@@ -123,6 +131,17 @@ func (r *Registry) RegisterOllama(providerID string, client *ollama.Client) {
 // RegisterLMStudio binds one normalized LM Studio adapter to the registry under
 // its providerId. LM Studio exposes no running/installed observation, so runtime
 // verification for it relies on the provider's own convergence result.
+// ConfigureArtifactInstaller explicitly enables the otherwise guarded install
+// operation. Passing nil restores the guard.
+func (r *Registry) ConfigureArtifactInstaller(installer ArtifactInstaller) {
+	if r == nil {
+		return
+	}
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	r.installer = installer
+}
+
 func (r *Registry) RegisterLMStudio(providerID string, client *lmstudio.Client) {
 	if r == nil || client == nil || providerID == "" {
 		return
@@ -139,8 +158,21 @@ func (r *Registry) Execute(ctx context.Context, operation string, params json.Ra
 	if r == nil {
 		return nil, ErrUnsupported
 	}
-	if operation == "install" || operation == "remove-managed-artifact" {
+	if operation == "remove-managed-artifact" {
 		return nil, ErrGuardedOperation
+	}
+	if operation == "install" {
+		r.mu.Lock()
+		installer := r.installer
+		r.mu.Unlock()
+		if installer == nil {
+			return nil, ErrGuardedOperation
+		}
+		parsed, err := ParseArtifactInstallParams(params)
+		if err != nil {
+			return nil, err
+		}
+		return installer.Install(ctx, parsed)
 	}
 	if operation == "inference.chat" {
 		return r.runInference(ctx, params)
