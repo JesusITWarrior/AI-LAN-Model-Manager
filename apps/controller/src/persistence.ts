@@ -3,6 +3,10 @@ export {
   type Migration, type OpenControllerDatabaseOptions, type PersistenceErrorCode,
 } from "./database.js";
 export {
+  ERR_DATABASE_BACKUP, DatabaseBackupError, createDatabaseBackup, restoreDatabaseBackup,
+  type DatabaseBackupManifest,
+} from "./database-backup.js";
+export {
   AuditRepository, JobRepository, JobStoreError, createJobStores,
   type AuditRecord, type CoupledContext, type HistoryRecord, type JobRecord, type JobStores, type JobStoreErrorCode,
 } from "./jobs-store.js";
