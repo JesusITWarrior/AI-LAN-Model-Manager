@@ -4,8 +4,9 @@
 // performs an initial observation followed by a cancellable periodic loop, and
 // reports only safe, redacted startup/shutdown summaries.
 //
-// It intentionally performs no discovery, opens no listener, connects to no
-// controller, and executes no arbitrary commands. Platform-specific behavior
+// It performs no discovery, opens no listener, and executes no arbitrary
+// commands. An explicitly configured Enroller may make one bounded outbound
+// controller enrollment attempt before observation. Platform-specific behavior
 // (canonical default paths and permission handling) is confined to build-tagged
 // files so the platform-neutral logic here stays identical everywhere.
 package service
@@ -18,6 +19,7 @@ import (
 	"strings"
 	"time"
 
+	"github.com/JesusITWarrior/AI-LAN-Model-Manager/agents/host-agent/internal/enrollment"
 	"github.com/JesusITWarrior/AI-LAN-Model-Manager/agents/host-agent/internal/observation"
 	"github.com/JesusITWarrior/AI-LAN-Model-Manager/agents/host-agent/internal/provider"
 	"github.com/JesusITWarrior/AI-LAN-Model-Manager/agents/host-agent/internal/snapshot"
@@ -62,6 +64,13 @@ type Config struct {
 	Output             chan ObservationRecord
 	Log                OutputLogger
 	SnapshotStore      SnapshotStore
+	Enroller           Enroller
+}
+
+// Enroller is the optional bounded outbound enrollment boundary. When nil the
+// service remains local-only.
+type Enroller interface {
+	Enroll(context.Context) (enrollment.Outcome, error)
 }
 
 // SnapshotStore is the injected durable-state boundary. Implementations must
@@ -72,8 +81,8 @@ type SnapshotStore interface {
 }
 
 // ProviderRegistry is an injectable collection of observation sources and local
-// runtime providers. The service never opens a network listener or connects to
-// a controller; it only drives these sources and records local observations.
+// runtime providers. The service never opens a network listener; outside the
+// optional Enroller it only drives these sources and records local observations.
 type ProviderRegistry struct {
 	Observers []observation.Observer
 	Runtime   []LocalProvider
@@ -134,6 +143,7 @@ type resolved struct {
 	Output             chan ObservationRecord
 	Log                OutputLogger
 	SnapshotStore      SnapshotStore
+	Enroller           Enroller
 }
 
 // New validates and sanitizes cfg, resolving a canonical absolute state tree
@@ -250,6 +260,7 @@ func (c Config) sanitize() (resolved, error) {
 	}
 
 	out.Output = c.Output
+	out.Enroller = c.Enroller
 	if c.Log != nil {
 		out.Log = c.Log
 	}

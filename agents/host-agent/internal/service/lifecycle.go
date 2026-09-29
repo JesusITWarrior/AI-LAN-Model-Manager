@@ -8,12 +8,14 @@ import (
 	"sync"
 	"time"
 
+	"github.com/JesusITWarrior/AI-LAN-Model-Manager/agents/host-agent/internal/enrollment"
 	"github.com/JesusITWarrior/AI-LAN-Model-Manager/agents/host-agent/internal/observation"
 	"github.com/JesusITWarrior/AI-LAN-Model-Manager/agents/host-agent/internal/provider"
 	"github.com/JesusITWarrior/AI-LAN-Model-Manager/agents/host-agent/internal/snapshot"
 )
 
-// Service owns the bounded, persistent, network-free host-service lifecycle.
+// Service owns the bounded, persistent host-service lifecycle. It opens no
+// listener; its only optional network action is one injected outbound enrollment.
 //
 // Its StateDir tree (canonical absolute, restrictive permissions where
 // supported, symlink escapes rejected) contains:
@@ -66,6 +68,13 @@ func (s *Service) Start(ctx context.Context) error {
 	s.cancel = cancel
 	s.done = make(chan struct{})
 	s.mu.Unlock()
+
+	if s.cfg.Enroller != nil {
+		outcome, err := s.cfg.Enroller.Enroll(loopCtx)
+		if s.cfg.Log != nil {
+			s.cfg.Log(EnrollmentSummary(outcome, err))
+		}
+	}
 
 	if s.cfg.InitialObservation {
 		record, err := s.runObservation(loopCtx)
@@ -275,6 +284,20 @@ func (s *Service) emit(ctx context.Context, record ObservationRecord) {
 	case s.cfg.Output <- record:
 	case <-ctx.Done():
 	default:
+	}
+}
+
+// EnrollmentSummary reports only a stable allowlisted status. In particular it
+// never emits the operator code, controller address, certificate, or error.
+func EnrollmentSummary(outcome enrollment.Outcome, err error) LogEntry {
+	status := enrollment.StatusDegraded
+	if err == nil && outcome.Status == enrollment.StatusEnrolled {
+		status = enrollment.StatusEnrolled
+	}
+	return LogEntry{
+		Level:   "info",
+		Message: "host service enrollment complete",
+		Fields:  map[string]any{"status": status},
 	}
 }
 
