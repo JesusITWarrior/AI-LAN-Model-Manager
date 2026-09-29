@@ -3,7 +3,7 @@ import type { CommandRequest, CommandResponse } from "@lan-model-manager/core";
 import { capabilityMatches, parseCommandRequest, parseCommandResponse, responseMatches } from "@lan-model-manager/core";
 import type { JobStores } from "./jobs-store.js";
 
-export interface CommandWire { send(request: CommandRequest): unknown }
+export interface CommandWire { send(request: CommandRequest): unknown; cancel?(jobId:string):boolean }
 export type DispatchResult = { readonly ok: true; readonly state: string; readonly observation: unknown } | { readonly ok: false; readonly error: string };
 export type SuccessVerifier = (response: CommandResponse) => boolean;
 const action = (operation: string) => operation === "probe" || operation === "inventory" || operation === "estimate" ? "load" : operation;
@@ -54,7 +54,8 @@ export class CommandDispatcher {
       this.stores.withAuditTransaction(tx => {
         let currentState = current.payload.state;
         for (const step of ["accepted", "running"] as const) {
-          if ((state === "accepted" && step === "running") || currentState === step || terminal.has(currentState)) break;
+          if (terminal.has(currentState) || (state === "accepted" && step === "running")) break;
+          if (currentState === step || (currentState === "running" && step === "accepted")) continue;
           tx.jobs.transition(request.jobId, step, new Date(Date.parse(response.observedAt) + (step === "running" ? 1 : 0)).toISOString(), { progressPercent: step === "running" ? Math.min(response.progress ?? 1, 99) : 0, terminalCode: null, terminalMessage: null });
           currentState = step;
         }
@@ -65,7 +66,7 @@ export class CommandDispatcher {
     } catch { return { ok: false, error: "ERR_DISPATCH_DATABASE" }; }
   }
 
-  cancel(jobId: string): DispatchResult { const now = this.clock(); try { const job = this.stores.jobs.get(jobId); if (!job) return { ok: false, error: "ERR_DISPATCH_NOT_FOUND" }; this.stores.jobs.transition(jobId, "cancelled", now, { progressPercent: null, terminalCode: "CANCELLED", terminalMessage: "cancelled" }); return { ok: true, state: "cancelled", observation: null }; } catch { return { ok: false, error: "ERR_DISPATCH_DATABASE" }; } }
+  cancel(jobId: string): DispatchResult { try { const job = this.stores.jobs.get(jobId); if (!job) return { ok: false, error: "ERR_DISPATCH_NOT_FOUND" }; if (terminal.has(job.payload.state)) return { ok: true, state: job.payload.state, observation: null }; const now=new Date(Math.max(Date.parse(this.clock()),Date.parse(job.updatedAt)+1)).toISOString(); if (this.wire.cancel && !this.wire.cancel(jobId)) return { ok: false, error: "ERR_DISPATCH_DATABASE" }; this.stores.withAuditTransaction(tx=>{tx.jobs.transition(jobId, "cancelled", now, { progressPercent: null, terminalCode: "CANCELLED", terminalMessage: "cancelled" });tx.audit.append({actorKind:"controller",actorId:"controller",action:"command-cancel",outcome:"cancelled",requestId:job.payload.operation.requestId,jobId,hostId:job.hostId,details:null,occurredAt:now});}); return { ok: true, state: "cancelled", observation: null }; } catch { return { ok: false, error: "ERR_DISPATCH_DATABASE" }; } }
 
   private fail(request: CommandRequest, code: string, observedAt?: string): DispatchResult {
     const base = Math.max(Date.parse(observedAt ?? this.clock()), Date.parse(this.clock()) + 4);

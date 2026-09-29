@@ -346,6 +346,24 @@ CREATE TABLE decisions (
 CREATE INDEX decisions_request_idx ON decisions(request_id);
 `;
 
+// Durable outbound command queue. Commands are delivered only through the
+// authenticated fleet mTLS adapter; this table is transport state, while the
+// existing jobs/job_history/audit tables remain the authoritative lifecycle.
+const migration12Sql = `
+CREATE TABLE agent_commands (
+  job_id TEXT PRIMARY KEY REFERENCES jobs(job_id) ON DELETE CASCADE,
+  host_id TEXT NOT NULL,
+  request_json TEXT NOT NULL CHECK(json_valid(request_json)),
+  request_digest TEXT NOT NULL CHECK(length(request_digest) = 64),
+  state TEXT NOT NULL CHECK(state IN ('queued','leased','completed','cancelled','expired')),
+  lease_until TEXT,
+  result_json TEXT CHECK(result_json IS NULL OR json_valid(result_json)),
+  created_at TEXT NOT NULL,
+  updated_at TEXT NOT NULL
+) STRICT;
+CREATE INDEX agent_commands_poll_idx ON agent_commands(host_id,state,created_at,job_id);
+`;
+
 export const CONTROLLER_MIGRATIONS: readonly Migration[] = Object.freeze([
   Object.freeze({ version: 1, name: "inventory-v1", sql: migration1Sql, checksum: migrationChecksum(migration1Sql) }),
   Object.freeze({ version: 2, name: "durable-jobs-v1", sql: migration2Sql, checksum: migrationChecksum(migration2Sql) }),
@@ -358,6 +376,7 @@ export const CONTROLLER_MIGRATIONS: readonly Migration[] = Object.freeze([
   Object.freeze({ version: 9, name: "private-plan-fleet-liveness-v1", sql: migration9Sql, checksum: migrationChecksum(migration9Sql) }),
   Object.freeze({ version: 10, name: "private-plan-fleet-health-v1", sql: migration10Sql, checksum: migrationChecksum(migration10Sql) }),
   Object.freeze({ version: 11, name: "private-plan-authorization-v1", sql: migration11Sql, checksum: migrationChecksum(migration11Sql) }),
+  Object.freeze({ version: 12, name: "private-plan-agent-commands-v1", sql: migration12Sql, checksum: migrationChecksum(migration12Sql) }),
 ]);
 
 function validateMigrations(migrations: readonly Migration[]): void {

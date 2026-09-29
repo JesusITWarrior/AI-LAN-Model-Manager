@@ -3,6 +3,7 @@ import type { IncomingMessage, ServerResponse } from "node:http";
 import type { TLSSocket } from "node:tls";
 import type { CertificateRepository } from "./certificate-repository.js";
 import type { FleetService } from "./fleet-service.js";
+import type { AgentCommandService } from "./agent-command-channel.js";
 
 export const FLEET_AGENT_BODY_LIMIT = 65_536;
 export const FLEET_AGENT_RATE_LIMIT = 120;
@@ -11,10 +12,12 @@ const MAX_RATE_KEYS = 2_048;
 const PATHS = new Map([
   ["/agent/v1/fleet/hello", "transport.hello"],
   ["/agent/v1/fleet/heartbeat", "transport.heartbeat"],
+  ["/agent/v1/commands/poll", "agent.command.poll"],
+  ["/agent/v1/commands/result", "agent.command.result"],
 ]);
 
 type Rate = { count: number; resetAt: number };
-export interface FleetAgentHttpDependencies { readonly fleet: FleetService; readonly certificates: CertificateRepository }
+export interface FleetAgentHttpDependencies { readonly fleet: FleetService; readonly certificates: CertificateRepository; readonly commands?: AgentCommandService }
 export interface FleetAgentHttpOptions { readonly clock?: () => number; readonly bodyLimit?: number; readonly rateLimit?: number; readonly rateWindowMs?: number }
 
 function send(response: ServerResponse, status: number, body: unknown): void {
@@ -62,13 +65,23 @@ export function createFleetAgentHttpHandler(deps: FleetAgentHttpDependencies, op
     const chunks: Buffer[] = []; let length = 0, done = false, overflow = false;
     request.on("data", chunk => { if (done || overflow) return; if (!(typeof chunk === "string" || chunk instanceof Uint8Array)) { overflow = true; return; } const value = Buffer.from(chunk); length += value.byteLength; if (length > bodyLimit) { overflow = true; return; } chunks.push(value); });
     request.on("error", () => { if (!done) { done = true; fail(response, 400); } });
-    request.on("end", () => {
+    request.on("end", async () => {
       if (done) return; done = true; if (overflow) { fail(response, 413); return; }
       let input: unknown; try { input = JSON.parse(Buffer.concat(chunks, length).toString("utf8")); } catch { fail(response, 400); return; }
       const envelope = exactEnvelope(input, expectedType);
       if (!envelope || !equal(envelope.certFingerprint, certificate.fingerprint) || BigInt(`0x${envelope.certSerial}`) !== BigInt(`0x${certificate.serial}`)) { fail(response, 401, "ERR_HOST_REVOKED"); return; }
       const record = deps.certificates.getBySerial(envelope.certSerial, envelope.certFingerprint);
       if (!record || record.status !== "active") { fail(response, 401, "ERR_HOST_REVOKED"); return; }
+      if (expectedType.startsWith("agent.command.")) {
+        if (!deps.commands) { fail(response, 404); return; }
+        const result = deps.commands.ingest(input, record.binding.address);
+        if (!result.ok) { fail(response, result.error === "ERR_COMMAND_AUTH" || result.error === "ERR_COMMAND_BINDING" ? 401 : 400, result.error); return; }
+        if (expectedType === "agent.command.poll") {
+          try { const waitMs=(input as {payload:{waitMs:number}}).payload.waitMs;const polled=await deps.commands.wait(record.binding.candidateId,result.result,waitMs);send(response, 200, deps.commands.signed(record.binding.candidateId, (input as {requestId:string}).requestId, (input as {sequence:number}).sequence, polled)); }
+          catch { fail(response, 500, "ERR_COMMAND_SIGN"); }
+        } else send(response, 200, { ok: true });
+        return;
+      }
       const result = deps.fleet.ingest(input, record.binding.address);
       send(response, 200, result);
     });

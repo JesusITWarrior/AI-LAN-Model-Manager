@@ -38,7 +38,7 @@ const (
 )
 
 // version is reported only in safe startup/shutdown summaries.
-var version = "18.9a"
+var version = "18.9b"
 
 type snapshotSource interface{ LatestSnapshot() (snapshot.State, bool) }
 type fleetCollector struct{ source snapshotSource }

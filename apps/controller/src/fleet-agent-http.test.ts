@@ -6,9 +6,9 @@ import { createFleetAgentHttpHandler } from "./fleet-agent-http.js";
 
 const raw = Buffer.from("peer-certificate");
 const fingerprint = createHash("sha256").update(raw).digest("hex");
-function invoke(options: { path?: string; type?: string; active?: boolean; authorized?: boolean; authorization?: string } = {}) {
+function invoke(options: { path?: string; type?: string; active?: boolean; authorized?: boolean; authorization?: string; bodyFingerprint?: string } = {}) {
   let ingested = 0;
-  const body = JSON.stringify({ messageType: options.type ?? "transport.hello", certFingerprint: fingerprint, certSerial: "ABCD" });
+  const body = JSON.stringify({ messageType: options.type ?? "transport.hello", certFingerprint: options.bodyFingerprint ?? fingerprint, certSerial: "ABCD" });
   const request = Object.assign(new EventEmitter(), {
     method: "POST", url: options.path ?? "/agent/v1/fleet/hello",
     headers: { "content-type": "application/json", "content-length": String(Buffer.byteLength(body)), ...(options.authorization ? { authorization: options.authorization } : {}) },
@@ -33,4 +33,10 @@ test("management or inference credentials cannot replace an active client certif
   const bearer = invoke({ authorized: false, authorization: "Bearer management-or-inference-secret" });
   assert.equal(bearer.status, 401); assert.equal(bearer.ingested, 0);
   const revoked = invoke({ active: false }); assert.equal(revoked.status, 401); assert.equal(revoked.ingested, 0);
+  const commandCredentialConfusion=invoke({path:"/agent/v1/commands/poll",type:"agent.command.poll",authorized:false,authorization:"Bearer inference-token"});assert.equal(commandCredentialConfusion.status,401);
+});
+
+test("command routes reject wrong and revoked client certificates before dispatch",()=>{
+  const wrong=invoke({path:"/agent/v1/commands/poll",type:"agent.command.poll",bodyFingerprint:"0".repeat(64)});assert.equal(wrong.status,401);assert.equal(wrong.ingested,0);
+  const revoked=invoke({path:"/agent/v1/commands/result",type:"agent.command.result",active:false});assert.equal(revoked.status,401);assert.equal(revoked.ingested,0);
 });

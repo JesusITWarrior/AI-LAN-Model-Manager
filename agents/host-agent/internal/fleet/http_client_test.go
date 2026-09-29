@@ -9,7 +9,15 @@ import (
 	"path/filepath"
 	"testing"
 	"time"
+
+	"github.com/JesusITWarrior/AI-LAN-Model-Manager/agents/host-agent/internal/command"
 )
+
+type crossCommandAdapter struct{}
+
+func (crossCommandAdapter) Execute(_ context.Context, operation string, _ json.RawMessage) (any, error) {
+	return map[string]any{"operation": operation, "health": "ready"}, nil
+}
 
 func TestCrossLanguageFleetHelper(t *testing.T) {
 	directory := os.Getenv("LANMM_CROSS_FLEET_CERT_DIR")
@@ -55,6 +63,18 @@ func TestCrossLanguageFleetHelper(t *testing.T) {
 	resumed, err := restarted.Send(context.Background(), Snapshot{Platform: "linux", Idle: true, Providers: providers, Models: models})
 	if err != nil {
 		t.Fatal(err)
+	}
+	if os.Getenv("LANMM_CROSS_FLEET_COMMAND") == "1" {
+		request, _, pollErr := restarted.PollCommand(context.Background(), 0)
+		if pollErr != nil || request == nil {
+			t.Fatalf("command poll = %#v, %v", request, pollErr)
+		}
+		executor := command.New("agent-1", crossCommandAdapter{}, time.Now)
+		result, executeErr := executor.Execute(context.Background(), *request)
+		if executeErr != nil || restarted.SendCommandResult(context.Background(), result) != nil {
+			t.Fatalf("command result = %#v, %v", result, executeErr)
+		}
+		fmt.Println("LANMM_CROSS_COMMAND_RESULT=succeeded")
 	}
 	value, _ := json.Marshal(map[string]uint64{"hello": hello.Sequence, "heartbeat": heartbeat, "resumed": resumed})
 	fmt.Printf("LANMM_CROSS_FLEET_RESULT=%s\n", value)
