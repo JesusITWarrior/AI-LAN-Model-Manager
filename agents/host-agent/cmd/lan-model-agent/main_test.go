@@ -1,6 +1,7 @@
 package main
 
 import (
+	"bytes"
 	"crypto/ecdsa"
 	"crypto/elliptic"
 	"crypto/rand"
@@ -10,12 +11,33 @@ import (
 	"math/big"
 	"os"
 	"path/filepath"
+	"strings"
 	"testing"
 	"time"
 
 	"github.com/JesusITWarrior/AI-LAN-Model-Manager/agents/host-agent/internal/enrollment"
 	"github.com/JesusITWarrior/AI-LAN-Model-Manager/agents/host-agent/internal/service"
 )
+
+func TestCommandLineHelpVersionAndUnknownArguments(t *testing.T) {
+	for _, args := range [][]string{{"-h"}, {"--help"}} {
+		var out bytes.Buffer
+		if code, handled := handleCommandLine(args, &out); !handled || code != 0 || !strings.Contains(out.String(), "Usage: lan-model-agent") {
+			t.Fatalf("help args=%v code=%d handled=%v out=%q", args, code, handled, out.String())
+		}
+	}
+	var versionOut bytes.Buffer
+	if code, handled := handleCommandLine([]string{"--version"}, &versionOut); !handled || code != 0 || versionOut.String() != "lan-model-agent "+version+"\n" {
+		t.Fatalf("version code=%d handled=%v out=%q", code, handled, versionOut.String())
+	}
+	var badOut bytes.Buffer
+	if code, handled := handleCommandLine([]string{"--unknown"}, &badOut); !handled || code != exitConfig || strings.Contains(badOut.String(), "LANMM_") {
+		t.Fatalf("unknown code=%d handled=%v out=%q", code, handled, badOut.String())
+	}
+	if code, handled := handleCommandLine(nil, &bytes.Buffer{}); handled || code != 0 {
+		t.Fatalf("service launch code=%d handled=%v", code, handled)
+	}
+}
 
 func testCA(t *testing.T) (string, string) {
 	t.Helper()

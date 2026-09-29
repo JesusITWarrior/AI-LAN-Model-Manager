@@ -52,7 +52,29 @@ func (c fleetCollector) Collect(ctx context.Context) (fleet.Snapshot, error) {
 	return fleet.Snapshot{Platform: state.Record.Platform, Idle: true}, nil
 }
 
-func main() { os.Exit(runPlatformService(runHost)) }
+func main() {
+	if code, handled := handleCommandLine(os.Args[1:], os.Stdout); handled {
+		os.Exit(code)
+	}
+	os.Exit(runPlatformService(runHost))
+}
+
+func handleCommandLine(args []string, out io.Writer) (int, bool) {
+	if len(args) == 0 {
+		return 0, false
+	}
+	if len(args) == 1 && (args[0] == "-h" || args[0] == "--help") {
+		_, _ = fmt.Fprintln(out, "Usage: lan-model-agent [--help] [--version]")
+		_, _ = fmt.Fprintln(out, "Runs the LAN Model Manager host agent; configuration is read from LANMM_* environment variables.")
+		return 0, true
+	}
+	if len(args) == 1 && args[0] == "--version" {
+		_, _ = fmt.Fprintf(out, "lan-model-agent %s\n", version)
+		return 0, true
+	}
+	_, _ = fmt.Fprintln(out, "lan-model-agent: unsupported argument; use --help")
+	return exitConfig, true
+}
 
 // runHost owns one cancellable service lifetime. Platform adapters provide the
 // cancellation source (signals on Unix and SCM control messages on Windows).

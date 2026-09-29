@@ -57,6 +57,13 @@ func (p PollingEnroller) Enroll(ctx context.Context) (Outcome, error) {
 			if completeErr == nil {
 				return outcome, nil
 			}
+			// The deadline and ticker can become ready together. Complete maps an
+			// already-cancelled request to degraded, but the polling contract must
+			// report a bounded pending timeout and discard ephemeral proof material.
+			if pollCtx.Err() != nil {
+				p.Client.discardPending()
+				return Outcome{Status: StatusPending}, ErrUnavailable
+			}
 			if !errors.Is(completeErr, ErrUnavailable) || outcome.Status != StatusPending {
 				return outcome, completeErr
 			}
