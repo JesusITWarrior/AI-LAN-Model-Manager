@@ -190,6 +190,12 @@ test("invalid ids, kind, action names, executable, argv, env, limits", () => {
   }
 });
 
+test("accepts normalized absolute Windows executable paths", () => {
+  const parsed = parseCustomProviderManifest({ ...base(), actions: [action({ executable: "C:\\ProgramData\\LANMM\\probe.exe" })] });
+  assert.equal(parsed.ok, true);
+  assert.equal(parseCustomProviderManifest({ ...base(), actions: [action({ executable: "C:/ProgramData/LANMM/probe.exe" })] }).ok, false);
+});
+
 test("sensitive public values are rejected", () => {
   // URL / endpoint.
   assert.equal(parseCustomProviderManifest({ ...base(), actions: [{ ...action(), executable: "https://evil/x" }] }).ok, false);

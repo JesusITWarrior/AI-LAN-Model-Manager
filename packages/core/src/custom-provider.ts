@@ -12,6 +12,7 @@
  * an echo of untrusted input, and never a thrown exception.
  */
 
+import { posix, win32 } from "node:path";
 import { parseByteAmount, type ByteAmount } from "./observations.js";
 import type { ParseResult } from "./protocol.js";
 
@@ -211,13 +212,15 @@ function parseKind(value: unknown): CustomProviderKind | null {
  // doubled slashes, and any endpoint, credential, or LAN token.
  */
 function parseExecutable(value: unknown): string | null {
-  if (typeof value !== "string") return null;
-  const length = value.length;
-  if (length < 1 || length > MAX_EXECUTABLE_LENGTH) return null;
-  if (value.charAt(0) !== "/") return null;
-  if (PATH_META.test(value)) return null;
-  if (value.includes("//") || value.endsWith("/") || /\.\./.test(value)) return null;
-  if (isSensitivePublicValue(value)) return null;
+  if (typeof value !== "string" || value.length < 1 || Buffer.byteLength(value) > MAX_EXECUTABLE_LENGTH) return null;
+  if (CONTROL_SHELL.test(value.replaceAll("\\", "")) || /[\x00-\x1f\x7f]/.test(value) || isSensitivePublicValue(value)) return null;
+  if (value.startsWith("/")) {
+    if (value.includes("\\") || posix.normalize(value) !== value || value === "/" || value.endsWith("/") || value.includes("//")) return null;
+    return value.split("/").some(part => part === "." || part === "..") ? null : value;
+  }
+  if (!/^[A-Za-z]:\\/.test(value) || value.includes("/") || value.startsWith("\\\\") || win32.normalize(value) !== value || value.endsWith("\\")) return null;
+  const parts = value.slice(3).split("\\");
+  if (parts.some(part => !part || part === "." || part === ".." || /[<>:"|?*]/.test(part) || /[. ]$/.test(part) || /^(CON|PRN|AUX|NUL|COM[1-9]|LPT[1-9])(?:\..*)?$/i.test(part))) return null;
   return value;
 }
 
