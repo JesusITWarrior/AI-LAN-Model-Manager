@@ -54,8 +54,15 @@ test("live enrollment begins from exact binding, presents one-time code, then pr
     assert.equal(begun.status, 200); const challenge = (begun.body as any).value;
     assert.deepEqual(Object.keys(challenge).sort(), ["binding", "caFingerprint", "challengeId", "controllerNonce", "expiresAt", "operatorCode"]);
     assert.equal(x.pairing.get(challenge.challengeId)?.state, "presented");
+    const pendingProof = proofFor(challenge);
+    const unproven = await x.post("/agent/v1/enrollment/complete", { ...pendingProof, proof: "0".repeat(64) });
+    assert.equal(unproven.status, 400); assert.deepEqual((unproven.body as any).error, { code: "ENROLLMENT_FAILED", message: "Enrollment failed." });
+    assert.equal(x.pairing.get(challenge.challengeId)?.state, "presented");
+    const pending = await x.post("/agent/v1/enrollment/complete", pendingProof);
+    assert.equal(pending.status, 409); assert.deepEqual((pending.body as any).error, { code: "OWNER_CONFIRMATION_PENDING", message: "Owner confirmation pending." });
+    assert.equal(x.pairing.get(challenge.challengeId)?.state, "presented");
     assert.ok(await x.pairing.confirm("owner", { challengeId: challenge.challengeId, code: challenge.operatorCode, binding: challenge.binding }));
-    const completed = await x.post("/agent/v1/enrollment/complete", proofFor(challenge));
+    const completed = await x.post("/agent/v1/enrollment/complete", pendingProof);
     assert.equal(completed.status, 200); assert.equal((completed.body as any).value.certificateFingerprint, "b".repeat(64)); assert.equal(x.pairing.get(challenge.challengeId)?.state, "consumed");
     assert.equal((await x.post("/agent/v1/enrollment/complete", proofFor(challenge))).status, 400);
   } finally { x.db.close(); }

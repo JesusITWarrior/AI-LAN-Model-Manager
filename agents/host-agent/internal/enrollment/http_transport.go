@@ -166,9 +166,6 @@ func (t *HTTPTransport) post(ctx context.Context, path string, input, output any
 		return remoteError(ctx)
 	}
 	defer response.Body.Close()
-	if response.StatusCode != http.StatusOK {
-		return remoteError(ctx)
-	}
 	if mediaType := strings.ToLower(strings.TrimSpace(strings.Split(response.Header.Get("Content-Type"), ";")[0])); mediaType != "application/json" {
 		return remoteError(ctx)
 	}
@@ -176,7 +173,17 @@ func (t *HTTPTransport) post(ctx context.Context, path string, input, output any
 		return remoteError(ctx)
 	}
 	raw, err := io.ReadAll(io.LimitReader(response.Body, EnrollmentResponseLimit+1))
-	if err != nil || len(raw) == 0 || len(raw) > EnrollmentResponseLimit || decodeExactJSON(raw, output) != nil {
+	if err != nil || len(raw) == 0 || len(raw) > EnrollmentResponseLimit {
+		return remoteError(ctx)
+	}
+	if response.StatusCode == http.StatusConflict {
+		var pending errorEnvelope
+		if decodeExactJSON(raw, &pending) == nil && !pending.OK && pending.Error.Code == "OWNER_CONFIRMATION_PENDING" && pending.Error.Message == "Owner confirmation pending." {
+			return ErrPending
+		}
+		return remoteError(ctx)
+	}
+	if response.StatusCode != http.StatusOK || decodeExactJSON(raw, output) != nil {
 		return remoteError(ctx)
 	}
 	if err := ctx.Err(); err != nil {
@@ -387,6 +394,14 @@ type completeRequest struct {
 type completeEnvelope struct {
 	OK    bool          `json:"ok"`
 	Value completeValue `json:"value"`
+}
+
+type errorEnvelope struct {
+	OK    bool `json:"ok"`
+	Error struct {
+		Code    string `json:"code"`
+		Message string `json:"message"`
+	} `json:"error"`
 }
 
 type completeValue struct {

@@ -1,24 +1,29 @@
 // LAN Model Manager host agent.
 //
-// This binary runs the bounded, persistent, network-free host-service lifecycle.
-// It observes local host resources and local provider state on a cancellable
-// loop, and writes only safe/redacted summaries. It performs no discovery,
-// opens no listener, connects to no controller, and executes no arbitrary
-// commands. Signal handling (SIGINT/SIGTERM) is intentionally kept in main; the
-// service itself only honours cancellation.
+// This binary runs the bounded, persistent host-service lifecycle. It observes
+// local host resources and local provider state on a cancellable loop, and
+// writes only safe/redacted summaries. By default it is network-free; an
+// explicit all-or-none enrollment configuration enables one bounded outbound
+// HTTPS flow. It performs no discovery, opens no listener, and executes no
+// arbitrary commands. Signal handling (SIGINT/SIGTERM) is intentionally kept in
+// main; the service itself only honours cancellation.
 package main
 
 import (
 	"context"
+	"fmt"
+	"io"
 	"log/slog"
 	"os"
 	"os/signal"
 	"path/filepath"
 	"regexp"
+	"strconv"
 	"strings"
 	"syscall"
 	"time"
 
+	"github.com/JesusITWarrior/AI-LAN-Model-Manager/agents/host-agent/internal/enrollment"
 	"github.com/JesusITWarrior/AI-LAN-Model-Manager/agents/host-agent/internal/observation"
 	"github.com/JesusITWarrior/AI-LAN-Model-Manager/agents/host-agent/internal/service"
 )
@@ -30,7 +35,7 @@ const (
 )
 
 // version is reported only in safe startup/shutdown summaries.
-var version = "18.6a"
+var version = "18.8c"
 
 func main() {
 	cfg, err := loadConfig()
@@ -78,10 +83,18 @@ func main() {
 }
 
 // loadConfig builds a service.Config from environment with a strict allowlist.
-// It never opens a network surface. An explicit StateDir overrides the platform
-// canonical path; other keys default sensibly and are validated by the service.
+// It never opens a listener. An explicit StateDir overrides the platform
+// canonical path; enrollment remains disabled unless every trust and candidate
+// binding value is provided.
 func loadConfig() (service.Config, error) {
-	allowed := map[string]bool{"LANMM_STATE_DIR": true, "LANMM_CERT_DIR": true, "LANMM_CACHE_DIR": true, "LANMM_HOST_ID": true, "LANMM_POLL_INTERVAL": true}
+	allowed := map[string]bool{
+		"LANMM_STATE_DIR": true, "LANMM_CERT_DIR": true, "LANMM_CACHE_DIR": true,
+		"LANMM_HOST_ID": true, "LANMM_POLL_INTERVAL": true,
+		"LANMM_ENROLLMENT_CONTROLLER_URL": true, "LANMM_ENROLLMENT_CA_CERT_FILE": true,
+		"LANMM_ENROLLMENT_CA_CERT_PEM": true, "LANMM_ENROLLMENT_CA_FINGERPRINT_SHA256": true,
+		"LANMM_ENROLLMENT_CANDIDATE_ADDRESS": true, "LANMM_ENROLLMENT_CANDIDATE_PORT": true,
+		"LANMM_ENROLLMENT_PROTOCOL_MAJOR": true, "LANMM_ENROLLMENT_PROTOCOL_MINOR": true,
+	}
 	for _, item := range os.Environ() {
 		key := strings.SplitN(item, "=", 2)[0]
 		if strings.HasPrefix(key, "LANMM_") && !allowed[key] {
@@ -128,7 +141,114 @@ func loadConfig() (service.Config, error) {
 	if len(cfg.Registry.Observers) == 0 {
 		return service.Config{}, service.ErrInvalidConfig
 	}
+	if err := configureEnrollment(&cfg); err != nil {
+		return service.Config{}, service.ErrInvalidConfig
+	}
 	return cfg, nil
+}
+
+var enrollmentEnvironment = []string{
+	"LANMM_ENROLLMENT_CONTROLLER_URL", "LANMM_ENROLLMENT_CA_CERT_FILE",
+	"LANMM_ENROLLMENT_CA_CERT_PEM", "LANMM_ENROLLMENT_CA_FINGERPRINT_SHA256",
+	"LANMM_ENROLLMENT_CANDIDATE_ADDRESS", "LANMM_ENROLLMENT_CANDIDATE_PORT",
+	"LANMM_ENROLLMENT_PROTOCOL_MAJOR", "LANMM_ENROLLMENT_PROTOCOL_MINOR",
+}
+
+func configureEnrollment(cfg *service.Config) error {
+	values := make(map[string]string, len(enrollmentEnvironment))
+	configured := false
+	for _, key := range enrollmentEnvironment {
+		if value, ok := os.LookupEnv(key); ok {
+			configured = true
+			values[key] = value
+		}
+	}
+	if !configured {
+		return nil
+	}
+	for _, key := range []string{"LANMM_ENROLLMENT_CONTROLLER_URL", "LANMM_ENROLLMENT_CA_FINGERPRINT_SHA256", "LANMM_ENROLLMENT_CANDIDATE_ADDRESS", "LANMM_ENROLLMENT_CANDIDATE_PORT", "LANMM_ENROLLMENT_PROTOCOL_MAJOR", "LANMM_ENROLLMENT_PROTOCOL_MINOR"} {
+		if values[key] == "" {
+			return service.ErrInvalidConfig
+		}
+	}
+	file, fileSet := values["LANMM_ENROLLMENT_CA_CERT_FILE"]
+	pemValue, pemSet := values["LANMM_ENROLLMENT_CA_CERT_PEM"]
+	if fileSet == pemSet {
+		return service.ErrInvalidConfig
+	}
+	if fileSet {
+		var err error
+		pemValue, err = readPinnedCAFile(file)
+		if err != nil {
+			return service.ErrInvalidConfig
+		}
+	}
+	port, err := parseUint16(values["LANMM_ENROLLMENT_CANDIDATE_PORT"])
+	if err != nil || port == 0 {
+		return service.ErrInvalidConfig
+	}
+	major, err := parseUint16(values["LANMM_ENROLLMENT_PROTOCOL_MAJOR"])
+	if err != nil {
+		return service.ErrInvalidConfig
+	}
+	minor, err := parseUint16(values["LANMM_ENROLLMENT_PROTOCOL_MINOR"])
+	if err != nil {
+		return service.ErrInvalidConfig
+	}
+	certDir := cfg.CertDir
+	if certDir == "" {
+		certDir = filepath.Join(cfg.StateDir, "cert")
+	}
+	enrollmentConfig := enrollment.Config{
+		ControllerURL: values["LANMM_ENROLLMENT_CONTROLLER_URL"], PinnedCACertificatePEM: pemValue,
+		PinnedCAFingerprintSHA256: values["LANMM_ENROLLMENT_CA_FINGERPRINT_SHA256"], CandidateID: cfg.HostID,
+		Address: values["LANMM_ENROLLMENT_CANDIDATE_ADDRESS"], Port: port,
+		ProtocolMajor: major, ProtocolMinor: minor, CertDir: certDir,
+	}
+	transport, err := enrollment.NewHTTPTransport(enrollmentConfig)
+	if err != nil {
+		return service.ErrInvalidConfig
+	}
+	client, err := enrollment.New(enrollmentConfig, transport, nil)
+	if err != nil {
+		return service.ErrInvalidConfig
+	}
+	cfg.Enroller = enrollment.PollingEnroller{Client: client, Present: func(code string) {
+		slog.Info("host-service enrollment pending; confirm this code in the controller", "operatorCode", code)
+	}}
+	return nil
+}
+
+func parseUint16(value string) (uint16, error) {
+	if value == "" || strings.TrimSpace(value) != value || strings.HasPrefix(value, "+") {
+		return 0, fmt.Errorf("invalid unsigned integer")
+	}
+	parsed, err := strconv.ParseUint(value, 10, 16)
+	return uint16(parsed), err
+}
+
+func readPinnedCAFile(path string) (string, error) {
+	if path == "" || strings.TrimSpace(path) != path || !filepath.IsAbs(path) || filepath.Clean(path) != path || strings.Contains(path, "..") {
+		return "", service.ErrInvalidConfig
+	}
+	info, err := os.Lstat(path)
+	if err != nil || !info.Mode().IsRegular() || info.Mode()&os.ModeSymlink != 0 || info.Size() < 1 || info.Size() > 64<<10 {
+		return "", service.ErrInvalidConfig
+	}
+	file, err := os.Open(path)
+	if err != nil {
+		return "", service.ErrInvalidConfig
+	}
+	defer file.Close()
+	opened, err := file.Stat()
+	if err != nil || !os.SameFile(info, opened) || !opened.Mode().IsRegular() {
+		return "", service.ErrInvalidConfig
+	}
+	value, err := io.ReadAll(io.LimitReader(file, (64<<10)+1))
+	if err != nil || len(value) == 0 || len(value) > 64<<10 || int64(len(value)) != opened.Size() {
+		return "", service.ErrInvalidConfig
+	}
+	return string(value), nil
 }
 
 var invalidHostID = regexp.MustCompile(`[^A-Za-z0-9._:-]+`)

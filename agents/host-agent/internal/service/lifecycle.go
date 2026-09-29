@@ -15,7 +15,7 @@ import (
 )
 
 // Service owns the bounded, persistent host-service lifecycle. It opens no
-// listener; its only optional network action is one injected outbound enrollment.
+// listener; its only optional network action is one injected, bounded outbound enrollment flow.
 //
 // Its StateDir tree (canonical absolute, restrictive permissions where
 // supported, symlink escapes rejected) contains:

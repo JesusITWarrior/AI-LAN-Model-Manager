@@ -1,13 +1,13 @@
 // Package enrollment implements the agent's bounded outbound enrollment flow.
 //
-// This slice authenticates a controller challenge with the existing pairing
-// transcript and persists only controller-issued public material. It does not
-// generate or persist a private key; CSR/private-key integration belongs to the
-// certificate-issuance slice.
+// It authenticates a controller challenge with the existing pairing transcript,
+// persists the host private key only in the contained certificate directory,
+// and stores controller-issued public certificate material atomically.
 package enrollment
 
 import (
 	"context"
+	"crypto/ecdsa"
 	"crypto/sha256"
 	"encoding/hex"
 	"encoding/pem"
@@ -26,6 +26,7 @@ import (
 var (
 	ErrInvalidConfig = errors.New("invalid enrollment configuration")
 	ErrUnavailable   = errors.New("enrollment unavailable")
+	ErrPending       = errors.New("owner confirmation pending")
 	ErrFailed        = errors.New("enrollment failed")
 )
 
@@ -137,6 +138,9 @@ type Client struct {
 	consumed  bool
 	pending   *Challenge
 	session   *pairing.Session
+	proof     *pairing.Proof
+	csr       []byte
+	key       *ecdsa.PrivateKey
 }
 
 func New(cfg Config, transport Transport, store Store) (*Client, error) {
@@ -209,29 +213,64 @@ func (c *Client) Complete(ctx context.Context) (Outcome, error) {
 	if c.enrolled != nil {
 		return Outcome{Status: StatusEnrolled, Result: *c.enrolled}, nil
 	}
-	if c.pending == nil || c.session == nil || ctx.Err() != nil {
-		c.pending, c.session = nil, nil
+	if c.pending == nil || c.session == nil {
+		return Outcome{Status: StatusDegraded}, ErrUnavailable
+	}
+	if ctx.Err() != nil {
+		c.clearPending()
 		return Outcome{Status: StatusDegraded}, ErrUnavailable
 	}
 	challenge, session := *c.pending, c.session
-	c.pending, c.session = nil, nil
-	proof, err := session.BuildProof(c.now())
+	if !c.now().Before(challenge.Pairing.ExpiresAt) {
+		c.clearPending()
+		return Outcome{Status: StatusDegraded}, ErrUnavailable
+	}
+	if c.proof == nil {
+		proof, err := session.BuildProof(c.now())
+		if err != nil || ctx.Err() != nil {
+			c.clearPending()
+			return Outcome{Status: StatusDegraded}, ErrFailed
+		}
+		csr, key, err := c.identity.CreateCSR(c.binding)
+		if err != nil || ctx.Err() != nil {
+			c.clearPending()
+			return Outcome{Status: StatusDegraded}, ErrFailed
+		}
+		c.proof, c.csr, c.key = &proof, csr, key
+	}
+	result, err := c.transport.Complete(ctx, challenge, *c.proof, c.csr)
+	if errors.Is(err, ErrPending) && ctx.Err() == nil {
+		return Outcome{Status: StatusPending}, ErrUnavailable
+	}
 	if err != nil || ctx.Err() != nil {
+		c.clearPending()
 		return Outcome{Status: StatusDegraded}, ErrFailed
 	}
-	csr, key, err := c.identity.CreateCSR(c.binding)
-	if err != nil || ctx.Err() != nil {
-		return Outcome{Status: StatusDegraded}, ErrFailed
-	}
-	result, err := c.transport.Complete(ctx, challenge, proof, csr)
-	if err != nil || ctx.Err() != nil || !c.validResult(result, challenge.Pairing.ChallengeID) || VerifyIssued(result, key, result.CAPEM, c.cfg.PinnedCAFingerprintSHA256, c.now()) != nil {
+	if !c.validResult(result, challenge.Pairing.ChallengeID) || VerifyIssued(result, c.key, result.CAPEM, c.cfg.PinnedCAFingerprintSHA256, c.now()) != nil {
+		c.clearPending()
 		return Outcome{Status: StatusDegraded}, ErrFailed
 	}
 	if err := c.store.Save(ctx, result); err != nil {
+		c.clearPending()
 		return Outcome{Status: StatusDegraded}, ErrFailed
 	}
 	c.enrolled = &result
+	c.clearPending()
 	return Outcome{Status: StatusEnrolled, Result: result}, nil
+}
+
+func (c *Client) clearPending() {
+	c.pending, c.session, c.proof, c.key = nil, nil, nil, nil
+	for index := range c.csr {
+		c.csr[index] = 0
+	}
+	c.csr = nil
+}
+
+func (c *Client) discardPending() {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	c.clearPending()
 }
 
 // Enroll is the service integration's run-once convenience operation. Callers

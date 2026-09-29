@@ -12,6 +12,7 @@ import (
 	"fmt"
 	"io"
 	"net"
+	"net/url"
 	"os"
 	"path/filepath"
 	"strings"
@@ -119,9 +120,11 @@ func (s IdentityStore) CreateCSR(binding pairing.Binding) ([]byte, *ecdsa.Privat
 	if random == nil {
 		random = rand.Reader
 	}
+	spiffeURI := &url.URL{Scheme: "spiffe", Host: "lanmodelmanager", Path: "/host/" + binding.CandidateID}
 	der, err := x509.CreateCertificateRequest(random, &x509.CertificateRequest{
 		Subject:            pkix.Name{CommonName: binding.CandidateID},
 		IPAddresses:        []net.IP{net.ParseIP(binding.Address)},
+		URIs:               []*url.URL{spiffeURI},
 		SignatureAlgorithm: x509.ECDSAWithSHA256,
 	}, key)
 	if err != nil {
@@ -220,7 +223,9 @@ func validIdentityBinding(binding pairing.Binding) bool {
 
 func csrMatchesBinding(csr *x509.CertificateRequest, binding pairing.Binding) bool {
 	publicKey, ok := csr.PublicKey.(*ecdsa.PublicKey)
-	return ok && publicKey.Curve == elliptic.P256() && csr.Subject.CommonName == binding.CandidateID && len(csr.IPAddresses) == 1 && csr.IPAddresses[0].String() == binding.Address
+	return ok && publicKey.Curve == elliptic.P256() && csr.Subject.CommonName == binding.CandidateID &&
+		len(csr.IPAddresses) == 1 && csr.IPAddresses[0].String() == binding.Address && len(csr.URIs) == 1 &&
+		csr.URIs[0].String() == "spiffe://lanmodelmanager/host/"+binding.CandidateID
 }
 
 func loadIdentityKey(path string) (*ecdsa.PrivateKey, error) {

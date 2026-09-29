@@ -6,7 +6,7 @@
 //
 // It performs no discovery, opens no listener, and executes no arbitrary
 // commands. An explicitly configured Enroller may make one bounded outbound
-// controller enrollment attempt before observation. Platform-specific behavior
+// controller enrollment flow before observation. Platform-specific behavior
 // (canonical default paths and permission handling) is confined to build-tagged
 // files so the platform-neutral logic here stays identical everywhere.
 package service

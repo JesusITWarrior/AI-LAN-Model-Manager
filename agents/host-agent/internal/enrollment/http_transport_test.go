@@ -237,6 +237,35 @@ func TestHTTPTransportRejectsTrustHostRedirectAndStatus(t *testing.T) {
 	}
 }
 
+func TestHTTPTransportAcceptsOnlyExactPendingEnvelope(t *testing.T) {
+	for name, body := range map[string]string{
+		"exact":     `{"ok":false,"error":{"code":"OWNER_CONFIRMATION_PENDING","message":"Owner confirmation pending."}}`,
+		"wrongCode": `{"ok":false,"error":{"code":"ENROLLMENT_FAILED","message":"Owner confirmation pending."}}`,
+		"extra":     `{"ok":false,"error":{"code":"OWNER_CONFIRMATION_PENDING","message":"Owner confirmation pending.","detail":"secret"}}`,
+	} {
+		t.Run(name, func(t *testing.T) {
+			f := newTransportFixture(t)
+			server := startTransportServer(t, f, http.HandlerFunc(func(response http.ResponseWriter, _ *http.Request) {
+				response.Header().Set("Content-Type", "application/json")
+				response.WriteHeader(http.StatusConflict)
+				_, _ = io.WriteString(response, body)
+			}))
+			f.config.ControllerURL = server.URL
+			transport, err := NewHTTPTransport(f.config)
+			if err != nil {
+				t.Fatal(err)
+			}
+			err = transport.post(context.Background(), "/agent/v1/enrollment/complete", struct{}{}, &completeEnvelope{})
+			if name == "exact" && !errors.Is(err, ErrPending) {
+				t.Fatalf("exact pending error=%v", err)
+			}
+			if name != "exact" && !errors.Is(err, ErrFailed) {
+				t.Fatalf("malformed pending error=%v", err)
+			}
+		})
+	}
+}
+
 func TestHTTPTransportRejectsOversizedDuplicateUnknownAndMissingJSON(t *testing.T) {
 	for name, body := range map[string]string{
 		"oversized": strings.Repeat("x", EnrollmentResponseLimit+1),
