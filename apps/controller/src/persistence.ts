@@ -7,6 +7,10 @@ export {
   type DatabaseBackupManifest,
 } from "./database-backup.js";
 export {
+  ControllerApplicationError, createControllerApplication,
+  type ApplicationServer, type ControllerApplication, type ControllerApplicationErrorCode, type ControllerApplicationOptions, type SignalSource,
+} from "./controller-application.js";
+export {
   ControllerRuntimeError, createControllerRuntime,
   type ControllerCoreServices, type ControllerFs, type ControllerRuntimeErrorCode, type ControllerRuntimeHandle,
   type CoreServiceDependencies, type RuntimeBuildOptions, type RuntimeDependencies, type RuntimeHookContext, type RuntimeLifecycleHooks,
