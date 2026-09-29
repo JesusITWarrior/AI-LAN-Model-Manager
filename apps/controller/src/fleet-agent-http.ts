@@ -6,6 +6,7 @@ import type { FleetService } from "./fleet-service.js";
 import type { AgentCommandService } from "./agent-command-channel.js";
 
 export const FLEET_AGENT_BODY_LIMIT = 65_536;
+export const AGENT_COMMAND_RESULT_BODY_LIMIT = 786_432;
 export const FLEET_AGENT_RATE_LIMIT = 120;
 export const FLEET_AGENT_RATE_WINDOW_MS = 60_000;
 const MAX_RATE_KEYS = 2_048;
@@ -60,10 +61,11 @@ export function createFleetAgentHttpHandler(deps: FleetAgentHttpDependencies, op
     let rate = rates.get(rateKey); if (!rate || now >= rate.resetAt) { rate = { count: 0, resetAt: now + windowMs }; rates.set(rateKey, rate); }
     if (rate.count >= rateLimit) { request.resume(); fail(response, 429); return; } rate.count++;
     if (rates.size > MAX_RATE_KEYS) rates.delete(rates.keys().next().value!);
+    const requestBodyLimit=expectedType==="agent.command.result"?AGENT_COMMAND_RESULT_BODY_LIMIT:bodyLimit;
     const declared = request.headers["content-length"];
-    if (Array.isArray(declared) || declared !== undefined && (!/^\d+$/.test(declared) || Number(declared) > bodyLimit)) { request.resume(); fail(response, 413); return; }
+    if (Array.isArray(declared) || declared !== undefined && (!/^\d+$/.test(declared) || Number(declared) > requestBodyLimit)) { request.resume(); fail(response, 413); return; }
     const chunks: Buffer[] = []; let length = 0, done = false, overflow = false;
-    request.on("data", chunk => { if (done || overflow) return; if (!(typeof chunk === "string" || chunk instanceof Uint8Array)) { overflow = true; return; } const value = Buffer.from(chunk); length += value.byteLength; if (length > bodyLimit) { overflow = true; return; } chunks.push(value); });
+    request.on("data", chunk => { if (done || overflow) return; if (!(typeof chunk === "string" || chunk instanceof Uint8Array)) { overflow = true; return; } const value = Buffer.from(chunk); length += value.byteLength; if (length > requestBodyLimit) { overflow = true; return; } chunks.push(value); });
     request.on("error", () => { if (!done) { done = true; fail(response, 400); } });
     request.on("end", async () => {
       if (done) return; done = true; if (overflow) { fail(response, 413); return; }

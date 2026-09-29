@@ -162,7 +162,11 @@ func NewSequencer(start uint64) *Sequencer { return &Sequencer{next: start} }
 func (s *Sequencer) Next() uint64          { s.mu.Lock(); defer s.mu.Unlock(); s.next++; return s.next }
 func NewEnvelope(hostID, requestID, messageType, nonce, fingerprint, serial string, sequence uint64, now time.Time, payload any) (Envelope, error) {
 	body, err := json.Marshal(payload)
-	if err != nil || len(body) > 32768 {
+	limit := 32768
+	if messageType == "agent.command.result" {
+		limit = 512 * 1024
+	}
+	if err != nil || len(body) > limit {
 		return Envelope{}, ErrTransport
 	}
 	return Envelope{ProtocolVersion: ProtocolVersion{Major: 1}, MessageType: messageType, HostID: hostID, RequestID: requestID, Sequence: sequence, SentAt: now.UTC().Format("2006-01-02T15:04:05.000Z"), Nonce: nonce, CertFingerprint: fingerprint, CertSerial: serial, Payload: body}, nil

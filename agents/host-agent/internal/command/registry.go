@@ -10,13 +10,16 @@ import (
 	"bytes"
 	"context"
 	"crypto/rand"
+	"encoding/base64"
 	"encoding/hex"
 	"encoding/json"
 	"errors"
+	"io"
 	"strconv"
 	"strings"
 	"sync"
 	"time"
+	"unicode/utf8"
 
 	"github.com/JesusITWarrior/AI-LAN-Model-Manager/agents/host-agent/internal/provider"
 	"github.com/JesusITWarrior/AI-LAN-Model-Manager/agents/host-agent/internal/provider/lmstudio"
@@ -82,6 +85,9 @@ type runtimeObserver interface {
 type installedObserver interface {
 	ListInstalled(context.Context) ([]provider.InstalledModel, error)
 }
+type inferenceAdapter interface {
+	Chat(context.Context, ollama.ChatRequest) (ollama.ChatCompletion, error)
+}
 
 // Registry binds each fixed lifecycle operation to exactly one provider client.
 // No adapter may be added through any other path.
@@ -136,6 +142,9 @@ func (r *Registry) Execute(ctx context.Context, operation string, params json.Ra
 	if operation == "install" || operation == "remove-managed-artifact" {
 		return nil, ErrGuardedOperation
 	}
+	if operation == "inference.chat" {
+		return r.runInference(ctx, params)
+	}
 	params2, err := parseLifecycle(operation, params)
 	if err != nil {
 		return nil, err
@@ -167,6 +176,132 @@ func (r *Registry) Execute(ctx context.Context, operation string, params json.Ra
 	default:
 		return nil, ErrUnsupported
 	}
+}
+
+func (r *Registry) runInference(ctx context.Context, raw json.RawMessage) (any, error) {
+	params, err := parseInferenceChat(raw)
+	if err != nil {
+		return nil, err
+	}
+	r.mu.Lock()
+	adapter := r.clients[params.ProviderID]
+	r.mu.Unlock()
+	chat, ok := adapter.(inferenceAdapter)
+	if !ok {
+		return nil, NoProvider
+	}
+	inventory, ok := adapter.(installedObserver)
+	if !ok {
+		return nil, ErrOperationUnavailable
+	}
+	models, err := inventory.ListInstalled(ctx)
+	if err != nil {
+		return nil, err
+	}
+	matched := false
+	for _, model := range models {
+		if model.ProviderID == params.ProviderID && model.ModelID == params.ModelID && model.CanonicalName == params.Model {
+			matched = true
+			break
+		}
+	}
+	if !matched {
+		return nil, ErrRuntimeStateMismatch
+	}
+	running, ok := adapter.(runtimeObserver)
+	if !ok {
+		return nil, ErrOperationUnavailable
+	}
+	loaded, err := running.ListRunning(ctx)
+	if err != nil {
+		return nil, err
+	}
+	r.syncRunning(loaded)
+	handle, err := r.Acquire(ctx, params.ProviderID, params.Model)
+	if err != nil {
+		return nil, err
+	}
+	defer func() { _ = r.Complete(context.Background(), handle) }()
+	messages := make([]ollama.ChatMessage, len(params.Messages))
+	for i, message := range params.Messages {
+		messages[i] = ollama.ChatMessage{Role: message.Role, Content: message.Content}
+	}
+	var temperature *float64
+	if params.TemperatureMilli != nil {
+		value := float64(*params.TemperatureMilli) / 1000
+		temperature = &value
+	}
+	var maxTokens *uint64
+	if params.MaxTokens != nil {
+		value := uint64(*params.MaxTokens)
+		maxTokens = &value
+	}
+	return chat.Chat(ctx, ollama.ChatRequest{RequestID: params.RequestID, Model: params.Model, Messages: messages, Temperature: temperature, MaxTokens: maxTokens, MaxRequestBytes: uint64(params.MaxRequestBytes), MaxResponseBytes: uint64(params.MaxResponseBytes)})
+}
+
+type inferenceChatMessage struct {
+	Role    string
+	Content string
+}
+type inferenceChatParams struct {
+	ProviderID       string
+	ModelID          string
+	Model            string
+	RequestID        string
+	MaxRequestBytes  int64
+	MaxResponseBytes int64
+	Messages         []inferenceChatMessage
+	TemperatureMilli *int64
+	MaxTokens        *int64
+}
+
+func parseInferenceChat(raw json.RawMessage) (inferenceChatParams, error) {
+	var input struct {
+		ProviderID       string `json:"providerId"`
+		ModelID          string `json:"modelId"`
+		Model            string `json:"model"`
+		RequestID        string `json:"requestId"`
+		MaxRequestBytes  int64  `json:"maxRequestBytes"`
+		MaxResponseBytes int64  `json:"maxResponseBytes"`
+		Messages         []struct {
+			Role          string `json:"role"`
+			ContentBase64 string `json:"contentBase64"`
+		} `json:"messages"`
+		TemperatureMilli *int64 `json:"temperatureMilli"`
+		MaxTokens        *int64 `json:"maxTokens"`
+	}
+	decoder := json.NewDecoder(bytes.NewReader(raw))
+	decoder.DisallowUnknownFields()
+	if decoder.Decode(&input) != nil || decoder.Decode(&struct{}{}) != io.EOF || !provider.ValidateProviderID(input.ProviderID) || !identifier.MatchString(input.ModelID) || !identifier.MatchString(input.RequestID) || input.MaxRequestBytes < 1 || input.MaxRequestBytes > ollama.MaximumChatRequestSize || input.MaxResponseBytes < 1 || input.MaxResponseBytes > ollama.MaximumChatResponseSize || len(input.Messages) < 1 || len(input.Messages) > 64 {
+		return inferenceChatParams{}, provider.ErrInvalidCommand
+	}
+	model, ok := provider.CanonicalOllamaModelName(input.Model)
+	if !ok {
+		return inferenceChatParams{}, provider.ErrInvalidCommand
+	}
+	if input.TemperatureMilli != nil && (*input.TemperatureMilli < 0 || *input.TemperatureMilli > 2000) || input.MaxTokens != nil && (*input.MaxTokens < 1 || *input.MaxTokens > 131072) {
+		return inferenceChatParams{}, provider.ErrInvalidCommand
+	}
+	out := inferenceChatParams{ProviderID: input.ProviderID, ModelID: input.ModelID, Model: model, RequestID: input.RequestID, MaxRequestBytes: input.MaxRequestBytes, MaxResponseBytes: input.MaxResponseBytes, TemperatureMilli: input.TemperatureMilli, MaxTokens: input.MaxTokens, Messages: make([]inferenceChatMessage, len(input.Messages))}
+	total := 0
+	for i, message := range input.Messages {
+		if message.Role != "system" && message.Role != "user" && message.Role != "assistant" && message.Role != "tool" {
+			return inferenceChatParams{}, provider.ErrInvalidCommand
+		}
+		content, e := base64.StdEncoding.Strict().DecodeString(message.ContentBase64)
+		if e != nil || len(content) < 1 || len(content) > 65536 || !utf8.Valid(content) {
+			return inferenceChatParams{}, provider.ErrInvalidCommand
+		}
+		total += len(content)
+		if total > 262144 {
+			return inferenceChatParams{}, provider.ErrInvalidCommand
+		}
+		out.Messages[i] = inferenceChatMessage{Role: message.Role, Content: string(content)}
+	}
+	if int64(len(raw)) > input.MaxRequestBytes {
+		return inferenceChatParams{}, provider.ErrInvalidCommand
+	}
+	return out, nil
 }
 
 // observeInstalled records the installed-model inventory against which install/remove

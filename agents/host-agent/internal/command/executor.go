@@ -59,7 +59,8 @@ type entry struct {
 	Response Response `json:"response"`
 }
 
-const maxReplayEntries = 1024
+const maxReplayEntries = 256
+const maxReplayStoreBytes = 80 << 20
 
 type Executor struct {
 	mu      sync.Mutex
@@ -86,13 +87,13 @@ func NewPersistent(hostID string, adapter Adapter, now func() time.Time, path st
 	if errors.Is(err, os.ErrNotExist) {
 		return e, nil
 	}
-	if err != nil || len(raw) > 1<<20 || json.Unmarshal(raw, &e.seen) != nil || e.seen == nil || len(e.seen) > maxReplayEntries {
+	if err != nil || len(raw) > maxReplayStoreBytes || json.Unmarshal(raw, &e.seen) != nil || e.seen == nil || len(e.seen) > maxReplayEntries {
 		return nil, ErrCommand
 	}
 	return e, nil
 }
 
-var allowed = map[string]string{"probe": "observe", "inventory": "provider-status", "estimate": "model-status", "load": "model-load", "set-options": "model-set-options", "drain": "model-drain", "unload": "model-unload", "install": "artifact-install", "remove-managed-artifact": "artifact-remove"}
+var allowed = map[string]string{"probe": "observe", "inventory": "provider-status", "estimate": "model-status", "load": "model-load", "set-options": "model-set-options", "drain": "model-drain", "unload": "model-unload", "install": "artifact-install", "remove-managed-artifact": "artifact-remove", "inference.chat": "model-inference"}
 
 func normalizedJSON(raw json.RawMessage) (any, error) {
 	decoder := json.NewDecoder(bytes.NewReader(raw))
@@ -194,7 +195,11 @@ func (e *Executor) Execute(ctx context.Context, r Request) (Response, error) {
 	deadline, err := time.Parse(time.RFC3339Nano, r.Deadline)
 	expires, xerr := time.Parse(time.RFC3339Nano, r.Capability.ExpiresAt)
 	digest, derr := authorizationDigest(r)
-	if err != nil || xerr != nil || derr != nil || !e.now().Before(deadline) || !e.now().Before(expires) || r.Capability.Operation != policy || r.Capability.HostID != r.HostID || !identifier.MatchString(r.Capability.TargetKind) || !identifier.MatchString(r.Capability.TargetID) || !digestPattern.MatchString(r.Capability.RequestDigest) || r.Capability.RequestDigest != digest || !targetMatches(r) || len(r.Params) > 32768 {
+	maxParams := 32768
+	if r.Operation == "inference.chat" {
+		maxParams = 524288
+	}
+	if err != nil || xerr != nil || derr != nil || !e.now().Before(deadline) || !e.now().Before(expires) || r.Capability.Operation != policy || r.Capability.HostID != r.HostID || !identifier.MatchString(r.Capability.TargetKind) || !identifier.MatchString(r.Capability.TargetID) || !digestPattern.MatchString(r.Capability.RequestDigest) || r.Capability.RequestDigest != digest || !targetMatches(r) || len(r.Params) > maxParams {
 		return Response{}, ErrCommand
 	}
 	e.mu.Lock()
@@ -205,6 +210,28 @@ func (e *Executor) Execute(ctx context.Context, r Request) (Response, error) {
 		}
 		if prior.Response.Status != "running" {
 			return prior.Response, nil
+		}
+		if r.Operation == "inference.chat" {
+			code := "INDETERMINATE"
+			failed := Response{RequestID: r.RequestID, JobID: r.JobID, HostID: r.HostID, Sequence: r.Sequence, Status: "failed", ObservedAt: e.now().UTC().Format("2006-01-02T15:04:05.000Z"), ErrorCode: &code}
+			e.seen[r.IdempotencyKey] = entry{Digest: digest, Response: failed}
+			if e.persist() != nil {
+				e.seen[r.IdempotencyKey] = prior
+				return Response{}, ErrCommand
+			}
+			return failed, nil
+		}
+	}
+	if r.Operation == "inference.chat" && e.store != "" {
+		if len(e.seen) >= maxReplayEntries {
+			return Response{}, ErrCommand
+		}
+		progress := uint8(1)
+		running := Response{RequestID: r.RequestID, JobID: r.JobID, HostID: r.HostID, Sequence: r.Sequence, Status: "running", Progress: &progress, ObservedAt: e.now().UTC().Format("2006-01-02T15:04:05.000Z")}
+		e.seen[r.IdempotencyKey] = entry{Digest: digest, Response: running}
+		if e.persist() != nil {
+			delete(e.seen, r.IdempotencyKey)
+			return Response{}, ErrCommand
 		}
 	}
 	runCtx, cancel := context.WithTimeout(ctx, deadline.Sub(e.now()))
@@ -258,7 +285,7 @@ func (e *Executor) persist() error {
 		return ErrCommand
 	}
 	raw, err := json.Marshal(e.seen)
-	if err != nil {
+	if err != nil || len(raw) > maxReplayStoreBytes {
 		return ErrCommand
 	}
 	tmp, err := os.CreateTemp(filepath.Dir(e.store), ".command-replay-")

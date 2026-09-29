@@ -11,6 +11,7 @@ import (
 	"time"
 
 	"github.com/JesusITWarrior/AI-LAN-Model-Manager/agents/host-agent/internal/command"
+	"github.com/JesusITWarrior/AI-LAN-Model-Manager/agents/host-agent/internal/provider/ollama"
 )
 
 type crossCommandAdapter struct{}
@@ -69,12 +70,32 @@ func TestCrossLanguageFleetHelper(t *testing.T) {
 		if pollErr != nil || request == nil {
 			t.Fatalf("command poll = %#v, %v", request, pollErr)
 		}
-		executor := command.New("agent-1", crossCommandAdapter{}, time.Now)
+		var adapter command.Adapter = crossCommandAdapter{}
+		inference := false
+		if endpoint := os.Getenv("LANMM_CROSS_FLEET_INFERENCE_ENDPOINT"); endpoint != "" {
+			inference = true
+			ollamaClient, clientErr := ollama.New(ollama.Config{ProviderID: "ollama-1", Endpoint: endpoint, Timeout: 2 * time.Second})
+			if clientErr != nil {
+				t.Fatal(clientErr)
+			}
+			registry := command.NewRegistry(time.Now)
+			registry.RegisterOllama("ollama-1", ollamaClient)
+			adapter = registry
+		}
+		executor := command.New("agent-1", adapter, time.Now)
 		result, executeErr := executor.Execute(context.Background(), *request)
 		if executeErr != nil || restarted.SendCommandResult(context.Background(), result) != nil {
 			t.Fatalf("command result = %#v, %v", result, executeErr)
 		}
-		fmt.Println("LANMM_CROSS_COMMAND_RESULT=succeeded")
+		encoded, _ := json.Marshal(result.Observation)
+		fmt.Printf("LANMM_CROSS_COMMAND_RESULT=%s:bytes=%d\n", result.Status, len(encoded))
+		if inference {
+			replay, replayErr := executor.Execute(context.Background(), *request)
+			if replayErr != nil || restarted.SendCommandResult(context.Background(), replay) != nil {
+				t.Fatalf("inference replay = %#v, %v", replay, replayErr)
+			}
+			fmt.Println("LANMM_CROSS_COMMAND_REPLAY=succeeded")
+		}
 	}
 	value, _ := json.Marshal(map[string]uint64{"hello": hello.Sequence, "heartbeat": heartbeat, "resumed": resumed})
 	fmt.Printf("LANMM_CROSS_FLEET_RESULT=%s\n", value)

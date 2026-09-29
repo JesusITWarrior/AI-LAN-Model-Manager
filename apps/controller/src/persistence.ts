@@ -7,6 +7,7 @@ export {
   type DatabaseBackupManifest,
 } from "./database-backup.js";
 export { createRuntimeInferenceHandler, type InferenceRuntimeOptions } from "./inference-runtime.js";
+export { createAgentChatTransport, type AgentChatTargetBinding, type AgentChatTransportOptions } from "./inference-agent-transport.js";
 export { createReadManagementDependencies, type ReadManagementApiDependencies } from "./management-runtime.js";
 export { routeAuthRequest, type AuthApiDependencies, type AuthHttpRequest, type AuthHttpResponse } from "./owner-auth.js";
 export { createAuthHttpHandler } from "./owner-http.js";

@@ -6,7 +6,7 @@ import type { JobStores } from "./jobs-store.js";
 export interface CommandWire { send(request: CommandRequest): unknown; cancel?(jobId:string):boolean }
 export type DispatchResult = { readonly ok: true; readonly state: string; readonly observation: unknown } | { readonly ok: false; readonly error: string };
 export type SuccessVerifier = (response: CommandResponse) => boolean;
-const action = (operation: string) => operation === "probe" || operation === "inventory" || operation === "estimate" ? "load" : operation;
+const action = (operation: string) => operation === "probe" || operation === "inventory" || operation === "estimate" || operation === "inference.chat" ? "load" : operation;
 const terminal = new Set(["succeeded", "failed", "timed-out", "cancelled"]);
 
 export class CommandDispatcher {
@@ -50,6 +50,7 @@ export class CommandDispatcher {
     try {
       const current = this.stores.jobs.get(request.jobId);
       if (!current) return { ok: false, error: "ERR_DISPATCH_NOT_FOUND" };
+      if(terminal.has(current.payload.state))return{ok:true,state:current.payload.state,observation:null};
       const patch = { progressPercent: response.progress, terminalCode: response.errorCode, terminalMessage: response.errorCode };
       this.stores.withAuditTransaction(tx => {
         let currentState = current.payload.state;
@@ -66,7 +67,7 @@ export class CommandDispatcher {
     } catch { return { ok: false, error: "ERR_DISPATCH_DATABASE" }; }
   }
 
-  cancel(jobId: string): DispatchResult { try { const job = this.stores.jobs.get(jobId); if (!job) return { ok: false, error: "ERR_DISPATCH_NOT_FOUND" }; if (terminal.has(job.payload.state)) return { ok: true, state: job.payload.state, observation: null }; const now=new Date(Math.max(Date.parse(this.clock()),Date.parse(job.updatedAt)+1)).toISOString(); if (this.wire.cancel && !this.wire.cancel(jobId)) return { ok: false, error: "ERR_DISPATCH_DATABASE" }; this.stores.withAuditTransaction(tx=>{tx.jobs.transition(jobId, "cancelled", now, { progressPercent: null, terminalCode: "CANCELLED", terminalMessage: "cancelled" });tx.audit.append({actorKind:"controller",actorId:"controller",action:"command-cancel",outcome:"cancelled",requestId:job.payload.operation.requestId,jobId,hostId:job.hostId,details:null,occurredAt:now});}); return { ok: true, state: "cancelled", observation: null }; } catch { return { ok: false, error: "ERR_DISPATCH_DATABASE" }; } }
+  cancel(jobId: string): DispatchResult { try { const job = this.stores.jobs.get(jobId); if (!job) return { ok: false, error: "ERR_DISPATCH_NOT_FOUND" }; if (terminal.has(job.payload.state)) return { ok: true, state: job.payload.state, observation: null }; const now=new Date(Math.max(Date.parse(this.clock()),Date.parse(job.updatedAt)+1)).toISOString(); if (this.wire.cancel && !this.wire.cancel(jobId)) return { ok: false, error: "ERR_DISPATCH_DATABASE" };const refreshed=this.stores.jobs.get(jobId);if(refreshed&&terminal.has(refreshed.payload.state))return{ok:true,state:refreshed.payload.state,observation:null}; this.stores.withAuditTransaction(tx=>{tx.jobs.transition(jobId, "cancelled", now, { progressPercent: null, terminalCode: "CANCELLED", terminalMessage: "cancelled" });tx.audit.append({actorKind:"controller",actorId:"controller",action:"command-cancel",outcome:"cancelled",requestId:job.payload.operation.requestId,jobId,hostId:job.hostId,details:null,occurredAt:now});}); return { ok: true, state: "cancelled", observation: null }; } catch { return { ok: false, error: "ERR_DISPATCH_DATABASE" }; } }
 
   private fail(request: CommandRequest, code: string, observedAt?: string): DispatchResult {
     const base = Math.max(Date.parse(observedAt ?? this.clock()), Date.parse(this.clock()) + 4);

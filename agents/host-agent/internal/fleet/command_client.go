@@ -20,6 +20,8 @@ import (
 
 const commandPollPath = "/agent/v1/commands/poll"
 const commandResultPath = "/agent/v1/commands/result"
+const maxCommandPollBody = 768 << 10
+const maxCommandEnvelopeBody = 768 << 10
 
 type commandPollPayload struct {
 	WaitMS int64 `json:"waitMs"`
@@ -104,7 +106,7 @@ func (c *HTTPSClient) agentEnvelope(message string, sequence uint64, payload any
 }
 func (c *HTTPSClient) doEnvelope(ctx context.Context, path string, env agenttransport.Envelope) (*http.Response, error) {
 	body, err := json.Marshal(env)
-	if err != nil || len(body) > 64<<10 {
+	if err != nil || len(body) > maxCommandEnvelopeBody {
 		return nil, ErrHTTPClient
 	}
 	request, err := http.NewRequestWithContext(ctx, http.MethodPost, c.base+path, bytes.NewReader(body))
@@ -121,8 +123,8 @@ func (c *HTTPSClient) doEnvelope(ctx context.Context, path string, env agenttran
 }
 func verifyControllerEnvelope(response *http.Response, request agenttransport.Envelope, hostID string, sequence uint64) (agenttransport.Envelope, error) {
 	defer response.Body.Close()
-	raw, err := io.ReadAll(io.LimitReader(response.Body, maxResponseBody+1))
-	if err != nil || len(raw) > maxResponseBody || response.StatusCode != http.StatusOK || response.TLS == nil || len(response.TLS.PeerCertificates) == 0 {
+	raw, err := io.ReadAll(io.LimitReader(response.Body, maxCommandPollBody+1))
+	if err != nil || len(raw) > maxCommandPollBody || response.StatusCode != http.StatusOK || response.TLS == nil || len(response.TLS.PeerCertificates) == 0 {
 		return agenttransport.Envelope{}, ErrHTTPClient
 	}
 	var env agenttransport.Envelope
