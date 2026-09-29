@@ -106,6 +106,7 @@ type Registry struct {
 	draining  map[string]struct{}            // modelKey -> admission stopped
 	active    map[string]map[string]struct{} // modelKey -> outstanding request handles
 	installer ArtifactInstaller
+	peerRelay *PeerRelay
 }
 
 // NewRegistry creates an empty registry using the supplied clock (or time.Now
@@ -142,6 +143,17 @@ func (r *Registry) ConfigureArtifactInstaller(installer ArtifactInstaller) {
 	r.installer = installer
 }
 
+// ConfigurePeerRelay explicitly enables peer directives. Nil restores the
+// closed-by-default state.
+func (r *Registry) ConfigurePeerRelay(relay *PeerRelay) {
+	if r == nil {
+		return
+	}
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	r.peerRelay = relay
+}
+
 func (r *Registry) RegisterLMStudio(providerID string, client *lmstudio.Client) {
 	if r == nil || client == nil || providerID == "" {
 		return
@@ -160,6 +172,15 @@ func (r *Registry) Execute(ctx context.Context, operation string, params json.Ra
 	}
 	if operation == "remove-managed-artifact" {
 		return nil, ErrGuardedOperation
+	}
+	if operation == PeerSourceOperation || operation == PeerDestinationOperation {
+		r.mu.Lock()
+		relay := r.peerRelay
+		r.mu.Unlock()
+		if relay == nil {
+			return nil, ErrGuardedOperation
+		}
+		return relay.Execute(ctx, operation, params)
 	}
 	if operation == "install" {
 		r.mu.Lock()

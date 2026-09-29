@@ -69,7 +69,9 @@ authorization and is visible in response metadata and audit history.
 A verified authorized peer is the preferred source for an exact artifact;
 approved original download is the fallback. Peers supply bytes but never trusted
 metadata or installation authority. Transfers are authenticated, resumable,
-rate-limited, staged, digest-verified, and atomically committed.
+rate-limited, staged, digest-verified, and atomically committed. Agents remain
+outbound-only: a controller rendezvous relays exact ticket-bound chunks from the
+source agent's existing authenticated command poll/result flow to the destination. SQLite persists the ticket-bound source request, bounded chunk, destination ACK window, final receipt, and transfer checkpoint so controller restart replays only the exact pending step. A transfer reaches `received` only after the destination explicitly commits the expected size and SHA-256 digest. No peer address, URL, cache path, arbitrary relay listener, or temporary agent listener is carried in a transfer ticket. Relay composition is optional and therefore closed by default.
 
 Only manager-owned temporary cache entries may be automatically evicted. Every
 candidate is revalidated immediately before deletion against active requests,

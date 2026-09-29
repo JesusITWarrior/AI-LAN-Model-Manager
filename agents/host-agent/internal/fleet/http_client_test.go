@@ -7,12 +7,23 @@ import (
 	"fmt"
 	"os"
 	"path/filepath"
+	"strings"
 	"testing"
 	"time"
 
 	"github.com/JesusITWarrior/AI-LAN-Model-Manager/agents/host-agent/internal/command"
 	"github.com/JesusITWarrior/AI-LAN-Model-Manager/agents/host-agent/internal/provider/ollama"
+	agenttransport "github.com/JesusITWarrior/AI-LAN-Model-Manager/agents/host-agent/internal/transport"
 )
+
+func TestMaximumPeerChunkFitsSignedCommandResultEnvelope(t *testing.T) {
+	chunk := strings.Repeat("A", 512000)
+	digest := strings.Repeat("a", 64)
+	result := command.PeerRelayResult{Version: 1, Action: "read", TransferID: "transfer-1", Role: "source", Status: "transferring", ChunkBase64: &chunk, ChunkDigest: &digest, ChainDigest: strings.Repeat("0", 64)}
+	if _, err := agenttransport.NewEnvelope("host-1", "request-1", "agent.command.result", "nonce", strings.Repeat("b", 64), "AB", 1, time.Now(), result); err != nil {
+		t.Fatalf("bounded peer result exceeds command envelope: %v", err)
+	}
+}
 
 type crossCommandAdapter struct{}
 

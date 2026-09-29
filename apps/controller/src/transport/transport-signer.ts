@@ -30,8 +30,12 @@ export interface TransportNativeVerifier {
   verify(message: string, signatureHex: string): boolean;
 }
 
-const DER_SIGNATURE_MIN = 70; // minimal ECDSA P-256 DER signatures are ~70 bytes
-const DER_SIGNATURE_MAX = 720; // generous upper bound for any single signature
+// A valid P-256 DER signature is usually 70-72 bytes, but either INTEGER may
+// legitimately lose leading zero octets (69 bytes and, very rarely, shorter).
+// Do not impose a probabilistic fixed-width floor; the crypto verifier enforces
+// the ASN.1 shape and curve bounds.
+const DER_SIGNATURE_MIN = 8;
+const DER_SIGNATURE_MAX = 72;
 
 function toHex(bytes: Uint8Array): string {
   return Buffer.from(bytes).toString("hex");

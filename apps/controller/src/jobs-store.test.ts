@@ -84,12 +84,12 @@ test("migration2 registers jobs/job_history/audit_events and migration ledger ha
       .prepare("SELECT name FROM sqlite_master WHERE type='table' AND name NOT LIKE 'sqlite_%'")
       .all() as Array<{ name: string }>;
     const set = names.map((r) => r.name).sort();
-    assert.deepEqual(set, ["agent_commands", "approvals", "artifact_download_tickets", "audit_events", "authorization_requests", "certificate_authorities", "decisions", "fleet_liveness", "host_certificates", "hosts", "inference_tokens", "job_history", "jobs", "models", "owners", "pairing_challenges", "policy_documents", "providers", "schema_migrations", "sessions", "transport_replay_state"]);
+    assert.deepEqual(set, ["agent_commands", "approvals", "artifact_download_tickets", "audit_events", "authorization_requests", "certificate_authorities", "decisions", "fleet_liveness", "host_certificates", "hosts", "inference_tokens", "job_history", "jobs", "models", "owners", "pairing_challenges", "peer_relay_chunks", "peer_transfers", "policy_documents", "providers", "schema_migrations", "sessions", "transport_replay_state"]);
     const cols = db.prepare(`PRAGMA table_info(audit_events)`).all() as Array<{ name: string }>;
     for (const col of ["seq", "event_json", "body_json", "outcome", "previous_hash", "hash", "created_at"]) {
       assert.ok(cols.some((c) => c.name === col), `audit_events has column ${col}`);
     }
-    assert.equal(CONTROLLER_MIGRATIONS.length, 13);
+    assert.equal(CONTROLLER_MIGRATIONS.length, 14);
     assert.equal(CONTROLLER_MIGRATIONS[1]!.name, "durable-jobs-v1");
   } finally {
     db.close();

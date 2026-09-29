@@ -29,47 +29,62 @@ type commandPollPayload struct {
 type commandPollResult struct {
 	Command         *command.Request `json:"command"`
 	CancelledJobIDs []string         `json:"cancelledJobIds"`
+	PeerTransfer    *json.RawMessage `json:"peerTransfer,omitempty"`
 }
 
 // PollCommand performs one bounded outbound poll and verifies that the response
 // is signed by the exact controller TLS leaf used by this mTLS connection.
 func (c *HTTPSClient) PollCommand(ctx context.Context, wait time.Duration) (*command.Request, []string, error) {
+	result, err := c.pollCommandWork(ctx, wait)
+	if err != nil {
+		return nil, nil, err
+	}
+	return result.Command, result.CancelledJobIDs, nil
+}
+
+func (c *HTTPSClient) pollCommandWork(ctx context.Context, wait time.Duration) (commandPollResult, error) {
 	if wait < 0 || wait > 30*time.Second {
-		return nil, nil, ErrHTTPClient
+		return commandPollResult{}, ErrHTTPClient
 	}
 	seq, err := c.next()
 	if err != nil {
-		return nil, nil, err
+		return commandPollResult{}, err
 	}
 	env, err := c.agentEnvelope("agent.command.poll", seq, commandPollPayload{WaitMS: wait.Milliseconds()})
 	if err != nil {
-		return nil, nil, err
+		return commandPollResult{}, err
 	}
 	pollCtx, cancel := context.WithTimeout(ctx, wait+5*time.Second)
 	defer cancel()
 	response, err := c.doEnvelope(pollCtx, commandPollPath, env)
 	if err != nil {
-		return nil, nil, err
+		return commandPollResult{}, err
 	}
 	controller, err := verifyControllerEnvelope(response, env, c.hostID, seq)
 	if err != nil {
-		return nil, nil, ErrHTTPClient
+		return commandPollResult{}, ErrHTTPClient
 	}
 	var result commandPollResult
 	decoder := json.NewDecoder(bytes.NewReader(controller.Payload))
 	decoder.DisallowUnknownFields()
-	if decoder.Decode(&result) != nil || decoder.Decode(&struct{}{}) != io.EOF || len(result.CancelledJobIDs) > 64 {
-		return nil, nil, ErrHTTPClient
+	if decoder.Decode(&result) != nil || decoder.Decode(&struct{}{}) != io.EOF || len(result.CancelledJobIDs) > 64 || result.Command != nil && result.PeerTransfer != nil {
+		return commandPollResult{}, ErrHTTPClient
 	}
 	if result.Command != nil && (result.Command.HostID != c.hostID || result.Command.Sequence == 0) {
-		return nil, nil, ErrHTTPClient
+		return commandPollResult{}, ErrHTTPClient
+	}
+	if result.PeerTransfer != nil && (len(*result.PeerTransfer) == 0 || len(*result.PeerTransfer) > maxCommandEnvelopeBody) {
+		return commandPollResult{}, ErrHTTPClient
 	}
 	if c.reserveControllerSequence(controller.Sequence) != nil {
-		return nil, nil, ErrHTTPClient
+		return commandPollResult{}, ErrHTTPClient
 	}
-	return result.Command, result.CancelledJobIDs, nil
+	return result, nil
 }
 func (c *HTTPSClient) SendCommandResult(ctx context.Context, result command.Response) error {
+	return c.sendCommandPayload(ctx, result)
+}
+func (c *HTTPSClient) sendCommandPayload(ctx context.Context, result any) error {
 	seq, err := c.next()
 	if err != nil {
 		return err
@@ -218,9 +233,13 @@ func uintString(v uint64) string {
 
 // RunCommands is an explicitly injected command plane; constructing the fleet
 // client alone never starts it. Execution is restricted to the command.Executor.
-func (c *HTTPSClient) RunCommands(ctx context.Context, executor *command.Executor) error {
-	if executor == nil {
+func (c *HTTPSClient) RunCommands(ctx context.Context, executor *command.Executor, peerRelays ...*command.PeerRelay) error {
+	if executor == nil || len(peerRelays) > 1 {
 		return ErrHTTPClient
+	}
+	var peerRelay *command.PeerRelay
+	if len(peerRelays) == 1 {
+		peerRelay = peerRelays[0]
 	}
 	type completion struct{ response command.Response }
 	var activeJob string
@@ -242,7 +261,7 @@ func (c *HTTPSClient) RunCommands(ctx context.Context, executor *command.Executo
 				return nil
 			}
 		}
-		request, cancelled, err := c.PollCommand(ctx, time.Second)
+		work, err := c.pollCommandWork(ctx, time.Second)
 		if err != nil {
 			if ctx.Err() != nil {
 				return nil
@@ -256,6 +275,13 @@ func (c *HTTPSClient) RunCommands(ctx context.Context, executor *command.Executo
 			}
 			continue
 		}
+		if work.PeerTransfer != nil && peerRelay != nil {
+			result, relayErr := peerRelay.ExecuteDirective(ctx, *work.PeerTransfer)
+			if relayErr == nil {
+				_ = c.sendCommandPayload(ctx, result)
+			}
+		}
+		request, cancelled := work.Command, work.CancelledJobIDs
 		for _, jobID := range cancelled {
 			if jobID == activeJob && cancelActive != nil {
 				cancelActive()

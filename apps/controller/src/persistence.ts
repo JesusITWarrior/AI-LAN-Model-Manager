@@ -70,6 +70,7 @@ export { createFleetAgentHttpHandler, FLEET_AGENT_BODY_LIMIT, FLEET_AGENT_RATE_L
 export { PolicyService, type ApprovalGrant, type OperationCapability, type PolicyServiceError, type PolicyServiceResult } from "./policy-service.js";
 export { CommandDispatcher, type CommandWire, type DispatchResult } from "./command-dispatch.js";
 export { AgentCommandStore, AgentCommandService, type AgentCommandPoll, type AgentCommandOutcome } from "./agent-command-channel.js";
+export { createPeerTransferComposition, issuePeerTransferTicket, PeerChunkRelay, PeerTransferCoordinator, SqlitePeerTransferCheckpointStore, type PeerTransferComposition, type PeerTransferCompositionOptions } from "./artifact-transfer.js";
 export { FleetQueryService, type FleetCounts, type FleetHealth, type FleetPage, type FleetQueryError, type FleetQueryOptions, type FleetQueryResult, type PublicHost, type PublicModel, type PublicProvider } from "./fleet-queries.js";
 export { ControllerTransport, type ControllerTransportOptions, type ManagedServer, type TransportAcceptResult } from "./transport/controller-transport.js";
 export { createMutualTlsServer, type MutualTlsServerFactoryOptions } from "./transport/https-server.js";

@@ -93,7 +93,7 @@ func NewPersistent(hostID string, adapter Adapter, now func() time.Time, path st
 	return e, nil
 }
 
-var allowed = map[string]string{"probe": "observe", "inventory": "provider-status", "estimate": "model-status", "load": "model-load", "set-options": "model-set-options", "drain": "model-drain", "unload": "model-unload", "install": "artifact-install", "remove-managed-artifact": "artifact-remove", "inference.chat": "model-inference"}
+var allowed = map[string]string{"probe": "observe", "inventory": "provider-status", "estimate": "model-status", "load": "model-load", "set-options": "model-set-options", "drain": "model-drain", "unload": "model-unload", "install": "artifact-install", "remove-managed-artifact": "artifact-remove", "inference.chat": "model-inference", PeerSourceOperation: "peer-transfer-source", PeerDestinationOperation: "peer-transfer-destination"}
 
 func normalizedJSON(raw json.RawMessage) (any, error) {
 	decoder := json.NewDecoder(bytes.NewReader(raw))
@@ -198,6 +198,9 @@ func (e *Executor) Execute(ctx context.Context, r Request) (Response, error) {
 	maxParams := 32768
 	if r.Operation == "inference.chat" {
 		maxParams = 524288
+	}
+	if r.Operation == PeerSourceOperation || r.Operation == PeerDestinationOperation {
+		maxParams = 768 << 10
 	}
 	if err != nil || xerr != nil || derr != nil || !e.now().Before(deadline) || !e.now().Before(expires) || r.Capability.Operation != policy || r.Capability.HostID != r.HostID || !identifier.MatchString(r.Capability.TargetKind) || !identifier.MatchString(r.Capability.TargetID) || !digestPattern.MatchString(r.Capability.RequestDigest) || r.Capability.RequestDigest != digest || !targetMatches(r) || len(r.Params) > maxParams {
 		return Response{}, ErrCommand

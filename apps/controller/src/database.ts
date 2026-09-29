@@ -381,6 +381,35 @@ CREATE TABLE artifact_download_tickets (
 CREATE INDEX artifact_download_tickets_host_idx ON artifact_download_tickets(host_id,expires_at);
 `;
 
+const migration14Sql = `
+CREATE TABLE peer_transfers (
+  transfer_id TEXT PRIMARY KEY CHECK(length(transfer_id) BETWEEN 1 AND 128),
+  checkpoint_json TEXT NOT NULL CHECK(json_valid(checkpoint_json)),
+  status TEXT NOT NULL CHECK(status IN ('authorized','transferring','received','cancelled','failed')),
+  updated_at TEXT NOT NULL
+) STRICT;
+CREATE INDEX peer_transfers_status_idx ON peer_transfers(status,updated_at,transfer_id);
+CREATE TABLE peer_relay_chunks (
+  transfer_id TEXT PRIMARY KEY REFERENCES peer_transfers(transfer_id) ON DELETE CASCADE,
+  ticket_json TEXT NOT NULL CHECK(json_valid(ticket_json)),
+  ticket_digest TEXT NOT NULL CHECK(length(ticket_digest)=64),
+  source_host_id TEXT NOT NULL,
+  destination_host_id TEXT NOT NULL,
+  artifact_id TEXT NOT NULL,
+  offset INTEGER NOT NULL CHECK(offset>=0),
+  length INTEGER NOT NULL CHECK(length>=0 AND length<=384000),
+  phase TEXT NOT NULL CHECK(phase IN ('idle','source-pending','chunk-ready','destination-pending','commit-pending','committed','failed')),
+  chunk_base64 TEXT,
+  chunk_digest TEXT CHECK(chunk_digest IS NULL OR length(chunk_digest)=64),
+  destination_chain_digest TEXT CHECK(destination_chain_digest IS NULL OR length(destination_chain_digest)=64),
+  receipt_json TEXT CHECK(receipt_json IS NULL OR json_valid(receipt_json)),
+  expires_at TEXT NOT NULL,
+  updated_at TEXT NOT NULL
+) STRICT;
+CREATE INDEX peer_relay_source_idx ON peer_relay_chunks(source_host_id,phase,updated_at,transfer_id);
+CREATE INDEX peer_relay_destination_idx ON peer_relay_chunks(destination_host_id,phase,updated_at,transfer_id);
+`;
+
 export const CONTROLLER_MIGRATIONS: readonly Migration[] = Object.freeze([
   Object.freeze({ version: 1, name: "inventory-v1", sql: migration1Sql, checksum: migrationChecksum(migration1Sql) }),
   Object.freeze({ version: 2, name: "durable-jobs-v1", sql: migration2Sql, checksum: migrationChecksum(migration2Sql) }),
@@ -395,6 +424,7 @@ export const CONTROLLER_MIGRATIONS: readonly Migration[] = Object.freeze([
   Object.freeze({ version: 11, name: "private-plan-authorization-v1", sql: migration11Sql, checksum: migrationChecksum(migration11Sql) }),
   Object.freeze({ version: 12, name: "private-plan-agent-commands-v1", sql: migration12Sql, checksum: migrationChecksum(migration12Sql) }),
   Object.freeze({ version: 13, name: "verified-artifact-delivery-v1", sql: migration13Sql, checksum: migrationChecksum(migration13Sql) }),
+  Object.freeze({ version: 14, name: "peer-transfer-checkpoints-v1", sql: migration14Sql, checksum: migrationChecksum(migration14Sql) }),
 ]);
 
 function validateMigrations(migrations: readonly Migration[]): void {
