@@ -57,7 +57,7 @@ test("rejects traversal, malformed/double encoding, NUL, backslash and query abu
 test("does not SPA-fallback for reserved planes, directories, or missing/unknown assets", async t => {
   const root = rootFixture(); mkdirSync(join(root, "folder")); const server = createServer(createConsoleStaticHandler({ root })); const port = await listen(server);
   t.after(async () => { await close(server); rmSync(root, { recursive: true }); });
-  for (const path of ["/health/other", "/auth/x", "/api/v1/missing", "/v1/models", "/assets/", "/missing.js", "/secret.txt"]) assert.equal((await get(port, path)).status, 404, path);
+  for (const path of ["/health/other", "/auth/x", "/api/v1/missing", "/agent/v1/enrollment/begin", "/v1/models", "/assets/", "/missing.js", "/secret.txt"]) assert.equal((await get(port, path)).status, 404, path);
 });
 
 test("rejects symlink escapes, oversized files and non-GET methods", async t => {

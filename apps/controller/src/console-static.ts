@@ -21,7 +21,7 @@ const SECURITY = {
   "x-content-type-options": "nosniff",
   "referrer-policy": "no-referrer",
 } as const;
-const RESERVED = /^(?:\/auth(?:\/|$)|\/api(?:\/|$)|\/v1(?:\/|$)|\/health(?:\/|$))/;
+const RESERVED = /^(?:\/auth(?:\/|$)|\/api(?:\/|$)|\/agent(?:\/|$)|\/v1(?:\/|$)|\/health(?:\/|$))/;
 const HASHED = /(?:^|\/)[^/]+-[A-Za-z0-9_-]{6,}\.[A-Za-z0-9]+$/;
 
 type ErrorCode = "INVALID_REQUEST" | "METHOD_NOT_ALLOWED" | "NOT_FOUND" | "PAYLOAD_TOO_LARGE" | "INTERNAL_ERROR";

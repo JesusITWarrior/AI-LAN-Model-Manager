@@ -11,6 +11,14 @@ export { createReadManagementDependencies, type ReadManagementApiDependencies } 
 export { routeAuthRequest, type AuthApiDependencies, type AuthHttpRequest, type AuthHttpResponse } from "./owner-auth.js";
 export { createAuthHttpHandler } from "./owner-http.js";
 export {
+  parseJsonWithoutDuplicateKeys, routeEnrollmentRequest,
+  type EnrollmentApiDependencies, type EnrollmentApiRequest, type EnrollmentApiResponse,
+} from "./enrollment-api.js";
+export {
+  createEnrollmentHttpHandler, ENROLLMENT_BODY_LIMIT, ENROLLMENT_RATE_LIMIT, ENROLLMENT_RATE_WINDOW_MS,
+  type EnrollmentHttpOptions,
+} from "./enrollment-http.js";
+export {
   ControllerApplicationError, createControllerApplication,
   type ApplicationServer, type ControllerApplication, type ControllerApplicationErrorCode, type ControllerApplicationOptions, type SignalSource,
 } from "./controller-application.js";
