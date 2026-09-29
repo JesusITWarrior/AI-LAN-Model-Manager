@@ -13,13 +13,20 @@ export function handleRequest(request: IncomingMessage, response: ServerResponse
 
 export type ControllerRequestHandler = (request: IncomingMessage, response: ServerResponse) => void;
 
-/** Create the HTTP server without listening. Injected handlers keep management and inference planes separate. */
-export function createControllerServer(management?: ControllerRequestHandler, inference?: ControllerRequestHandler, auth?: ControllerRequestHandler) {
+/** Create the HTTP server without listening; the static handler is always the final route. */
+export function createControllerServer(
+  management?: ControllerRequestHandler,
+  inference?: ControllerRequestHandler,
+  auth?: ControllerRequestHandler,
+  staticContent?: ControllerRequestHandler,
+) {
   return createServer((request, response) => {
     const path = request.url?.split("?", 1)[0] ?? "";
+    if (path === "/health") { handleRequest(request, response); return; }
     if (auth && (path === "/auth/v1" || path.startsWith("/auth/v1/"))) { auth(request, response); return; }
     if (management && (path === "/api/v1" || path.startsWith("/api/v1/"))) { management(request, response); return; }
     if (inference && (path === "/v1" || path.startsWith("/v1/"))) { inference(request, response); return; }
+    if (staticContent) { staticContent(request, response); return; }
     handleRequest(request, response);
   });
 }
