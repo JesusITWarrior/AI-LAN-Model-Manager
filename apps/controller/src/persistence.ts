@@ -8,8 +8,8 @@ export {
 } from "./database-backup.js";
 export {
   ControllerRuntimeError, createControllerRuntime,
-  type ControllerFs, type ControllerRuntimeErrorCode, type ControllerRuntimeHandle,
-  type RuntimeBuildOptions, type RuntimeDependencies, type RuntimeHookContext, type RuntimeLifecycleHooks,
+  type ControllerCoreServices, type ControllerFs, type ControllerRuntimeErrorCode, type ControllerRuntimeHandle,
+  type CoreServiceDependencies, type RuntimeBuildOptions, type RuntimeDependencies, type RuntimeHookContext, type RuntimeLifecycleHooks,
 } from "./controller-runtime.js";
 export {
   AuditRepository, JobRepository, JobStoreError, createJobStores,

@@ -1,6 +1,15 @@
 import * as fs from "node:fs";
+import { randomBytes } from "node:crypto";
 import { resolve, sep } from "node:path";
 import type { DatabaseSync } from "node:sqlite";
+import type { PasswordCryptoEngine } from "./credentials.js";
+import { createOwnerBootstrapService, type OwnerBootstrapService } from "./owner-service.js";
+import { SessionManager } from "./session-manager.js";
+import { createInferenceTokenManager, type InferenceTokenManager } from "./inference-manager.js";
+import { PairingManager } from "./pairing-manager.js";
+import { FleetQueryService } from "./fleet-queries.js";
+import { PolicyService } from "./policy-service.js";
+import { PersistentReplayStore } from "./transport/replay-store.js";
 
 import { openControllerDatabase } from "./database.js";
 import type { ControllerRepositories } from "./repositories.js";
@@ -37,6 +46,24 @@ import {
  * runtime internals it delegates to are intentionally left mutable so start/
  * stop/close and DB lifecycle keep working.
  */
+
+
+export interface ControllerCoreServices {
+  readonly owner: OwnerBootstrapService;
+  readonly sessions: SessionManager;
+  readonly inferenceTokens: InferenceTokenManager;
+  readonly pairing: PairingManager;
+  readonly fleet: FleetQueryService;
+  readonly policy: PolicyService;
+  readonly replay: PersistentReplayStore;
+}
+
+export interface CoreServiceDependencies {
+  readonly now?: () => string;
+  readonly random?: (size: number) => Uint8Array;
+  readonly ownerId?: () => string;
+  readonly passwordCrypto?: PasswordCryptoEngine;
+}
 
 /** Stable, redacted runtime error-code namespace. Message === code. */
 export type ControllerRuntimeErrorCode =
@@ -96,7 +123,7 @@ export type BuildJobStoresFn = (db: DatabaseSync, now: () => string) => JobStore
  * rollback / close-once / redaction can be proved without ambient mutation.
  * Every field is optional and defaults to the real implementation.
  */
-export interface RuntimeDependencies {
+export interface RuntimeDependencies extends CoreServiceDependencies {
   readonly fs?: ControllerFs;
   readonly openDatabase?: OpenDatabaseFn;
   readonly buildRepositories?: BuildRepositoriesFn;
@@ -128,6 +155,8 @@ export interface ControllerRuntimeHandle {
   readonly repositories: ControllerRepositories;
   /** The job/audit store composed against the runtime database. */
   readonly jobStores: JobStores;
+  /** Runtime-owned non-network authoritative services. */
+  readonly services: ControllerCoreServices;
   /** True while the runtime has been started and not stopped/closed. */
   readonly isActive: boolean;
   /** True once {@link ControllerRuntimeHandle.close} has run (exactly once). */
@@ -201,18 +230,25 @@ class RuntimeImpl {
   private readonly buildRepositories: BuildRepositoriesFn;
   private readonly buildJobStores: BuildJobStoresFn;
   private readonly now: () => string;
+  private readonly random: (size: number) => Uint8Array;
+  private readonly ownerId: () => string;
+  private readonly passwordCrypto: PasswordCryptoEngine | undefined;
 
   private state: RuntimeLifecycleState = "created";
   private db: DatabaseSync | null = null;
   private dbSettled = false;
   private repositoriesValue!: ControllerRepositories;
   private jobStoresValue!: JobStores;
+  private servicesValue!: ControllerCoreServices;
   private createdDirs: string[] = [];
   private databaseCreated = false;
 
   constructor(rawOptions: RuntimeBuildOptions) {
     this.fs = rawOptions.dependencies?.fs ?? (fs as unknown as ControllerFs);
-    this.now = () => new Date().toISOString();
+    this.now = rawOptions.dependencies?.now ?? (() => new Date().toISOString());
+    this.random = rawOptions.dependencies?.random ?? ((size) => randomBytes(size));
+    this.ownerId = rawOptions.dependencies?.ownerId ?? (() => Buffer.from(this.random(16)).toString("hex"));
+    this.passwordCrypto = rawOptions.dependencies?.passwordCrypto;
     const options = this.#validate(rawOptions);
     this.plan = options.plan;
     this.rootDir = options.plan.rootDir;
@@ -242,6 +278,11 @@ class RuntimeImpl {
   get jobStores(): JobStores {
     if (this.state === "closed") throw new ControllerRuntimeError("ERR_RUNTIME_CLOSED");
     return this.jobStoresValue;
+  }
+
+  get services(): ControllerCoreServices {
+    if (this.state === "closed") throw new ControllerRuntimeError("ERR_RUNTIME_CLOSED");
+    return this.servicesValue;
   }
 
   start(): void {
@@ -340,6 +381,17 @@ class RuntimeImpl {
       stage = "composition";
       this.repositoriesValue = this.buildRepositories(this.db, this.now);
       this.jobStoresValue = this.buildJobStores(this.db, this.now);
+      const owner = createOwnerBootstrapService(this.db, { now: this.now, ownerId: this.ownerId, ...(this.passwordCrypto ? { crypto: this.passwordCrypto } : {}) });
+      const authorize = (value: unknown) => owner.authenticate(value);
+      this.servicesValue = Object.freeze({
+        owner,
+        sessions: new SessionManager(this.db, owner, { clock: this.now, random: this.random }),
+        inferenceTokens: createInferenceTokenManager(this.db, authorize, { clock: this.now, random: this.random }),
+        pairing: new PairingManager(this.db, authorize, { clock: this.now, random: this.random }),
+        fleet: new FleetQueryService(this.db, this.repositoriesValue, { clock: this.now }),
+        policy: new PolicyService(this.db, { clock: this.now, random: this.random, stores: this.jobStoresValue }),
+        replay: new PersistentReplayStore(this.db),
+      });
     } catch {
       const code: ControllerRuntimeErrorCode =
         stage === "containment" ? "ERR_RUNTIME_PATH_CONTAINMENT"
@@ -416,6 +468,9 @@ export function createControllerRuntime(options: RuntimeBuildOptions): Controlle
     },
     get jobStores() {
       return impl.jobStores;
+    },
+    get services() {
+      return impl.services;
     },
     get isActive() {
       return impl.isActive;

@@ -1,11 +1,13 @@
 import assert from "node:assert/strict";
 import { mkdtempSync, mkdirSync, readdirSync, rmSync, statSync, symlinkSync, writeFileSync, existsSync } from "node:fs";
+import { createHash } from "node:crypto";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import test from "node:test";
 
 import { CONTROLLER_MIGRATIONS, migrateControllerDatabase, openControllerDatabase } from "./database.js";
 import type { DatabaseSync } from "node:sqlite";
+import type { PasswordCryptoEngine } from "./credentials.js";
 import {
   createControllerRuntime,
   ControllerRuntimeError,
@@ -66,6 +68,17 @@ const CONTAINED_SUBDIRS = Object.freeze(["artifacts", "cache", "staging", "quara
 function subdirs(root: string): string[] {
   const entries = readdirSync(root, { withFileTypes: true });
   return entries.filter((d) => d.isDirectory()).map((d) => d.name).sort();
+}
+
+function deterministicPasswordCrypto(): PasswordCryptoEngine {
+  return {
+    random: size => Buffer.alloc(size, 7),
+    async derive(password, salt, parameters) {
+      const seed = createHash("sha256").update(Buffer.from(password)).update(Buffer.from(salt)).digest();
+      return Buffer.alloc(parameters.keyLength, seed[0]);
+    },
+    equal: (left, right) => Buffer.from(left).equals(Buffer.from(right)),
+  };
 }
 
 // ---------------------------------------------------------------------------
@@ -155,6 +168,47 @@ test("runtime persists job state across a simulated restart (close + reopen)", (
     }
   } finally {
     runtime.close();
+    rmSync(dir, { recursive: true, force: true });
+  }
+});
+
+test("runtime owns one immutable non-network service graph with shared deterministic authority", async () => {
+  const dir = mkdtempSync(join(tmpdir(), "lanmm-services-"));
+  const plan = makePlan(dir);
+  const options = {
+    ...baseOptions(plan),
+    dependencies: {
+      now: () => t0,
+      random: (size: number) => Buffer.alloc(size, 9),
+      ownerId: () => "a".repeat(32),
+      passwordCrypto: deterministicPasswordCrypto(),
+    },
+  };
+  try {
+    const runtime = createControllerRuntime(options);
+    const services = runtime.services;
+    assert.equal(Object.isFrozen(services), true);
+    assert.equal(runtime.services, services);
+    assert.equal(typeof (services as unknown as { listen?: unknown }).listen, "undefined");
+    const owner = await services.owner.bootstrapOwner({ username: "admin", password: "owner-password-123" });
+    assert.equal(owner.ownerId, "a".repeat(32));
+    const session = await services.sessions.create({ username: "admin", password: "owner-password-123" });
+    assert.ok(session);
+    assert.equal(session.metadata.createdAt, t0);
+    const token = await services.inferenceTokens.issue({ username: "admin", password: "owner-password-123" }, { label: "alpha" });
+    assert.ok(token);
+    assert.equal(token.metadata.tokenId, "09".repeat(16));
+    runtime.close();
+    assert.throws(() => runtime.services, (error: unknown) => error instanceof ControllerRuntimeError && error.code === "ERR_RUNTIME_CLOSED");
+
+    const reopened = createControllerRuntime(options);
+    try {
+      assert.equal(reopened.services.owner.isInitialized(), true);
+      assert.equal(await reopened.services.owner.authenticate({ username: "admin", password: "owner-password-123" }), true);
+    } finally {
+      reopened.close();
+    }
+  } finally {
     rmSync(dir, { recursive: true, force: true });
   }
 });
