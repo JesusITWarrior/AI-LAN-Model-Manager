@@ -1,4 +1,4 @@
-.PHONY: check build test go-test vet fmt-check all
+.PHONY: check build test go-test vet fmt-check supply-chain all
 
 all: check
 
@@ -21,4 +21,7 @@ fmt-check:
 		exit 1; \
 	fi
 
-check: build test go-test vet fmt-check
+supply-chain:
+	npm run supply-chain
+
+check: build test go-test vet fmt-check supply-chain

@@ -37,7 +37,12 @@ jobs:
         run: |
           $dirty = gofmt -l agents/host-agent
           if ($dirty) { Write-Error "Go files require gofmt: $dirty"; exit 1 }
-      - run: npx tsx --test scripts/packaging/tests/agents.test.ts
+      - run: npx tsx --test scripts/packaging/tests/agents.test.ts scripts/packaging/tests/supply-chain.test.ts
+      - name: Offline lock, license, and secret checks
+        run: |
+          node scripts/packaging/lock-integrity.js .
+          node scripts/packaging/license-inventory.js .
+          node scripts/packaging/secret-scan.js .
 
   package-skeleton:
     runs-on: ubuntu-latest
@@ -53,6 +58,10 @@ jobs:
       - run: npm ci --ignore-scripts
       - name: Build unsigned cross-platform package skeleton
         run: node scripts/packaging/build.js artifacts/host-agent
+      - name: Generate deterministic SBOM and unsigned provenance
+        run: |
+          node scripts/packaging/sbom.js . artifacts/host-agent/cyclonedx.json
+          node scripts/packaging/provenance.js . artifacts/host-agent artifacts/host-agent/provenance
       - name: Prove signing gate fails closed without release material
         shell: bash
         run: |
