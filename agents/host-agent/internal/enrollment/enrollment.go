@@ -45,6 +45,7 @@ var (
 // Config is the complete, strict trust and candidate binding for one client.
 type Config struct {
 	ControllerURL             string
+	PinnedCACertificatePEM    string
 	PinnedCAFingerprintSHA256 string
 	CandidateID               string
 	Address                   string
@@ -56,6 +57,9 @@ type Config struct {
 
 func (c Config) binding() (pairing.Binding, error) {
 	if !validControllerURL(c.ControllerURL) || !hex64.MatchString(c.PinnedCAFingerprintSHA256) || !idPattern.MatchString(c.CandidateID) {
+		return pairing.Binding{}, ErrInvalidConfig
+	}
+	if _, err := pinnedCACertificate(c.PinnedCACertificatePEM, c.PinnedCAFingerprintSHA256); err != nil {
 		return pairing.Binding{}, ErrInvalidConfig
 	}
 	ip := net.ParseIP(c.Address)

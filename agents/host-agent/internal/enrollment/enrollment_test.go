@@ -81,7 +81,7 @@ func fixture(t *testing.T) (Config, Challenge, Result, *fakeTransport) {
 	}
 	caPEM := string(pem.EncodeToMemory(&pem.Block{Type: "CERTIFICATE", Bytes: caDER}))
 	pin := FingerprintSHA256(caDER)
-	cfg := Config{ControllerURL: "https://controller.example:7443", PinnedCAFingerprintSHA256: pin, CandidateID: "agent-1", Address: "192.168.1.20", Port: 7443, ProtocolMajor: 1, CertDir: t.TempDir()}
+	cfg := Config{ControllerURL: "https://controller.example:7443", PinnedCACertificatePEM: caPEM, PinnedCAFingerprintSHA256: pin, CandidateID: "agent-1", Address: "192.168.1.20", Port: 7443, ProtocolMajor: 1, CertDir: t.TempDir()}
 	binding, err := cfg.binding()
 	if err != nil {
 		t.Fatal(err)
