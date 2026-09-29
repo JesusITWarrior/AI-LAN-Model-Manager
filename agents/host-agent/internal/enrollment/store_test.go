@@ -10,7 +10,7 @@ import (
 )
 
 func TestFileStorePreservesCommittedStateOnFailedWrite(t *testing.T) {
-	cfg, _, result := fixture(t)
+	cfg, _, result, _ := fixture(t)
 	store := FileStore{CertDir: cfg.CertDir}
 	if err := store.Save(context.Background(), result); err != nil {
 		t.Fatal(err)

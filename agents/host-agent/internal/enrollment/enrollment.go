@@ -112,7 +112,7 @@ type Outcome struct {
 // Transport is the sole outbound network boundary.
 type Transport interface {
 	Begin(context.Context, pairing.Binding) (Challenge, error)
-	Complete(context.Context, Challenge, pairing.Proof) (Result, error)
+	Complete(context.Context, Challenge, pairing.Proof, []byte) (Result, error)
 }
 
 // Store persists public enrollment state atomically.
@@ -127,6 +127,7 @@ type Client struct {
 	binding   pairing.Binding
 	transport Transport
 	store     Store
+	identity  IdentityStore
 	now       func() time.Time
 	enrolled  *Result
 	consumed  bool
@@ -142,11 +143,12 @@ func New(cfg Config, transport Transport, store Store) (*Client, error) {
 	if store == nil {
 		store = FileStore{CertDir: cfg.CertDir}
 	}
-	c := &Client{cfg: cfg, binding: binding, transport: transport, store: store, now: time.Now}
+	c := &Client{cfg: cfg, binding: binding, transport: transport, store: store, identity: IdentityStore{CertDir: cfg.CertDir}, now: time.Now}
 	result, loadErr := store.Load(context.Background())
 	switch {
 	case loadErr == nil:
-		if !c.validResult(result, "") {
+		key, keyErr := c.identity.Load()
+		if keyErr != nil || !c.validResult(result, "") || VerifyIssued(result, key, result.CAPEM, cfg.PinnedCAFingerprintSHA256, c.now()) != nil {
 			return nil, ErrUnavailable
 		}
 		c.enrolled = &result
@@ -213,8 +215,12 @@ func (c *Client) Complete(ctx context.Context) (Outcome, error) {
 	if err != nil || ctx.Err() != nil {
 		return Outcome{Status: StatusDegraded}, ErrFailed
 	}
-	result, err := c.transport.Complete(ctx, challenge, proof)
-	if err != nil || ctx.Err() != nil || !c.validResult(result, challenge.Pairing.ChallengeID) {
+	csr, key, err := c.identity.CreateCSR(c.binding)
+	if err != nil || ctx.Err() != nil {
+		return Outcome{Status: StatusDegraded}, ErrFailed
+	}
+	result, err := c.transport.Complete(ctx, challenge, proof, csr)
+	if err != nil || ctx.Err() != nil || !c.validResult(result, challenge.Pairing.ChallengeID) || VerifyIssued(result, key, result.CAPEM, c.cfg.PinnedCAFingerprintSHA256, c.now()) != nil {
 		return Outcome{Status: StatusDegraded}, ErrFailed
 	}
 	if err := c.store.Save(ctx, result); err != nil {

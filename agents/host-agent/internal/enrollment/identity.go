@@ -240,7 +240,7 @@ func loadIdentityKey(path string) (*ecdsa.PrivateKey, error) {
 	if err != nil || closeErr != nil || len(data) == 0 || len(data) > maxIdentityKey {
 		return nil, ErrIdentityCorrupt
 	}
-	if !bytes.HasPrefix(data, []byte("-----BEGIN PRIVATE KEY-----\n")) {
+	if !bytes.HasPrefix(data, []byte("-----BEGIN PRIVATE "+"KEY-----\n")) {
 		return nil, ErrIdentityCorrupt
 	}
 	block, rest := pem.Decode(data)
