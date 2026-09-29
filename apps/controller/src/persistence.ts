@@ -6,6 +6,7 @@ export {
   ERR_DATABASE_BACKUP, DatabaseBackupError, createDatabaseBackup, restoreDatabaseBackup,
   type DatabaseBackupManifest,
 } from "./database-backup.js";
+export { createRuntimeInferenceHandler, type InferenceRuntimeOptions } from "./inference-runtime.js";
 export { createReadManagementDependencies, type ReadManagementApiDependencies } from "./management-runtime.js";
 export { routeAuthRequest, type AuthApiDependencies, type AuthHttpRequest, type AuthHttpResponse } from "./owner-auth.js";
 export { createAuthHttpHandler } from "./owner-http.js";
