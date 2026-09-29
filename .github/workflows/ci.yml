@@ -37,7 +37,7 @@ jobs:
         run: |
           $dirty = gofmt -l agents/host-agent
           if ($dirty) { Write-Error "Go files require gofmt: $dirty"; exit 1 }
-      - run: npx tsx --test scripts/packaging/tests/agents.test.ts scripts/packaging/tests/supply-chain.test.ts
+      - run: npx tsx --test scripts/packaging/tests/agents.test.ts scripts/packaging/tests/supply-chain.test.ts scripts/packaging/tests/audit.test.ts
       - name: Offline lock, license, and secret checks
         run: |
           node scripts/packaging/lock-integrity.js .
@@ -75,3 +75,18 @@ jobs:
           path: artifacts/host-agent/
           if-no-files-found: error
           retention-days: 1
+
+  release-audit:
+    needs: [matrix-check, package-skeleton]
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: '24'
+          cache: npm
+      - uses: actions/setup-go@v5
+        with:
+          go-version: '1.24'
+      - run: npm ci --ignore-scripts
+      - run: node scripts/packaging/audit.js . --run-gates

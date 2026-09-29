@@ -5,9 +5,11 @@ unloading, placing, and routing to AI models across authorized machines on a
 LAN. It is designed around safe hot-swapping, resource-aware placement, and a
 provider-neutral inventory spanning runtimes such as Ollama and LM Studio.
 
-> **Status:** Architecture and safety foundation are in place. The controller
-> runs on loopback only; authentication, agent pairing, and model lifecycle
-> features are under development.
+> **Status:** Pre-release implementation. The controller remains loopback-only.
+> Authentication, pairing, authenticated agent transport, inventory, lifecycle
+> policy, inference routing, artifact handling, recovery, and release-audit
+> foundations are implemented and tested; native-host qualification, release
+> signing, and publication are not complete.
 
 ## Architecture
 
@@ -21,20 +23,30 @@ provider-neutral inventory spanning runtimes such as Ollama and LM Studio.
 - **Artifact manager:** uses verified peer transfer first, then approved source
   download, with independent metadata and checksum verification.
 
-See [Architecture](docs/architecture.md) and [Security](SECURITY.md).
+See [Architecture](docs/architecture.md), [Security policy](SECURITY.md), and the
+[Threat model](docs/threat-model.md).
 
 ## Development
 
-Requirements: Node.js 24+, npm 11+, and eventually Go 1.24+ for host-agent work.
+Requirements: Node.js 24+, npm 11+, and Go 1.24+.
 
 ```bash
-npm install
-npm run check
+npm ci --ignore-scripts
+make check
 npm run dev:controller
 ```
 
-The development controller binds to loopback by default. Do not expose it to a
-LAN until authenticated transport and owner setup are implemented.
+`make check` builds the TypeScript and web projects, runs TypeScript and Go
+checks, validates formatting, performs offline supply-chain checks, and runs the
+source release-readiness audit. To create local **unsigned** cross-platform
+package skeletons:
+
+```bash
+node scripts/packaging/build.js artifacts/host-agent
+```
+
+The development controller binds to loopback. Do not expose it publicly; the
+current configuration rejects public inference binding.
 
 ## Configuration hygiene
 

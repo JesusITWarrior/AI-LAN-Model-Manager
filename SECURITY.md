@@ -7,8 +7,9 @@ development surface only and must not be exposed to an untrusted network.
 
 ## Non-negotiable invariants
 
-1. Discovery does not grant trust. A host is unusable until the owner verifies
-   an expiring pairing code and endpoint identity fingerprint.
+1. Discovery does not grant trust. A host is unusable until the owner confirms
+   an expiring pairing code and the candidate's address, port, identity, and
+   protocol binding; certificate enrollment follows successful mutual proof.
 2. Controller-agent traffic is mutually authenticated after pairing and resists
    replay. Identities support rotation and revocation.
 3. Agents run unprivileged by default and expose typed capabilities, not a
@@ -36,11 +37,15 @@ development surface only and must not be exposed to an untrusted network.
 Never commit LAN addresses, machine names, hardware inventories, usernames,
 pairing material, private keys, certificates, tokens, real custom manifests,
 provider paths, logs, prompts, request content, or model artifacts. The
-repository `.gitignore` excludes standard local locations. CI will add secret
-and dependency scanning before release.
+repository `.gitignore` excludes standard local locations. Offline lock,
+license, tracked-file secret, SBOM, provenance, and release-readiness checks run
+in the local gate and the manual-only hosted workflow.
 
 ## Vulnerability reporting
 
 Do not open public issues containing exploit details or deployment information.
 Until a private reporting channel is published, contact the repository owner
 through GitHub without including secrets in the first message.
+
+See the [threat model](docs/threat-model.md) for implemented boundaries and
+explicit residual risks.

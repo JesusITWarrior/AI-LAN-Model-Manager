@@ -1,4 +1,4 @@
-.PHONY: check build test go-test vet fmt-check supply-chain all
+.PHONY: check build test go-test vet fmt-check supply-chain release-audit all
 
 all: check
 
@@ -24,4 +24,7 @@ fmt-check:
 supply-chain:
 	npm run supply-chain
 
-check: build test go-test vet fmt-check supply-chain
+release-audit:
+	node scripts/packaging/audit.js . --allow-dirty --run-gates
+
+check: build test go-test vet fmt-check supply-chain release-audit
