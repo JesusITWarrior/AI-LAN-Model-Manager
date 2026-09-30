@@ -8,6 +8,7 @@ import (
 	"crypto/x509"
 	"crypto/x509/pkix"
 	"encoding/pem"
+	"errors"
 	"math/big"
 	"os"
 	"path/filepath"
@@ -134,5 +135,66 @@ func TestPinnedCAFileRejectsRelativeSymlinkAndOversize(t *testing.T) {
 	}
 	if _, err := readPinnedCAFile(large); err == nil {
 		t.Fatal("oversized CA accepted")
+	}
+}
+
+func TestExplicitReEnrollmentArchivesIdentityAndConsumesMarker(t *testing.T) {
+	state := t.TempDir()
+	if err := os.Chmod(state, 0700); err != nil {
+		t.Fatal(err)
+	}
+	cert := filepath.Join(state, "cert")
+	if err := os.Mkdir(cert, 0700); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(cert, "host-key.pem"), []byte("old secret"), 0600); err != nil {
+		t.Fatal(err)
+	}
+	marker := filepath.Join(state, "reenroll.request")
+	if err := os.WriteFile(marker, []byte("owner-authorized-reenroll\n"), 0600); err != nil {
+		t.Fatal(err)
+	}
+	cfg := service.Config{StateDir: state, CertDir: cert}
+	if err := prepareExplicitReEnrollment(&cfg); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := os.Stat(marker); !errors.Is(err, os.ErrNotExist) {
+		t.Fatalf("marker remains: %v", err)
+	}
+	entries, err := os.ReadDir(state)
+	if err != nil {
+		t.Fatal(err)
+	}
+	retired := 0
+	for _, entry := range entries {
+		if strings.HasPrefix(entry.Name(), "cert.retired-") {
+			retired++
+			raw, readErr := os.ReadFile(filepath.Join(state, entry.Name(), "host-key.pem"))
+			if readErr != nil || string(raw) != "old secret" {
+				t.Fatalf("archive = %q, %v", raw, readErr)
+			}
+		}
+	}
+	if retired != 1 {
+		t.Fatalf("retired=%d", retired)
+	}
+	if info, err := os.Stat(cert); err != nil || !info.IsDir() {
+		t.Fatalf("new cert dir: %v", err)
+	}
+	if err := prepareExplicitReEnrollment(&cfg); err != nil {
+		t.Fatal(err)
+	}
+}
+func TestExplicitReEnrollmentRejectsSymlinkMarker(t *testing.T) {
+	state := t.TempDir()
+	target := filepath.Join(state, "target")
+	if err := os.WriteFile(target, []byte("owner-authorized-reenroll\n"), 0600); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.Symlink(target, filepath.Join(state, "reenroll.request")); err != nil {
+		t.Skip("symlink unavailable")
+	}
+	if prepareExplicitReEnrollment(&service.Config{StateDir: state}) == nil {
+		t.Fatal("symlink marker accepted")
 	}
 }

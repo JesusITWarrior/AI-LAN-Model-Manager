@@ -68,6 +68,10 @@ export interface ControllerConfig {
   readonly publicInferenceEnabled: boolean;
   readonly tlsRequired: boolean;
   readonly mutualTlsRequired: boolean;
+  readonly agentPlaneEnabled?: boolean;
+  readonly agentPlaneHost?: string;
+  readonly agentPlanePort?: number;
+  readonly agentPlaneAdvertisedAddress?: string;
 }
 
 export interface ControllerPathPlan {
@@ -95,11 +99,19 @@ export interface ControllerConfigParseOptions {
 type DataDescriptors = Record<PropertyKey, PropertyDescriptor>;
 type PathApi = typeof posix | typeof win32;
 
-const CONFIG_KEY_SET = new Set<string>(CONTROLLER_CONFIG_KEYS);
-const ENV_KEY_SET = new Set<string>(CONTROLLER_ENV_KEYS);
+const CONFIG_KEY_SET = new Set<string>([...CONTROLLER_CONFIG_KEYS,"agentPlaneEnabled","agentPlaneHost","agentPlanePort","agentPlaneAdvertisedAddress"]);
+const ENV_KEY_SET = new Set<string>([...CONTROLLER_ENV_KEYS,"LANMM_AGENT_PLANE_ENABLED","LANMM_AGENT_PLANE_HOST","LANMM_AGENT_PLANE_PORT","LANMM_AGENT_PLANE_ADVERTISED_ADDRESS"]);
 const LOG_LEVEL_SET = new Set<unknown>(CONTROLLER_LOG_LEVELS);
 const DEFAULT_PORT = 7340;
 const DEFAULT_INFERENCE_PORT = 7341;
+const DEFAULT_AGENT_PLANE_PORT = 7443;
+
+function isCanonicalIPv4(value:unknown,allowAny=false):value is string {
+  if(typeof value!=="string"||value.length>15)return false;
+  const parts=value.split(".");
+  return parts.length===4&&parts.every(part=>/^(0|[1-9][0-9]{0,2})$/.test(part)&&Number(part)<=255)&&(allowAny||value!=="0.0.0.0");
+}
+function isPrivateIPv4(value:unknown,allowAny=false):value is string {if(!isCanonicalIPv4(value,allowAny))return false;if(value==="0.0.0.0")return allowAny;const parts=value.split(".").map(Number),a=parts[0]!,b=parts[1]!;return a===10||(a===172&&b>=16&&b<=31)||(a===192&&b===168)}
 
 function fail<T>(error: ControllerConfigError): ControllerConfigResult<T> {
   return { ok: false, error };
@@ -247,6 +259,10 @@ export function parseControllerConfig(
     const publicInferenceField = ownValue(descriptors, "publicInferenceEnabled");
     const tlsField = ownValue(descriptors, "tlsRequired");
     const mutualTlsField = ownValue(descriptors, "mutualTlsRequired");
+    const agentPlaneEnabledField=ownValue(descriptors,"agentPlaneEnabled");
+    const agentPlaneHostField=ownValue(descriptors,"agentPlaneHost");
+    const agentPlanePortField=ownValue(descriptors,"agentPlanePort");
+    const agentPlaneAddressField=ownValue(descriptors,"agentPlaneAdvertisedAddress");
 
     const bindHost = bindHostField.present ? bindHostField.value : "127.0.0.1";
     const port = portField.present ? portField.value : DEFAULT_PORT;
@@ -260,12 +276,16 @@ export function parseControllerConfig(
     const publicInferenceEnabled = publicInferenceField.present ? publicInferenceField.value : false;
     const tlsRequired = tlsField.present ? tlsField.value : true;
     const mutualTlsRequired = mutualTlsField.present ? mutualTlsField.value : true;
+    const agentPlaneEnabled=agentPlaneEnabledField.present?agentPlaneEnabledField.value:false;
+    const agentPlaneHost=agentPlaneHostField.present?agentPlaneHostField.value:"0.0.0.0";
+    const agentPlanePort=agentPlanePortField.present?agentPlanePortField.value:DEFAULT_AGENT_PLANE_PORT;
+    const agentPlaneAdvertisedAddress=agentPlaneAddressField.present?agentPlaneAddressField.value:"";
 
     if (!isLoopbackHost(bindHost) || !isLoopbackHost(inferenceHost)) return fail("ERR_CONFIG_HOST");
-    if (!isPort(port) || !isPort(inferencePort)) return fail("ERR_CONFIG_PORT");
-    if (port === inferencePort) return fail("ERR_CONFIG_PORT_CONFLICT");
+    if (!isPort(port) || !isPort(inferencePort)||!isPort(agentPlanePort)) return fail("ERR_CONFIG_PORT");
+    if (port === inferencePort||agentPlaneEnabled&&(agentPlanePort===port||agentPlanePort===inferencePort)) return fail("ERR_CONFIG_PORT_CONFLICT");
     if (!isLogLevel(logLevel)) return fail("ERR_CONFIG_LOG_LEVEL");
-    if ([discoveryEnabled, publicInferenceEnabled, tlsRequired, mutualTlsRequired].some((value) => typeof value !== "boolean")) {
+    if ([discoveryEnabled, publicInferenceEnabled, tlsRequired, mutualTlsRequired,agentPlaneEnabled].some((value) => typeof value !== "boolean")) {
       return fail("ERR_CONFIG_BOOLEAN");
     }
     if (!validateAbsoluteDataDir(dataDir, flavor)) return fail("ERR_CONFIG_DATA_DIR");
@@ -273,6 +293,8 @@ export function parseControllerConfig(
     // TLS may be deliberately disabled only because both listeners are constrained
     // above to canonical loopback hosts. Public inference remains unavailable.
     if (publicInferenceEnabled) return fail("ERR_CONFIG_PUBLIC_INFERENCE");
+    if(!isPrivateIPv4(agentPlaneHost,true)||agentPlaneEnabled&&!isPrivateIPv4(agentPlaneAdvertisedAddress))return fail("ERR_CONFIG_HOST");
+    if(agentPlaneEnabled&&!discoveryEnabled)return fail("ERR_CONFIG_TLS");
 
     return {
       ok: true,
@@ -287,6 +309,7 @@ export function parseControllerConfig(
         publicInferenceEnabled,
         tlsRequired,
         mutualTlsRequired,
+        ...(agentPlaneEnabled||agentPlaneEnabledField.present||agentPlaneHostField.present||agentPlanePortField.present||agentPlaneAddressField.present?{agentPlaneEnabled,agentPlaneHost,agentPlanePort,agentPlaneAdvertisedAddress}:{}),
       }),
     };
   } catch {
@@ -337,12 +360,17 @@ export function parseControllerEnvironment(
       ["LANMM_PUBLIC_INFERENCE_ENABLED", "publicInferenceEnabled", "boolean"],
       ["LANMM_TLS_REQUIRED", "tlsRequired", "boolean"],
       ["LANMM_MUTUAL_TLS_REQUIRED", "mutualTlsRequired", "boolean"],
+      ["LANMM_AGENT_PLANE_ENABLED","agentPlaneEnabled","boolean"],
+      ["LANMM_AGENT_PLANE_HOST","agentPlaneHost","string"],
+      ["LANMM_AGENT_PLANE_PORT","agentPlanePort","port"],
+      ["LANMM_AGENT_PLANE_ADVERTISED_ADDRESS","agentPlaneAdvertisedAddress","string"],
     ] as const;
     for (const [envKey, configKey, kind] of mappings) {
       const field = ownValue(raw, envKey);
       if (!field.present) continue;
       if (typeof field.value !== "string") return fail("ERR_ENV_VALUE");
       if (kind === "string") {
+        if(field.value===""&&configKey.startsWith("agentPlane"))return fail("ERR_ENV_VALUE");
         config[configKey] = field.value;
       } else if (kind === "port") {
         const parsed = parseEnvPort(field.value);

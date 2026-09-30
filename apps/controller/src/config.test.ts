@@ -267,3 +267,5 @@ test("environment adapter rejects exotic records without invoking getters and ne
   assert.doesNotThrow(() => parseControllerEnvironment(revoked.proxy, nativeOptions));
   assert.equal(parseControllerEnvironment(revoked.proxy, nativeOptions).ok, false);
 });
+
+test("agent plane accepts only explicit canonical private-LAN bindings",()=>{const root=posix.resolve("/tmp/lanmm-private-plane");const base={dataDir:root,discoveryEnabled:true,agentPlaneEnabled:true,agentPlaneHost:"0.0.0.0",agentPlanePort:7443,agentPlaneAdvertisedAddress:"192.168.50.10"};const accepted=parseControllerConfig(base);assert.equal(accepted.ok,true);for(const value of ["8.8.8.8","192.168.001.10","169.254.1.1","0.0.0.0"]){const result=parseControllerConfig({...base,agentPlaneAdvertisedAddress:value});assert.equal(result.ok,false,value);}assert.equal(parseControllerConfig({...base,discoveryEnabled:false}).ok,false);});

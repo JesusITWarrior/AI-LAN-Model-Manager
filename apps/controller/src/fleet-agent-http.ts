@@ -1,5 +1,6 @@
 import { createHash, timingSafeEqual } from "node:crypto";
 import type { IncomingMessage, ServerResponse } from "node:http";
+import type { TransportSigner } from "@lan-model-manager/core";
 import type { TLSSocket } from "node:tls";
 import type { CertificateRepository } from "./certificate-repository.js";
 import type { FleetService } from "./fleet-service.js";
@@ -15,10 +16,11 @@ const PATHS = new Map([
   ["/agent/v1/fleet/heartbeat", "transport.heartbeat"],
   ["/agent/v1/commands/poll", "agent.command.poll"],
   ["/agent/v1/commands/result", "agent.command.result"],
+  ["/agent/v1/certificate/rotate", "certificate.rotate"],
 ]);
 
 type Rate = { count: number; resetAt: number };
-export interface FleetAgentHttpDependencies { readonly fleet: FleetService; readonly certificates: CertificateRepository; readonly commands?: AgentCommandService; readonly artifacts?: { handle(request:IncomingMessage,response:ServerResponse):Promise<boolean> } }
+export interface FleetAgentHttpDependencies { readonly fleet: FleetService; readonly certificates: CertificateRepository; readonly commands?: AgentCommandService; readonly artifacts?: { handle(request:IncomingMessage,response:ServerResponse):Promise<boolean> }; readonly rotation?: { rotate(serial:string,fingerprint:string,csrPem:string):{certificate:{certificatePem:string;fingerprint:string;serial:string;notBefore:string;notAfter:string};caCertificatePem:string}|null }; readonly commandSigner?: (request:IncomingMessage)=>TransportSigner|null }
 export interface FleetAgentHttpOptions { readonly clock?: () => number; readonly bodyLimit?: number; readonly rateLimit?: number; readonly rateWindowMs?: number }
 
 function send(response: ServerResponse, status: number, body: unknown): void {
@@ -71,6 +73,11 @@ export function createFleetAgentHttpHandler(deps: FleetAgentHttpDependencies, op
     request.on("end", async () => {
       if (done) return; done = true; if (overflow) { fail(response, 413); return; }
       let input: unknown; try { input = JSON.parse(Buffer.concat(chunks, length).toString("utf8")); } catch { fail(response, 400); return; }
+      if(expectedType==="certificate.rotate"){
+        const current=deps.certificates.getBySerial(certificate.serial,certificate.fingerprint),value=input as Record<string,unknown>;
+        if(!deps.rotation||!current||typeof value!=="object"||value===null||Array.isArray(value)||Reflect.ownKeys(value).length!==1||typeof value.csrPem!=="string"||value.csrPem.length<64||value.csrPem.length>16384){fail(response,current?400:401,current?"ERR_CERTIFICATE_INPUT":"ERR_HOST_REVOKED");return;}
+        try{const rotated=deps.rotation.rotate(certificate.serial,certificate.fingerprint,value.csrPem);if(!rotated){fail(response,409,"ERR_CERTIFICATE_ROTATION");return;}send(response,200,{ok:true,result:{certificatePem:rotated.certificate.certificatePem,caPem:rotated.caCertificatePem,fingerprint:rotated.certificate.fingerprint,serial:rotated.certificate.serial,notBefore:rotated.certificate.notBefore,notAfter:rotated.certificate.notAfter}});}catch{fail(response,400,"ERR_CERTIFICATE_ROTATION");}return;
+      }
       const envelope = exactEnvelope(input, expectedType);
       if (!envelope || !equal(envelope.certFingerprint, certificate.fingerprint) || BigInt(`0x${envelope.certSerial}`) !== BigInt(`0x${certificate.serial}`)) { fail(response, 401, "ERR_HOST_REVOKED"); return; }
       const record = deps.certificates.getBySerial(envelope.certSerial, envelope.certFingerprint);
@@ -80,7 +87,7 @@ export function createFleetAgentHttpHandler(deps: FleetAgentHttpDependencies, op
         const result = deps.commands.ingest(input, record.binding.address);
         if (!result.ok) { fail(response, result.error === "ERR_COMMAND_AUTH" || result.error === "ERR_COMMAND_BINDING" ? 401 : 400, result.error); return; }
         if (expectedType === "agent.command.poll") {
-          try { const waitMs=(input as {payload:{waitMs:number}}).payload.waitMs;const polled=await deps.commands.wait(record.binding.candidateId,result.result,waitMs);send(response, 200, deps.commands.signed(record.binding.candidateId, (input as {requestId:string}).requestId, (input as {sequence:number}).sequence, polled)); }
+          try { const waitMs=(input as {payload:{waitMs:number}}).payload.waitMs,signer=deps.commandSigner?.(request);if(deps.commandSigner&&!signer){fail(response,500,"ERR_COMMAND_SIGN");return;}const polled=await deps.commands.wait(record.binding.candidateId,result.result,waitMs);send(response, 200, deps.commands.signed(record.binding.candidateId, (input as {requestId:string}).requestId, (input as {sequence:number}).sequence, polled,signer??undefined)); }
           catch { fail(response, 500, "ERR_COMMAND_SIGN"); }
         } else send(response, 200, { ok: true });
         return;

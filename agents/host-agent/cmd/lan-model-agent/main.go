@@ -11,6 +11,7 @@ package main
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"io"
 	"log/slog"
@@ -20,11 +21,16 @@ import (
 	"runtime"
 	"strconv"
 	"strings"
+	"sync"
 	"time"
 
+	"github.com/JesusITWarrior/AI-LAN-Model-Manager/agents/host-agent/internal/command"
+	"github.com/JesusITWarrior/AI-LAN-Model-Manager/agents/host-agent/internal/discovery"
 	"github.com/JesusITWarrior/AI-LAN-Model-Manager/agents/host-agent/internal/enrollment"
 	"github.com/JesusITWarrior/AI-LAN-Model-Manager/agents/host-agent/internal/fleet"
 	"github.com/JesusITWarrior/AI-LAN-Model-Manager/agents/host-agent/internal/observation"
+	"github.com/JesusITWarrior/AI-LAN-Model-Manager/agents/host-agent/internal/provider"
+	"github.com/JesusITWarrior/AI-LAN-Model-Manager/agents/host-agent/internal/provider/ollama"
 	"github.com/JesusITWarrior/AI-LAN-Model-Manager/agents/host-agent/internal/service"
 	"github.com/JesusITWarrior/AI-LAN-Model-Manager/agents/host-agent/internal/snapshot"
 )
@@ -39,7 +45,10 @@ const (
 var version = "18.9b"
 
 type snapshotSource interface{ LatestSnapshot() (snapshot.State, bool) }
-type fleetCollector struct{ source snapshotSource }
+type fleetCollector struct {
+	source snapshotSource
+	ollama *ollama.Client
+}
 
 func (c fleetCollector) Collect(ctx context.Context) (fleet.Snapshot, error) {
 	if ctx.Err() != nil {
@@ -49,7 +58,15 @@ func (c fleetCollector) Collect(ctx context.Context) (fleet.Snapshot, error) {
 	if !ok {
 		return fleet.Snapshot{}, fleet.ErrFleet
 	}
-	return fleet.Snapshot{Platform: state.Record.Platform, Idle: true}, nil
+	result := fleet.Snapshot{Platform: state.Record.Platform, Idle: true}
+	if c.ollama != nil {
+		probe, probeErr := c.ollama.Probe(ctx)
+		models, modelsErr := c.ollama.ListInstalled(ctx)
+		if probeErr == nil && modelsErr == nil {
+			result.Providers, result.Models = fleet.MapInventory([]provider.ProviderProbe{probe}, models, time.Now().UTC().Format("2006-01-02T15:04:05.000Z"))
+		}
+	}
+	return result, nil
 }
 
 func main() {
@@ -95,6 +112,13 @@ func runHost(ctx context.Context) int {
 		return exitConfig
 	}
 
+	if advertisement, advertErr := discoveryAdvertisement(cfg.HostID); advertErr == nil {
+		if sender, sendErr := discovery.NewUDPMulticastSender(); sendErr == nil {
+			if advertiser, newErr := discovery.NewAdvertiser(sender, advertisement); newErr == nil {
+				go func() { _ = advertiser.Run(ctx) }()
+			}
+		}
+	}
 	if err := host.Start(ctx); err != nil {
 		slog.Error("host-service failed to start", "reason", safeErr(err))
 		return exitGeneral
@@ -106,9 +130,11 @@ func runHost(ctx context.Context) int {
 	if certDir == "" {
 		certDir = filepath.Join(cfg.StateDir, "cert")
 	}
-	if client, fleetErr := fleet.NewHTTPSClient(certDir); fleetErr == nil {
-		go func() { _ = client.Run(ctx, fleetCollector{source: host}, runtime.GOOS, "") }()
+	var ollamaClient *ollama.Client
+	if endpoint := os.Getenv("LANMM_OLLAMA_ENDPOINT"); endpoint != "" {
+		ollamaClient, _ = ollama.New(ollama.Config{ProviderID: "ollama-local", Endpoint: endpoint})
 	}
+	go maintainFleetSessions(ctx, certDir, cfg.StateDir, host, ollamaClient)
 	slog.Info("host-service started", "hostID", host.HostID(), "version", version)
 
 	// Wait for a termination signal, then shut down gracefully. The service
@@ -128,6 +154,63 @@ func runHost(ctx context.Context) int {
 	return 0
 }
 
+func maintainFleetSessions(ctx context.Context, certDir, stateDir string, host *service.Service, ollamaClient *ollama.Client) {
+	for ctx.Err() == nil {
+		// Rotation is attempted before every session generation. A durable pending
+		// CSR allows this call to recover when the prior process was interrupted
+		// after the controller atomically replaced/revoked the old certificate.
+		if _, rotateErr := fleet.RotateIdentityIfNeeded(ctx, certDir, 7*24*time.Hour); rotateErr != nil {
+			// Do not run a possibly revoked predecessor after a lost rotation
+			// response. Retry the durable pending CSR promptly and cancellation-aware.
+			select {
+			case <-ctx.Done():
+				return
+			case <-time.After(time.Minute):
+				continue
+			}
+		}
+		client, err := fleet.NewHTTPSClient(certDir)
+		if err != nil {
+			select {
+			case <-ctx.Done():
+				return
+			case <-time.After(time.Minute):
+				continue
+			}
+		}
+		sessionCtx, cancel := context.WithCancel(ctx)
+		var workers sync.WaitGroup
+		workers.Add(1)
+		go func() {
+			defer workers.Done()
+			_ = client.Run(sessionCtx, fleetCollector{source: host, ollama: ollamaClient}, runtime.GOOS, "")
+		}()
+		if ollamaClient != nil {
+			registry := command.NewRegistry(time.Now)
+			registry.RegisterOllama("ollama-local", ollamaClient)
+			if executor, e := command.NewPersistent(host.HostID(), registry, time.Now, filepath.Join(stateDir, "command-replay.json")); e == nil {
+				workers.Add(1)
+				go func() { defer workers.Done(); _ = client.RunCommands(sessionCtx, executor) }()
+			}
+		}
+		timer := time.NewTimer(12 * time.Hour)
+		select {
+		case <-ctx.Done():
+			if !timer.Stop() {
+				<-timer.C
+			}
+			cancel()
+			client.CloseIdleConnections()
+			workers.Wait()
+			return
+		case <-timer.C:
+			cancel()
+			client.CloseIdleConnections()
+			workers.Wait()
+		}
+	}
+}
+
 // loadConfig builds a service.Config from environment with a strict allowlist.
 // It never opens a listener. An explicit StateDir overrides the platform
 // canonical path; enrollment remains disabled unless every trust and candidate
@@ -140,6 +223,7 @@ func loadConfig() (service.Config, error) {
 		"LANMM_ENROLLMENT_CA_CERT_PEM": true, "LANMM_ENROLLMENT_CA_FINGERPRINT_SHA256": true,
 		"LANMM_ENROLLMENT_CANDIDATE_ADDRESS": true, "LANMM_ENROLLMENT_CANDIDATE_PORT": true,
 		"LANMM_ENROLLMENT_PROTOCOL_MAJOR": true, "LANMM_ENROLLMENT_PROTOCOL_MINOR": true,
+		"LANMM_DISCOVERY_DISPLAY_NAME": true, "LANMM_DISCOVERY_ADDRESS": true, "LANMM_DISCOVERY_PORT": true, "LANMM_DISCOVERY_TTL_SECONDS": true, "LANMM_OLLAMA_ENDPOINT": true,
 	}
 	for _, item := range os.Environ() {
 		key := strings.SplitN(item, "=", 2)[0]
@@ -187,10 +271,77 @@ func loadConfig() (service.Config, error) {
 	if len(cfg.Registry.Observers) == 0 {
 		return service.Config{}, service.ErrInvalidConfig
 	}
+	if err := prepareExplicitReEnrollment(&cfg); err != nil {
+		return service.Config{}, service.ErrInvalidConfig
+	}
 	if err := configureEnrollment(&cfg); err != nil {
 		return service.Config{}, service.ErrInvalidConfig
 	}
+	discoveryConfigured := false
+	for _, key := range []string{"LANMM_DISCOVERY_DISPLAY_NAME", "LANMM_DISCOVERY_ADDRESS", "LANMM_DISCOVERY_PORT", "LANMM_DISCOVERY_TTL_SECONDS"} {
+		if _, ok := os.LookupEnv(key); ok {
+			discoveryConfigured = true
+		}
+	}
+	if discoveryConfigured {
+		if _, err := discoveryAdvertisement(cfg.HostID); err != nil {
+			return service.Config{}, service.ErrInvalidConfig
+		}
+	}
+	if endpoint, ok := os.LookupEnv("LANMM_OLLAMA_ENDPOINT"); ok {
+		if _, err := ollama.New(ollama.Config{ProviderID: "ollama-local", Endpoint: endpoint}); err != nil {
+			return service.Config{}, service.ErrInvalidConfig
+		}
+	}
 	return cfg, nil
+}
+
+// prepareExplicitReEnrollment consumes a local-admin marker written while the
+// service is stopped. The old certificate directory is atomically archived,
+// never overwritten, before normal owner-confirmed enrollment starts.
+func prepareExplicitReEnrollment(cfg *service.Config) error {
+	stateDir := cfg.StateDir
+	if stateDir == "" {
+		return nil
+	}
+	marker := filepath.Join(stateDir, "reenroll.request")
+	info, err := os.Lstat(marker)
+	if errors.Is(err, os.ErrNotExist) {
+		return nil
+	}
+	if err != nil || !info.Mode().IsRegular() || info.Mode()&os.ModeSymlink != 0 || (runtime.GOOS != "windows" && info.Mode().Perm() != 0600) || info.Size() != int64(len("owner-authorized-reenroll\n")) {
+		return service.ErrInvalidConfig
+	}
+	raw, err := os.ReadFile(marker)
+	if err != nil || string(raw) != "owner-authorized-reenroll\n" {
+		return service.ErrInvalidConfig
+	}
+	certDir := cfg.CertDir
+	if certDir == "" {
+		certDir = filepath.Join(stateDir, "cert")
+	}
+	if existing, statErr := os.Lstat(certDir); statErr == nil {
+		if !existing.IsDir() || existing.Mode()&os.ModeSymlink != 0 {
+			return service.ErrInvalidConfig
+		}
+		archive := fmt.Sprintf("%s.retired-%s", certDir, time.Now().UTC().Format("20060102T150405.000000000Z"))
+		if err = os.Rename(certDir, archive); err != nil {
+			return service.ErrInvalidConfig
+		}
+	} else if !errors.Is(statErr, os.ErrNotExist) {
+		return service.ErrInvalidConfig
+	}
+	if err = os.MkdirAll(certDir, 0700); err != nil {
+		return service.ErrInvalidConfig
+	}
+	if err = os.Remove(marker); err != nil {
+		return service.ErrInvalidConfig
+	}
+	if dir, openErr := os.Open(stateDir); openErr == nil {
+		_ = dir.Sync()
+		_ = dir.Close()
+	}
+	return nil
 }
 
 var enrollmentEnvironment = []string{
@@ -319,4 +470,24 @@ func safeErr(err error) string {
 		return ""
 	}
 	return err.Error()
+}
+
+func discoveryAdvertisement(hostID string) (discovery.Advertisement, error) {
+	name, address, portText, ttlText := os.Getenv("LANMM_DISCOVERY_DISPLAY_NAME"), os.Getenv("LANMM_DISCOVERY_ADDRESS"), os.Getenv("LANMM_DISCOVERY_PORT"), os.Getenv("LANMM_DISCOVERY_TTL_SECONDS")
+	if name == "" && address == "" && portText == "" && ttlText == "" {
+		return discovery.Advertisement{}, service.ErrInvalidConfig
+	}
+	port, err := parseUint16(portText)
+	if err != nil {
+		return discovery.Advertisement{}, service.ErrInvalidConfig
+	}
+	ttl, err := strconv.ParseUint(ttlText, 10, 32)
+	if err != nil {
+		return discovery.Advertisement{}, service.ErrInvalidConfig
+	}
+	value := discovery.Advertisement{ID: hostID, DisplayName: name, ProtocolVersion: discovery.ProtocolVersion{Major: 1, Minor: 0}, AgentPort: port, Platform: runtime.GOOS, Addresses: []string{address}, TTLSeconds: uint32(ttl)}
+	if _, err = discovery.BuildAdvertisement(value); err != nil {
+		return discovery.Advertisement{}, service.ErrInvalidConfig
+	}
+	return value, nil
 }

@@ -13,6 +13,7 @@ import (
 	"errors"
 	"fmt"
 	"io"
+	mrand "math/rand"
 	"net/http"
 	"net/url"
 	"os"
@@ -21,7 +22,6 @@ import (
 	"sync"
 	"time"
 
-	"github.com/JesusITWarrior/AI-LAN-Model-Manager/agents/host-agent/internal/enrollment"
 	agenttransport "github.com/JesusITWarrior/AI-LAN-Model-Manager/agents/host-agent/internal/transport"
 )
 
@@ -126,17 +126,21 @@ type HTTPSClient struct {
 	store        SequenceStore
 	now          func() time.Time
 	lastObserved time.Time
+	// Runner seams are private and used to deterministically verify reconnect,
+	// backoff, and cancellation behavior without weakening production defaults.
+	runHello       func(context.Context, string, string, time.Duration, time.Duration, time.Duration) (Ack, error)
+	runSend        func(context.Context, Snapshot) (uint64, error)
+	runWait        func(context.Context, time.Duration) bool
+	runRandom      *mrand.Rand
+	runBackoffBase time.Duration
+	runBackoffCap  time.Duration
 }
 
 func NewHTTPSClient(certDir string) (*HTTPSClient, error) {
 	if !filepath.IsAbs(certDir) || filepath.Clean(certDir) != certDir {
 		return nil, ErrHTTPClient
 	}
-	result, err := (enrollment.FileStore{CertDir: certDir}).Load(context.Background())
-	if err != nil {
-		return nil, ErrHTTPClient
-	}
-	key, err := (enrollment.IdentityStore{CertDir: certDir}).Load()
+	result, key, err := loadFleetIdentity(certDir)
 	if err != nil {
 		return nil, ErrHTTPClient
 	}

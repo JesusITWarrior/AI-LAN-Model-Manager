@@ -36,6 +36,17 @@ func TestCrossLanguageFleetHelper(t *testing.T) {
 	if directory == "" {
 		t.Skip("cross-language helper")
 	}
+	if os.Getenv("LANMM_CROSS_FLEET_ROTATE") == "1" {
+		rotated, rotateErr := RotateIdentityIfNeeded(context.Background(), directory, 90*24*time.Hour)
+		if rotateErr != nil || !rotated {
+			t.Fatalf("rotation = %v, %v", rotated, rotateErr)
+		}
+		if _, restartErr := NewHTTPSClient(directory); restartErr != nil {
+			t.Fatal(restartErr)
+		}
+		fmt.Println("LANMM_CROSS_FLEET_ROTATED=true")
+		return
+	}
 	client, err := NewHTTPSClient(directory)
 	if err != nil {
 		t.Fatal(err)

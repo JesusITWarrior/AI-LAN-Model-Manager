@@ -1,11 +1,13 @@
 package discovery
 
 import (
+	"context"
 	"encoding/hex"
 	"errors"
 	"os"
 	"strings"
 	"testing"
+	"time"
 )
 
 func fixture() Advertisement {
@@ -83,5 +85,26 @@ func TestAdvertiserErrorsAreRedacted(t *testing.T) {
 	err := advertiser.Start()
 	if err == nil || strings.Contains(err.Error(), "secret") {
 		t.Fatalf("unredacted: %v", err)
+	}
+}
+
+func TestAdvertiserRunIsPeriodicAndStops(t *testing.T) {
+	value := fixture()
+	value.TTLSeconds = 1
+	sender := &fakeSender{}
+	advertiser, err := NewAdvertiser(sender, value)
+	if err != nil {
+		t.Fatal(err)
+	}
+	ctx, cancel := context.WithTimeout(context.Background(), 1100*time.Millisecond)
+	defer cancel()
+	if err = advertiser.Run(ctx); err != nil {
+		t.Fatal(err)
+	}
+	if len(sender.sent) < 2 {
+		t.Fatalf("periodic sends=%d", len(sender.sent))
+	}
+	if sender.closed != 1 {
+		t.Fatalf("closes=%d", sender.closed)
 	}
 }

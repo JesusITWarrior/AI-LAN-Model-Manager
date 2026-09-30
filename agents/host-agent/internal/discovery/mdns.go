@@ -2,12 +2,14 @@ package discovery
 
 import (
 	"bytes"
+	"context"
 	"encoding/binary"
 	"errors"
 	"net"
 	"regexp"
 	"strings"
 	"sync"
+	"time"
 	"unicode/utf8"
 )
 
@@ -235,4 +237,82 @@ func (a *Advertiser) Stop() error {
 		return errors.New("discovery close failed")
 	}
 	return nil
+}
+
+// UDPMulticastSender emits mDNS datagrams without binding a listening socket.
+type UDPMulticastSender struct {
+	mu         sync.Mutex
+	connection *net.UDPConn
+}
+
+func NewUDPMulticastSender() (*UDPMulticastSender, error) {
+	target, err := net.ResolveUDPAddr("udp4", "224.0.0.251:5353")
+	if err != nil {
+		return nil, errors.New("discovery sender failed")
+	}
+	connection, err := net.DialUDP("udp4", nil, target)
+	if err != nil {
+		return nil, errors.New("discovery sender failed")
+	}
+	return &UDPMulticastSender{connection: connection}, nil
+}
+func (s *UDPMulticastSender) Send(packet []byte) error {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	if s.connection == nil {
+		return errors.New("discovery send failed")
+	}
+	if len(packet) == 0 || len(packet) > 65535 {
+		return errors.New("discovery send failed")
+	}
+	_, err := s.connection.Write(packet)
+	if err != nil {
+		return errors.New("discovery send failed")
+	}
+	return nil
+}
+func (s *UDPMulticastSender) Close() error {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	if s.connection == nil {
+		return nil
+	}
+	err := s.connection.Close()
+	s.connection = nil
+	if err != nil {
+		return errors.New("discovery close failed")
+	}
+	return nil
+}
+
+// Run advertises immediately and periodically until cancellation. No socket is
+// opened for inbound traffic. The interval is bounded by the advertisement TTL.
+func (a *Advertiser) Run(ctx context.Context) error {
+	if ctx == nil {
+		return ErrInvalidAdvertisement
+	}
+	if err := a.Start(); err != nil {
+		return err
+	}
+	interval := time.Duration(a.advertisement.TTLSeconds) * time.Second / 2
+	if interval < time.Second {
+		interval = time.Second
+	}
+	ticker := time.NewTicker(interval)
+	defer ticker.Stop()
+	defer a.Stop()
+	packet, err := BuildAdvertisement(a.advertisement)
+	if err != nil {
+		return err
+	}
+	for {
+		select {
+		case <-ctx.Done():
+			return nil
+		case <-ticker.C:
+			if err := a.sender.Send(packet); err != nil {
+				return errors.New("discovery send failed")
+			}
+		}
+	}
 }

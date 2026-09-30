@@ -338,7 +338,9 @@ class RuntimeImpl {
     readonly hooks: RuntimeLifecycleHooks | undefined;
     readonly dependencies: RuntimeDependencies | undefined;
   } {
-    const configKeys = CONTROLLER_CONFIG_KEYS as readonly string[];
+    const baseConfigKeys = CONTROLLER_CONFIG_KEYS as readonly string[];
+    const ownConfigKeys=Reflect.ownKeys(options.config);
+    const configKeys = ownConfigKeys.length===baseConfigKeys.length?baseConfigKeys:[...baseConfigKeys,"agentPlaneEnabled","agentPlaneHost","agentPlanePort","agentPlaneAdvertisedAddress"];
     if (!isPlainRecord(options.config, configKeys)) {
       throw new ControllerRuntimeError("ERR_RUNTIME_CONFIG");
     }
