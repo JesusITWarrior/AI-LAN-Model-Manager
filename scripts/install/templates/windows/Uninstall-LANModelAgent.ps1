@@ -10,7 +10,7 @@ $node=(Get-Command node.exe -ErrorAction SilentlyContinue).Source
 if(-not $node){throw 'ERR_INSTALL_NODE'}
 $summary=if($Purge){'remove the service, application files, enrollment state, and configuration'}else{'remove the service and application files while preserving enrollment state and configuration'}
 $serviceArgs=@('-NoProfile','-ExecutionPolicy','Bypass','-File',$serviceScript,'-Role','agent','-Action','Uninstall')
-$args=@($runtime,'uninstall','--platform','windows','--root','\','--role','agent')
+$args=@($runtime,'uninstall','--platform','windows','--role','agent')
 if($Purge){$serviceArgs+='-Purge';$args+='--purge'}
 if($WhatIfPreference){
   $serviceArgs+='-WhatIf';$args+='--dry-run'

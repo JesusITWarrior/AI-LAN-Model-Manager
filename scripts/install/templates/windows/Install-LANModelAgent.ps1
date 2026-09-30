@@ -15,7 +15,7 @@ if(-not $node){throw 'ERR_INSTALL_NODE'}
 $pointer=Join-Path $env:ProgramFiles 'LANModelManager\agent.current'
 $action=if(Test-Path -LiteralPath $pointer -PathType Leaf){'upgrade'}else{'install'}
 $serviceAction=if($action -eq 'upgrade'){'Upgrade'}else{'Install'}
-$args=@($runtime,$action,'--platform','windows','--root','\','--payload',$packageRoot,'--manifest',$manifest,'--role','agent')
+$args=@($runtime,$action,'--platform','windows','--payload',$packageRoot,'--manifest',$manifest,'--role','agent')
 $serviceArgs=@('-NoProfile','-ExecutionPolicy','Bypass','-File',$serviceScript,'-Role','agent','-Version',$Version,'-Action',$serviceAction)
 if($Activate){$serviceArgs+='-Activate'}
 if($WhatIfPreference){
