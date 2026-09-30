@@ -2,12 +2,12 @@
 
 This slice supplies deterministic, unsigned Linux controller/host-agent and Windows host-agent package foundations. Repository builds and tests do **not** modify a live service. macOS service packaging remains a later slice.
 
-## Hat Trick internal Alpha: one command
+## Internal Fedora Alpha: one command
 
-On the Fedora host named `Hat-Trick`, use a reviewed, clean checkout and run:
+On an approved Fedora Alpha qualification host, use a reviewed, clean checkout and run:
 
 ```sh
-./scripts/alpha/install-hat-trick-alpha.sh
+./scripts/alpha/install-fedora-alpha.sh
 ```
 
 The command requires Node.js 24+ and the systemd user tools. It verifies the repository-relative `artifacts/alpha-final-a/lan-model-controller-linux-any.tar.gz` against both `checksums.txt` and `package-inventory.json`, then verifies the package's bounded install manifest and every payload byte before changing the installation. It installs versioned files under `${XDG_DATA_HOME:-$HOME/.local/share}/lan-model-manager-alpha`, keeps controller state separately under `${XDG_STATE_HOME:-$HOME/.local/state}/lan-model-manager-alpha/controller`, and creates only a `systemctl --user` service. Re-running the command is idempotent; a newer verified package switches releases while preserving state and rolls back if `/auth/v1/status` is not healthy.
@@ -17,13 +17,13 @@ This is an **unsigned internal Alpha**. SHA-256 verification detects corruption 
 Preview without installing:
 
 ```sh
-./scripts/alpha/install-hat-trick-alpha.sh --dry-run
+./scripts/alpha/install-fedora-alpha.sh --dry-run
 ```
 
 Remove the user service and installed program files while retaining controller state:
 
 ```sh
-./scripts/alpha/uninstall-hat-trick-alpha.sh
+./scripts/alpha/uninstall-fedora-alpha.sh
 ```
 
 Use `--dry-run` to preview removal. Only an intentional `--purge` removes the preserved controller state, after a destructive warning.
