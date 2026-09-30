@@ -1,8 +1,8 @@
-#Requires -Version 7.2
+#Requires -Version 5.1
 [CmdletBinding(SupportsShouldProcess=$true)]
 param(
   [Parameter(Mandatory=$true)][ValidateSet('controller','agent')][string]$Role,
-  [Parameter(Mandatory=$true)][ValidatePattern('^[0-9]+\.[0-9]+\.[0-9]+(?:-[0-9A-Za-z.-]+)?$')][string]$Version,
+  [ValidatePattern('^[0-9]+\.[0-9]+\.[0-9]+(?:-[0-9A-Za-z.-]+)?$')][string]$Version='0.0.0',
   [ValidateSet('Install','Upgrade','Uninstall')][string]$Action='Install',
   [switch]$Activate,
   [switch]$Purge
