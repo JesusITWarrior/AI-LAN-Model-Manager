@@ -3,11 +3,13 @@ import assert from "node:assert/strict";
 import {mkdtemp, mkdir, readFile, writeFile, access, symlink} from "node:fs/promises";
 import {tmpdir} from "node:os";
 import {join} from "node:path";
-import {createManifest,installPlan,installRelease,inventoryTree,safeRelative,uninstall,verifyManifest} from "../core.js";
+import {contained,createManifest,installPlan,installRelease,inventoryTree,safeRelative,uninstall,verifyManifest} from "../core.js";
 
 const COMMIT="9f9f243e76991e4fd5e8365001f2074bdfe44ffd";
 async function payload(root:string,version:string,body:string,role="agent"){const dir=join(root,`payload-${version}`);await mkdir(join(dir,"bin"),{recursive:true});await writeFile(join(dir,"bin",role==="agent"?"lan-model-agent":"lan-model-controller"),body,{mode:0o755});const files=await inventoryTree(dir);return{dir,manifest:createManifest({role,version,files,sourceCommit:COMMIT})};}
 async function present(path:string){try{await access(path);return true}catch{return false}}
+
+test("containment accepts descendants of a filesystem root without double separators",()=>{assert.equal(contained("/","/Program Files/LANModelManager"),true);assert.equal(contained("/","/../escape"),true);assert.equal(contained("/safe","/unsafe"),false);});
 
 test("dry-run validates bytes and reports canonical rootless plan without mutation",async()=>{const root=await mkdtemp(join(tmpdir(),"lmm-install-")),p=await payload(root,"1.0.0","v1");const result=await installRelease({payload:p.dir,manifest:p.manifest,platform:"linux",root,dryRun:true});assert.equal(result.changed,false);assert.match(result.actions[1]!,/releases[\\/]agent[\\/]1\.0\.0$/);assert.equal(await present(join(root,"opt")),false);});
 

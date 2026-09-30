@@ -11,7 +11,7 @@ export function safeVersion(value){if(typeof value!=="string"||value.length>128|
 export function compareVersions(a,b){safeVersion(a);safeVersion(b);const [ac,ap]=a.split("-",2),[bc,bp]=b.split("-",2),an=ac.split(".").map(Number),bn=bc.split(".").map(Number);for(let i=0;i<3;i++)if(an[i]!==bn[i])return an[i]<bn[i]?-1:1;if(ap===bp)return 0;if(ap===undefined)return 1;if(bp===undefined)return -1;return ap<bp?-1:ap>bp?1:0;}
 export function safeRole(value){if(!ROLES.has(value))throw new Error("ERR_INSTALL_ROLE");return value;}
 export function safeRelative(value){if(typeof value!=="string"||!REL.test(value)||isAbsolute(value)||value.split("/").some(part=>part===""||part==="."||part===".."))throw new Error("ERR_INSTALL_PATH");return value;}
-export function contained(root,path){const r=resolve(root),p=resolve(path);return p===r||p.startsWith(r+sep);}
+export function contained(root,path){const r=resolve(root),p=resolve(path),prefix=r.endsWith(sep)?r:r+sep;return p===r||p.startsWith(prefix);}
 export function sha256(bytes){return createHash("sha256").update(bytes).digest("hex");}
 function canonicalFiles(files){return [...files].sort((a,b)=>a.path<b.path?-1:a.path>b.path?1:0).map(f=>`${f.path}\0${f.sha256}\0${f.size}\n`).join("");}
 export function verifyManifest(input){
