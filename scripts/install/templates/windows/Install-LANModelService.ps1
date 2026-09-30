@@ -24,7 +24,7 @@ if($Action -eq 'Uninstall') {
   if($Purge) { foreach($path in @($state,$config)){if($PSCmdlet.ShouldProcess($path,'Purge state or configuration')){Remove-Item -LiteralPath $path -Recurse -Force -ErrorAction SilentlyContinue}} }
   return
 }
-if(-not (Test-Path -LiteralPath $binary -PathType Leaf)){throw 'ERR_INSTALL_BINARY'}
+if(-not $WhatIfPreference -and -not (Test-Path -LiteralPath $binary -PathType Leaf)){throw 'ERR_INSTALL_BINARY'}
 $oldBinary=$null
 $existing=Get-Service -Name $name -ErrorAction SilentlyContinue
 if($existing){$oldBinary=(Get-CimInstance Win32_Service -Filter "Name='$name'").PathName}
