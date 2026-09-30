@@ -8,8 +8,8 @@
   "scripts": {
     "build": "tsc -b && npm run build -w @lan-model-manager/web",
     "check": "npm run build && npm test",
-    "supply-chain": "node scripts/packaging/lock-integrity.js . && node scripts/packaging/license-inventory.js . && node scripts/packaging/secret-scan.js . && npx tsx --test scripts/packaging/tests/agents.test.ts scripts/packaging/tests/supply-chain.test.ts scripts/packaging/tests/audit.test.ts scripts/packaging/tests/package-inventory.test.ts scripts/install/tests/core.test.ts",
-    "test:installer": "tsx --test scripts/install/tests/core.test.ts",
+    "supply-chain": "node scripts/packaging/lock-integrity.js . && node scripts/packaging/license-inventory.js . && node scripts/packaging/secret-scan.js . && npx tsx --test scripts/packaging/tests/agents.test.ts scripts/packaging/tests/supply-chain.test.ts scripts/packaging/tests/audit.test.ts scripts/packaging/tests/package-inventory.test.ts scripts/install/tests/core.test.ts && node --test scripts/alpha/tests/hat-trick-alpha.test.mjs",
+    "test:installer": "tsx --test scripts/install/tests/core.test.ts && node --test scripts/alpha/tests/hat-trick-alpha.test.mjs",
     "dev:controller": "tsx apps/controller/src/main.ts",
     "test": "tsx --test packages/core/src/*.test.ts apps/controller/src/*.test.ts apps/web/src/*.test.ts"
   },
