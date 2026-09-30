@@ -6,6 +6,7 @@ const HEX64 = /^[a-f0-9]{64}$/;
 const JSON_HEADERS = Object.freeze({ "content-type": "application/json; charset=utf-8", "cache-control": "no-store" });
 
 type PairingEnrollmentManager = {
+  pendingOwnerConfirmation(input: unknown): boolean;
   pendingAgentProof(input: unknown): boolean;
   verifyAgentProof(input: unknown): unknown;
   consume(challengeId: unknown): CertificateEnrollmentAuthorization | null;
@@ -94,7 +95,10 @@ export async function routeEnrollmentRequest(deps: EnrollmentApiDependencies, re
     const input = completeInput(parsed);
     if (!input || input.caFingerprint !== ca.fingerprint) return failed();
     const proof = { challengeId: input.challengeId, controllerNonce: input.controllerNonce, agentNonce: input.agentNonce, proof: input.proof, binding: input.binding };
-    if (deps.pairing.pendingAgentProof(proof)) return response(409, undefined, "OWNER_CONFIRMATION_PENDING", "Owner confirmation pending.");
+    // While the exact active challenge is awaiting its owner code, retain the
+    // agent's bounded CSR/proof session and return a retryable response. Proof
+    // authentication remains mandatory immediately after owner confirmation.
+    if (deps.pairing.pendingOwnerConfirmation(proof)) return response(409, undefined, "OWNER_CONFIRMATION_PENDING", "Owner confirmation pending.");
     if (!deps.pairing.verifyAgentProof(proof)) return failed();
     const authorization = deps.pairing.consume(input.challengeId);
     if (!authorization) return failed();

@@ -56,7 +56,7 @@ test("live enrollment begins from exact binding, presents one-time code, then pr
     assert.equal(x.pairing.get(challenge.challengeId)?.state, "presented");
     const pendingProof = proofFor(challenge);
     const unproven = await x.post("/agent/v1/enrollment/complete", { ...pendingProof, proof: "0".repeat(64) });
-    assert.equal(unproven.status, 400); assert.deepEqual((unproven.body as any).error, { code: "ENROLLMENT_FAILED", message: "Enrollment failed." });
+    assert.equal(unproven.status, 409); assert.deepEqual((unproven.body as any).error, { code: "OWNER_CONFIRMATION_PENDING", message: "Owner confirmation pending." });
     assert.equal(x.pairing.get(challenge.challengeId)?.state, "presented");
     const pending = await x.post("/agent/v1/enrollment/complete", pendingProof);
     assert.equal(pending.status, 409); assert.deepEqual((pending.body as any).error, { code: "OWNER_CONFIRMATION_PENDING", message: "Owner confirmation pending." });

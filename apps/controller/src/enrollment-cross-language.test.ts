@@ -70,11 +70,12 @@ test("real TypeScript TLS enrollment handler enrolls and restarts the Go client"
       return created;
     };
     const pairingForRoute = {
-      pendingAgentProof(input: unknown) {
-        const pending = pairing.pendingAgentProof(input);
+      pendingOwnerConfirmation(input: unknown) {
+        const pending = pairing.pendingOwnerConfirmation(input);
         if (pending) pendingLookups++;
         return pending;
       },
+      pendingAgentProof: (input: unknown) => pairing.pendingAgentProof(input),
       verifyAgentProof: (input: unknown) => pairing.verifyAgentProof(input),
       consume: (challengeId: unknown) => pairing.consume(challengeId),
     };
