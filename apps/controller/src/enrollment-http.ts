@@ -2,7 +2,9 @@ import type { IncomingMessage, ServerResponse } from "node:http";
 import { routeEnrollmentRequest, type EnrollmentApiDependencies, type EnrollmentApiResponse } from "./enrollment-api.js";
 
 export const ENROLLMENT_BODY_LIMIT = 24_576;
-export const ENROLLMENT_RATE_LIMIT = 20;
+// A pending enrollment polls once per second for up to two minutes. Keep the
+// per-address window bounded while allowing that documented client cadence.
+export const ENROLLMENT_RATE_LIMIT = 120;
 export const ENROLLMENT_RATE_WINDOW_MS = 60_000;
 const MAX_RATE_KEYS = 1_024;
 
