@@ -1,0 +1,178 @@
+{
+  "request": {
+    "requestId": "synthetic-request",
+    "jobId": "synthetic-job",
+    "hostId": "synthetic-host",
+    "operation": "inference.chat.stream",
+    "idempotencyKey": "synthetic-idem",
+    "sequence": 1,
+    "deadline": "2026-11-03T22:00:00.000Z",
+    "capability": {
+      "operation": "model-inference",
+      "targetKind": "model",
+      "targetId": "synthetic-model-id",
+      "hostId": "synthetic-host",
+      "modelId": "synthetic-model-id",
+      "expiresAt": "2026-11-03T22:01:00.000Z",
+      "requestDigest": "635a352e9b39a30992258d7289115a1281ac0875f280a1bd3e574b66b307bf31"
+    },
+    "params": {
+      "schemaVersion": 1,
+      "chat": {
+        "providerId": "synthetic-provider",
+        "modelId": "synthetic-model-id",
+        "model": "synthetic-model:fixture",
+        "requestId": "synthetic-request",
+        "maxRequestBytes": 524288,
+        "maxResponseBytes": 262144,
+        "messages": [
+          {
+            "role": "user",
+            "contentBase64": "c3ludGhldGlj"
+          }
+        ],
+        "temperatureMilli": null,
+        "maxTokens": null
+      },
+      "upstreamFrameBytes": 65536,
+      "maxEventBytes": 131072,
+      "maxTotalEventBytes": 1048576,
+      "maxEvents": 4096
+    }
+  },
+  "events": [
+    {
+      "schemaVersion": 1,
+      "hostId": "synthetic-host",
+      "jobId": "synthetic-job",
+      "requestId": "synthetic-request",
+      "commandDigest": "635a352e9b39a30992258d7289115a1281ac0875f280a1bd3e574b66b307bf31",
+      "index": 0,
+      "kind": "chunk",
+      "chunk": {
+        "id": "synthetic-request",
+        "object": "chat.completion.chunk",
+        "model": "synthetic-model:fixture",
+        "choices": [
+          {
+            "index": 0,
+            "delta": {
+              "role": "assistant",
+              "content": "synthetic δ"
+            },
+            "finish_reason": null
+          }
+        ]
+      },
+      "errorCode": null
+    },
+    {
+      "schemaVersion": 1,
+      "hostId": "synthetic-host",
+      "jobId": "synthetic-job",
+      "requestId": "synthetic-request",
+      "commandDigest": "635a352e9b39a30992258d7289115a1281ac0875f280a1bd3e574b66b307bf31",
+      "index": 1,
+      "kind": "succeeded",
+      "chunk": {
+        "id": "synthetic-request",
+        "object": "chat.completion.chunk",
+        "model": "synthetic-model:fixture",
+        "choices": [
+          {
+            "index": 0,
+            "delta": {
+              "role": "assistant",
+              "content": "synthetic δ"
+            },
+            "finish_reason": "stop"
+          }
+        ],
+        "usage": {
+          "prompt_tokens": 1,
+          "completion_tokens": 2,
+          "total_tokens": 3
+        }
+      },
+      "errorCode": null
+    }
+  ],
+  "invalidEvents": [
+    {
+      "name": "out-of-order",
+      "prior": [],
+      "raw": "{\"schemaVersion\":1,\"hostId\":\"synthetic-host\",\"jobId\":\"synthetic-job\",\"requestId\":\"synthetic-request\",\"commandDigest\":\"635a352e9b39a30992258d7289115a1281ac0875f280a1bd3e574b66b307bf31\",\"index\":1,\"kind\":\"chunk\",\"chunk\":{\"id\":\"synthetic-request\",\"object\":\"chat.completion.chunk\",\"model\":\"synthetic-model:fixture\",\"choices\":[{\"index\":0,\"delta\":{\"role\":\"assistant\",\"content\":\"synthetic δ\"},\"finish_reason\":null}]},\"errorCode\":null}"
+    },
+    {
+      "name": "duplicate-delta",
+      "prior": [
+        0
+      ],
+      "raw": "{\"schemaVersion\":1,\"hostId\":\"synthetic-host\",\"jobId\":\"synthetic-job\",\"requestId\":\"synthetic-request\",\"commandDigest\":\"635a352e9b39a30992258d7289115a1281ac0875f280a1bd3e574b66b307bf31\",\"index\":0,\"kind\":\"chunk\",\"chunk\":{\"id\":\"synthetic-request\",\"object\":\"chat.completion.chunk\",\"model\":\"synthetic-model:fixture\",\"choices\":[{\"index\":0,\"delta\":{\"role\":\"assistant\",\"content\":\"synthetic δ\"},\"finish_reason\":null}]},\"errorCode\":null}"
+    },
+    {
+      "name": "duplicate-terminal",
+      "prior": [
+        0,
+        1
+      ],
+      "raw": "{\"schemaVersion\":1,\"hostId\":\"synthetic-host\",\"jobId\":\"synthetic-job\",\"requestId\":\"synthetic-request\",\"commandDigest\":\"635a352e9b39a30992258d7289115a1281ac0875f280a1bd3e574b66b307bf31\",\"index\":1,\"kind\":\"succeeded\",\"chunk\":{\"id\":\"synthetic-request\",\"object\":\"chat.completion.chunk\",\"model\":\"synthetic-model:fixture\",\"choices\":[{\"index\":0,\"delta\":{\"role\":\"assistant\",\"content\":\"synthetic δ\"},\"finish_reason\":\"stop\"}],\"usage\":{\"prompt_tokens\":1,\"completion_tokens\":2,\"total_tokens\":3}},\"errorCode\":null}"
+    },
+    {
+      "name": "foreign-hostId",
+      "prior": [],
+      "raw": "{\"schemaVersion\":1,\"hostId\":\"foreign\",\"jobId\":\"synthetic-job\",\"requestId\":\"synthetic-request\",\"commandDigest\":\"635a352e9b39a30992258d7289115a1281ac0875f280a1bd3e574b66b307bf31\",\"index\":0,\"kind\":\"chunk\",\"chunk\":{\"id\":\"synthetic-request\",\"object\":\"chat.completion.chunk\",\"model\":\"synthetic-model:fixture\",\"choices\":[{\"index\":0,\"delta\":{\"role\":\"assistant\",\"content\":\"synthetic δ\"},\"finish_reason\":null}]},\"errorCode\":null}"
+    },
+    {
+      "name": "foreign-jobId",
+      "prior": [],
+      "raw": "{\"schemaVersion\":1,\"hostId\":\"synthetic-host\",\"jobId\":\"foreign\",\"requestId\":\"synthetic-request\",\"commandDigest\":\"635a352e9b39a30992258d7289115a1281ac0875f280a1bd3e574b66b307bf31\",\"index\":0,\"kind\":\"chunk\",\"chunk\":{\"id\":\"synthetic-request\",\"object\":\"chat.completion.chunk\",\"model\":\"synthetic-model:fixture\",\"choices\":[{\"index\":0,\"delta\":{\"role\":\"assistant\",\"content\":\"synthetic δ\"},\"finish_reason\":null}]},\"errorCode\":null}"
+    },
+    {
+      "name": "foreign-requestId",
+      "prior": [],
+      "raw": "{\"schemaVersion\":1,\"hostId\":\"synthetic-host\",\"jobId\":\"synthetic-job\",\"requestId\":\"foreign\",\"commandDigest\":\"635a352e9b39a30992258d7289115a1281ac0875f280a1bd3e574b66b307bf31\",\"index\":0,\"kind\":\"chunk\",\"chunk\":{\"id\":\"synthetic-request\",\"object\":\"chat.completion.chunk\",\"model\":\"synthetic-model:fixture\",\"choices\":[{\"index\":0,\"delta\":{\"role\":\"assistant\",\"content\":\"synthetic δ\"},\"finish_reason\":null}]},\"errorCode\":null}"
+    },
+    {
+      "name": "foreign-commandDigest",
+      "prior": [],
+      "raw": "{\"schemaVersion\":1,\"hostId\":\"synthetic-host\",\"jobId\":\"synthetic-job\",\"requestId\":\"synthetic-request\",\"commandDigest\":\"foreign\",\"index\":0,\"kind\":\"chunk\",\"chunk\":{\"id\":\"synthetic-request\",\"object\":\"chat.completion.chunk\",\"model\":\"synthetic-model:fixture\",\"choices\":[{\"index\":0,\"delta\":{\"role\":\"assistant\",\"content\":\"synthetic δ\"},\"finish_reason\":null}]},\"errorCode\":null}"
+    },
+    {
+      "name": "safeinteger-sum-overflow",
+      "prior": [],
+      "raw": "{\"schemaVersion\":1,\"hostId\":\"synthetic-host\",\"jobId\":\"synthetic-job\",\"requestId\":\"synthetic-request\",\"commandDigest\":\"635a352e9b39a30992258d7289115a1281ac0875f280a1bd3e574b66b307bf31\",\"index\":0,\"kind\":\"succeeded\",\"chunk\":{\"id\":\"synthetic-request\",\"object\":\"chat.completion.chunk\",\"model\":\"synthetic-model:fixture\",\"choices\":[{\"index\":0,\"delta\":{\"role\":\"assistant\",\"content\":\"synthetic δ\"},\"finish_reason\":\"stop\"}],\"usage\":{\"prompt_tokens\":9007199254740991,\"completion_tokens\":1,\"total_tokens\":9007199254740992}},\"errorCode\":null}"
+    },
+    {
+      "name": "unknown-chunk-field",
+      "prior": [],
+      "raw": "{\"schemaVersion\":1,\"hostId\":\"synthetic-host\",\"jobId\":\"synthetic-job\",\"requestId\":\"synthetic-request\",\"commandDigest\":\"635a352e9b39a30992258d7289115a1281ac0875f280a1bd3e574b66b307bf31\",\"index\":0,\"kind\":\"chunk\",\"chunk\":{\"id\":\"synthetic-request\",\"object\":\"chat.completion.chunk\",\"model\":\"synthetic-model:fixture\",\"choices\":[{\"index\":0,\"delta\":{\"role\":\"assistant\",\"content\":\"synthetic δ\",\"thinking\":\"synthetic-private\"},\"finish_reason\":null}]},\"errorCode\":null}"
+    },
+    {
+      "name": "duplicate-object-key",
+      "prior": [],
+      "raw": "{\"schemaVersion\":1,\"hostId\":\"synthetic-host\",\"jobId\":\"synthetic-job\",\"requestId\":\"synthetic-request\",\"commandDigest\":\"635a352e9b39a30992258d7289115a1281ac0875f280a1bd3e574b66b307bf31\",\"index\":0,\"index\":0,\"kind\":\"chunk\",\"chunk\":{\"id\":\"synthetic-request\",\"object\":\"chat.completion.chunk\",\"model\":\"synthetic-model:fixture\",\"choices\":[{\"index\":0,\"delta\":{\"role\":\"assistant\",\"content\":\"synthetic δ\"},\"finish_reason\":null}]},\"errorCode\":null}"
+    },
+    {
+      "name": "negative-zero",
+      "prior": [],
+      "raw": "{\"schemaVersion\":1,\"hostId\":\"synthetic-host\",\"jobId\":\"synthetic-job\",\"requestId\":\"synthetic-request\",\"commandDigest\":\"635a352e9b39a30992258d7289115a1281ac0875f280a1bd3e574b66b307bf31\",\"index\":-0,\"kind\":\"chunk\",\"chunk\":{\"id\":\"synthetic-request\",\"object\":\"chat.completion.chunk\",\"model\":\"synthetic-model:fixture\",\"choices\":[{\"index\":0,\"delta\":{\"role\":\"assistant\",\"content\":\"synthetic δ\"},\"finish_reason\":null}]},\"errorCode\":null}"
+    },
+    {
+      "name": "unpaired-surrogate",
+      "prior": [],
+      "raw": "{\"schemaVersion\":1,\"hostId\":\"synthetic-host\",\"jobId\":\"synthetic-job\",\"requestId\":\"synthetic-request\",\"commandDigest\":\"635a352e9b39a30992258d7289115a1281ac0875f280a1bd3e574b66b307bf31\",\"index\":0,\"kind\":\"chunk\",\"chunk\":{\"id\":\"synthetic-request\",\"object\":\"chat.completion.chunk\",\"model\":\"synthetic-model:fixture\",\"choices\":[{\"index\":0,\"delta\":{\"role\":\"assistant\",\"content\":\"\\ud800\"},\"finish_reason\":null}]},\"errorCode\":null}"
+    },
+    {
+      "name": "leading-utf8-bom",
+      "prior": [],
+      "raw": "﻿{\"schemaVersion\":1,\"hostId\":\"synthetic-host\",\"jobId\":\"synthetic-job\",\"requestId\":\"synthetic-request\",\"commandDigest\":\"635a352e9b39a30992258d7289115a1281ac0875f280a1bd3e574b66b307bf31\",\"index\":0,\"kind\":\"chunk\",\"chunk\":{\"id\":\"synthetic-request\",\"object\":\"chat.completion.chunk\",\"model\":\"synthetic-model:fixture\",\"choices\":[{\"index\":0,\"delta\":{\"role\":\"assistant\",\"content\":\"synthetic δ\"},\"finish_reason\":null}]},\"errorCode\":null}"
+    }
+  ],
+  "invalidCommands": [
+    {
+      "name": "leading-utf8-bom",
+      "raw": "﻿{\"requestId\":\"synthetic-request\",\"jobId\":\"synthetic-job\",\"hostId\":\"synthetic-host\",\"operation\":\"inference.chat.stream\",\"idempotencyKey\":\"synthetic-idem\",\"sequence\":1,\"deadline\":\"2026-11-03T22:00:00.000Z\",\"capability\":{\"operation\":\"model-inference\",\"targetKind\":\"model\",\"targetId\":\"synthetic-model-id\",\"hostId\":\"synthetic-host\",\"modelId\":\"synthetic-model-id\",\"expiresAt\":\"2026-11-03T22:01:00.000Z\",\"requestDigest\":\"635a352e9b39a30992258d7289115a1281ac0875f280a1bd3e574b66b307bf31\"},\"params\":{\"schemaVersion\":1,\"chat\":{\"providerId\":\"synthetic-provider\",\"modelId\":\"synthetic-model-id\",\"model\":\"synthetic-model:fixture\",\"requestId\":\"synthetic-request\",\"maxRequestBytes\":524288,\"maxResponseBytes\":262144,\"messages\":[{\"role\":\"user\",\"contentBase64\":\"c3ludGhldGlj\"}],\"temperatureMilli\":null,\"maxTokens\":null},\"upstreamFrameBytes\":65536,\"maxEventBytes\":131072,\"maxTotalEventBytes\":1048576,\"maxEvents\":4096}}"
+    }
+  ]
+}

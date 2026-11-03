@@ -188,17 +188,48 @@ func targetMatches(r Request) bool {
 }
 
 func (e *Executor) Execute(ctx context.Context, r Request) (Response, error) {
+	if r.Operation == StreamOperation {
+		return Response{}, ErrCommand
+	}
+	return e.execute(ctx, r, nil)
+}
+
+// ExecuteStream is local-only. Buffered command transports cannot invoke it.
+// A replay returns only the durable outcome; emitted output is never regenerated.
+func (e *Executor) ExecuteStream(ctx context.Context, r Request, emit StreamEmitter) (Response, error) {
+	r = snapshotStreamRequest(r)
+	if r.Operation != StreamOperation || emit == nil {
+		return Response{}, ErrCommand
+	}
+	return e.execute(ctx, r, emit)
+}
+func (e *Executor) execute(ctx context.Context, r Request, emit StreamEmitter) (Response, error) {
 	policy, ok := allowed[r.Operation]
-	if e == nil || e.adapter == nil || r.HostID != e.hostID || !identifier.MatchString(r.RequestID) || !identifier.MatchString(r.JobID) || !identifier.MatchString(r.IdempotencyKey) || r.Sequence == 0 || !ok {
+	if r.Operation == StreamOperation && emit != nil {
+		policy, ok = "model-inference", true
+	}
+	if r.Operation == StreamOperation {
+		raw, err := json.Marshal(r)
+		if err != nil {
+			return Response{}, ErrCommand
+		}
+		if _, err := ParseStreamCommand(raw); err != nil {
+			return Response{}, ErrCommand
+		}
+	}
+	if e == nil || e.adapter == nil || r.HostID != e.hostID || !identifier.MatchString(r.RequestID) || !identifier.MatchString(r.JobID) || !identifier.MatchString(r.IdempotencyKey) || r.Sequence == 0 || r.Sequence > maxSafeInteger || !ok {
 		return Response{}, ErrCommand
 	}
 	deadline, err := time.Parse(time.RFC3339Nano, r.Deadline)
 	expires, xerr := time.Parse(time.RFC3339Nano, r.Capability.ExpiresAt)
 	digest, derr := authorizationDigest(r)
 	maxParams := 32768
-	if r.Operation == "inference.chat" {
+	if r.Operation == "inference.chat" || r.Operation == StreamOperation {
 		maxParams = 524288
 	}
+	if r.Operation == StreamOperation {
+		maxParams = 550000
+	} // Typed params are bounded separately.
 	if r.Operation == PeerSourceOperation || r.Operation == PeerDestinationOperation {
 		maxParams = 768 << 10
 	}
@@ -214,7 +245,7 @@ func (e *Executor) Execute(ctx context.Context, r Request) (Response, error) {
 		if prior.Response.Status != "running" {
 			return prior.Response, nil
 		}
-		if r.Operation == "inference.chat" {
+		if r.Operation == "inference.chat" || r.Operation == StreamOperation {
 			code := "INDETERMINATE"
 			failed := Response{RequestID: r.RequestID, JobID: r.JobID, HostID: r.HostID, Sequence: r.Sequence, Status: "failed", ObservedAt: e.now().UTC().Format("2006-01-02T15:04:05.000Z"), ErrorCode: &code}
 			e.seen[r.IdempotencyKey] = entry{Digest: digest, Response: failed}
@@ -225,7 +256,7 @@ func (e *Executor) Execute(ctx context.Context, r Request) (Response, error) {
 			return failed, nil
 		}
 	}
-	if r.Operation == "inference.chat" && e.store != "" {
+	if r.Operation == StreamOperation || (r.Operation == "inference.chat" && e.store != "") {
 		if len(e.seen) >= maxReplayEntries {
 			return Response{}, ErrCommand
 		}
@@ -237,23 +268,71 @@ func (e *Executor) Execute(ctx context.Context, r Request) (Response, error) {
 			return Response{}, ErrCommand
 		}
 	}
-	runCtx, cancel := context.WithTimeout(ctx, deadline.Sub(e.now()))
+	duration := deadline.Sub(e.now())
+	if r.Operation == StreamOperation && expires.Sub(e.now()) < duration {
+		duration = expires.Sub(e.now())
+	}
+	runCtx, cancel := context.WithTimeout(ctx, duration)
 	defer cancel()
-	observation, runErr := e.adapter.Execute(runCtx, r.Operation, r.Params)
+	var observation any
+	var runErr error
+	if r.Operation == StreamOperation {
+		adapter, ok := e.adapter.(StreamAdapter)
+		if !ok {
+			runErr = ErrUnsupported
+		} else {
+			validator, _ := NewStreamValidator(r)
+			terminalKind := ""
+			var publishErr error
+			runErr = adapter.ExecuteStream(runCtx, r, func(ctx context.Context, raw []byte) error {
+				if publishErr != nil {
+					return publishErr
+				}
+				if err := ctx.Err(); err != nil {
+					publishErr = err
+					return err
+				}
+				event, err := validator.Accept(raw)
+				if err != nil {
+					publishErr = err
+					return err
+				}
+				if err = emit(ctx, raw); err != nil {
+					publishErr = err
+					return err
+				}
+				if event.Kind != "chunk" {
+					terminalKind = event.Kind
+				}
+				return nil
+			})
+			// Publication acceptance is the terminal linearization point. A later
+			// cancellation must not contradict a successfully published completion.
+			if terminalKind == "succeeded" {
+				runErr = nil
+			} else if publishErr != nil {
+				runErr = publishErr
+			} else if runErr == nil {
+				runErr = ErrStream
+			}
+		}
+	} else {
+		observation, runErr = e.adapter.Execute(runCtx, r.Operation, r.Params)
+	}
 	status := "succeeded"
 	complete := uint8(100)
 	var progress *uint8 = &complete
 	var code *string
-	if errors.Is(runErr, ErrServingActive) {
+	if errors.Is(runErr, ErrServingActive) && r.Operation != StreamOperation {
 		status = "running"
 		v := uint8(50)
 		progress = &v
-	} else if errors.Is(runErr, context.DeadlineExceeded) || errors.Is(runCtx.Err(), context.DeadlineExceeded) {
+	} else if errors.Is(runErr, context.DeadlineExceeded) || (r.Operation != StreamOperation && errors.Is(runCtx.Err(), context.DeadlineExceeded)) {
 		status = "failed"
 		progress = nil
 		v := "TIMEOUT"
 		code = &v
-	} else if errors.Is(runErr, context.Canceled) || errors.Is(runCtx.Err(), context.Canceled) {
+	} else if errors.Is(runErr, context.Canceled) || (r.Operation != StreamOperation && errors.Is(runCtx.Err(), context.Canceled)) {
 		status = "cancelled"
 		progress = nil
 		v := "CANCELLED"

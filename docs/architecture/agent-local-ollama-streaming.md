@@ -84,3 +84,143 @@ review a matching strict, versioned stream command/event contract in Go and TS:
 No live models, prompts, credentials, configuration, deployment, or hosted CI
 are involved in this slice. All new fixtures use synthetic model identities and
 content.
+
+## Local command dependency (implemented; no relay)
+
+The `command` package now exposes **separate local-only**
+`Executor.ExecuteStream` / `Registry.ExecuteStream` entry points for the explicit
+`inference.chat.stream` operation. The ordinary executor, registry dispatch,
+TS `parseCommandRequest`, agent polling transport and controller chat transport
+remain closed to this operation. Existing `inference.chat` stays buffered and
+unchanged. No endpoint, relay, routing, public SSE or live configuration is added.
+`packages/core/src/stream-command.ts` is the matching strict wire boundary, not a
+production dispatcher. Both implementations consume the synthetic shared
+`agents/host-agent/internal/command/testdata/stream-v1.json` fixture.
+
+### Version 1 command
+
+The existing request/capability envelope is retained, with a model-inference
+capability whose model target exactly matches nested `params.chat.modelId` and
+whose host matches the outer host. `params` has **exactly**:
+
+- `schemaVersion: 1`;
+- `chat`: the complete existing typed chat command parameters, including explicit
+  nullable temperature/max-tokens fields, exact request ID, provider ID, model ID,
+  canonical lower-case model name, base64 UTF-8 messages, request-byte limit and
+  upstream response-byte limit;
+- `upstreamFrameBytes: 65536`, the fixed accepted provider primitive's frame bound;
+- `maxEventBytes`: 1,024–131,072 serialized UTF-8 bytes;
+- `maxTotalEventBytes`: at least maxEventBytes, at most 1,048,576 bytes;
+- `maxEvents`: 1–4,096, including the terminal event.
+
+The model-name grammar intentionally uses the intersection of the existing TS
+and Go command grammars (ASCII alphanumeric first, then `._:/-`, length ≤256,
+nonempty path segments that do not start/end with a dot), with exact lower-case
+binding. It does not silently normalize a differently signed identity.
+The canonical authorization digest covers **all** command fields and limits,
+excluding only the digest itself. No additional approval bypass exists.
+Deadline and capability expiry bound execution; the earlier one wins. These
+interfaces do not authenticate a peer by themselves: only an authenticated
+transport may eventually call the local executor. Direct registry calls are
+internal adapter calls, not an authorization boundary.
+
+### Ordered public event protocol
+
+Each serialized event has exactly `schemaVersion`, `hostId`, `jobId`, `requestId`,
+`commandDigest`, `index`, `kind`, `chunk`, `errorCode`. Indices start at zero and
+increase by one. Every binding is exact. Kinds are:
+
+- `chunk`: public provider-neutral assistant delta, nullable finish reason null,
+  no usage, and null errorCode;
+- `succeeded`: the provider's final public chunk, finish reason stop/length and
+  exact summed usage; null errorCode;
+- `failed`: null chunk and fixed `STREAM_FAILED` errorCode;
+- `cancelled`: null chunk and fixed `CANCELLED` errorCode.
+
+Chunks allow only `id`, `object: "chat.completion.chunk"`, canonical `model`, one
+index-zero assistant `choices` entry, and terminal-only usage. No private provider
+metadata passes. Both individual usage counts **and their sum** must be
+nonnegative integers ≤9,007,199,254,740,991. Command sequence numbers have the same
+safe-integer ceiling; event indices are additionally bounded by maxEvents.
+Unknown/missing/duplicate keys, nonintegral numeric tokens, invalid UTF-8 or
+unpaired escaped surrogates, reordered/duplicate events, wrong bindings, extra
+terminals, overflow and serialized byte/count limit violations fail closed.
+A poisoned validator cannot later recover. The single-consumer validators'
+`Finish`/`finish` requires an actual terminal, not mere input exhaustion; callers
+must inspect terminal kind and must never equate a failed/cancelled terminal with
+success. Raw serialized byte lengths—not decoded text length—consume the limits.
+A transport frame delimiter is not part of this JSON-event byte count and must
+be separately bounded by the future framing layer.
+
+The registry verifies exact installed provider/model identity and loaded state,
+then retains its admission handle through provider execution **and synchronous
+publication of the terminal outcome**. It calls the accepted `ChatStream`; a
+provider terminal callback is withheld until that call returns successfully,
+which proves that primitive's valid terminal + clean EOF rule. Errors after a
+provisional terminal cannot publish success. No provider/output goroutines,
+unbounded queues, detached publication, or full completion accumulator are added.
+A concurrent inventory disappearance cannot erase an outstanding admission
+handle. Drain/unload remain blocked while publication is blocked.
+
+`StreamEmitter(ctx, bytes)` is a synchronous bounded-publication interface.
+Implementers must honor cancellation when blocked and may not retain an
+unbounded backlog. An arbitrary uncooperative callback cannot be forcibly
+interrupted safely. Publication errors are final; they never trigger another
+publication attempt or a command requeue. On cancellation, no fresh background
+context is created to force a terminal onto an unavailable sink: a blocked
+publisher exits with context error, the executor records cancelled/timeout, and
+an event consumer with no delivered terminal must fail incomplete. Likewise,
+pre-admission/size/publication failures can end without a deliverable terminal;
+the local buffered outcome is authoritative for cleanup, not substitute chunks.
+A terminal publication returning nil is its acceptance/linearization point;
+cancellation immediately afterward cannot contradict an accepted success.
+
+The executor reserves an in-flight replay entry before invoking a stream,
+persisting it first when a durable store is configured. Completed replays return
+only their buffered final outcome, **never** stream output. Interrupted durable
+`running` markers become `INDETERMINATE` without contacting the provider. A
+stream's active-admission rejection is a failed final outcome, not the legacy
+lifecycle `running` response that would requeue work. Chunks are never stored as
+`CommandResponse` observations. Event byte/count exhaustion, sink failure and
+provider failure never regenerate already emitted output.
+
+### Exact remaining transport dependency
+
+Before enabling any production operation, independently review this local slice
+and add all of the following in a separate transport change:
+
+1. An authenticated outbound agent event channel with exact authenticated host /
+   command binding and strict Go↔TS raw parsers; explicitly authorize the new
+   operation in only the intended controller and agent transport paths.
+2. A bounded framing and publication adapter implementing synchronous
+   backpressure and cancellation/deadline propagation, disconnect cleanup,
+   sink acceptance semantics and no detached readers or publishers.
+3. Controller admission/lease ownership through the final delivery outcome,
+   coordination with the agent's admission handle, and cancellation routing.
+4. Durable reconnect/replay behavior that distinguishes cached command outcome
+   from unreplayable/interrupted output, never regenerates the request and never
+   treats a buffered result as streaming chunks. No chunk replay log exists here.
+5. Public SSE mapping that emits `[DONE]` **only** after a strictly validated
+   `succeeded` event, never EOF, disconnect, timeout, failure or cancelled outcome;
+   end-to-end synthetic tests for delivery loss, restart and slow consumers.
+
+No production-streaming claim is made by this dependency.
+
+### Review hardening: raw UTF-8 and ownership
+
+Both raw stream command and event parsers explicitly reject a leading UTF-8 BOM;
+TS must not rely on TextDecoder's default BOM stripping. Shared raw rejection
+fixtures exercise both boundaries in Go and TS. UTF-8 BOM inside allowed string
+content is ordinary content, not a document prefix.
+
+Go stream executor, registry and validator entry points snapshot `Request.Params`
+and the nullable capability `ModelID` pointer before validation/ownership. Callers
+must not mutate input concurrently with the entry snapshot itself. Subsequent
+caller mutations do not alter the owned authorization or validation state; tests
+mutate only after the snapshot, synchronously, without data races. This mirrors
+the TS validator's private request clone.
+
+Emitter byte slices are borrowed, read-only for the synchronous call. A publisher
+that needs retention must make its own bounded copy, must not mutate supplied
+bytes, and must not create concurrent/unbounded retention. No buffer reuse or
+ownership transfer is implied by returning nil.

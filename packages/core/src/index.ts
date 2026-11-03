@@ -23,3 +23,5 @@ export * from './custom-command-plan.js';
 export * from './peer-transfer.js';
 export * from './artifact-cache.js';
 export * from './cache-eviction.js';
+
+export * from "./stream-command.js";

@@ -579,8 +579,10 @@ func (r *Registry) syncRunning(models []provider.RunningModel) {
 	for key := range r.running {
 		if _, ok := present[key]; !ok {
 			delete(r.running, key)
-			delete(r.draining, key)
-			delete(r.active, key)
+			if len(r.active[key]) == 0 {
+				delete(r.draining, key)
+			}
+			// An observation cannot release an in-flight execution lease.
 		}
 	}
 	for key := range present {
