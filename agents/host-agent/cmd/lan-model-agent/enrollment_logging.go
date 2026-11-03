@@ -59,7 +59,16 @@ func saveEnrollmentDiagnostic(stateDir string, entry service.LogEntry) error {
 	if err != nil {
 		return fmt.Errorf("enrollment diagnostic failed")
 	}
-	file, err := os.CreateTemp(stateDir, ".enrollment-status-*")
+	return saveDiagnostic(stateDir, "enrollment-status.json", raw)
+}
+
+// saveDiagnostic replaces one bounded, allowlisted status record in the protected
+// state tree. Callers supply only locally constructed JSON, never provider data.
+func saveDiagnostic(stateDir, filename string, raw []byte) error {
+	if privatefile.Directory(stateDir) != nil {
+		return privatefile.ErrPermissions
+	}
+	file, err := os.CreateTemp(stateDir, ".diagnostic-*")
 	if err != nil {
 		return fmt.Errorf("enrollment diagnostic failed")
 	}
@@ -75,7 +84,7 @@ func saveEnrollmentDiagnostic(stateDir string, entry service.LogEntry) error {
 	if file.Sync() != nil || file.Close() != nil {
 		return fmt.Errorf("enrollment diagnostic failed")
 	}
-	if os.Rename(name, filepath.Join(stateDir, "enrollment-status.json")) != nil {
+	if os.Rename(name, filepath.Join(stateDir, filename)) != nil {
 		return fmt.Errorf("enrollment diagnostic failed")
 	}
 	return nil

@@ -190,3 +190,53 @@ func TestDecodeInstalledModelsDenseLimitAndDeterminism(t *testing.T) {
 		t.Fatal("model ID is not deterministic/provider-scoped")
 	}
 }
+
+// Synthetic current-api fixture: no operator inventory names or digests.
+// Ollama api/types.go ListModelResponse.Capabilities and ModelDetails now
+// include these optional fields; older responses remain valid.
+func currentTagJSON() string {
+	value := tagJSON("ollama.com/example/synthetic:latest", digestA, "2026-01-01T00:00:00Z")
+	value = strings.Replace(value, `"parent_model":""`, `"context_length":262144,"embedding_length":3840,"parent_model":""`, 1)
+	return strings.TrimSuffix(value, "}") + `,"capabilities":["completion","tools","thinking"]}`
+}
+
+func TestCurrentTagsOptionalMetadataAndStrictValidation(t *testing.T) {
+	legacy := tagJSON("ollama.com/example/synthetic:latest", digestA, "2026-01-01T00:00:00Z")
+	for _, model := range []string{
+		legacy,
+		strings.TrimSuffix(legacy, "}") + `,"capabilities":["completion"]}`,
+		strings.Replace(legacy, `"parent_model":""`, `"parent_model":"","context_length":262144`, 1),
+		strings.Replace(legacy, `"parent_model":""`, `"parent_model":"","embedding_length":3840`, 1),
+	} {
+		if _, err := decodeInstalledModels([]byte(`{"models":[`+model+`]}`), "ollama"); err != nil {
+			t.Fatalf("independent optional field failed: %v", err)
+		}
+	}
+	valid := currentTagJSON()
+	models, err := decodeInstalledModels([]byte(`{"models":[`+valid+`]}`), "ollama")
+	if err != nil || len(models) != 1 || models[0].CanonicalName != "ollama.com/example/synthetic:latest" {
+		t.Fatalf("current tags decode failed: %v", err)
+	}
+	for _, mutation := range []struct{ old, replacement string }{
+		{`"context_length":262144`, `"context_length":-1`},
+		{`"context_length":262144`, `"context_length":10000001`},
+		{`"context_length":262144`, `"context_length":null`},
+		{`"context_length":262144`, `"context_length":"262144"`},
+		{`"context_length":262144`, `"context_length":1.5`},
+		{`"context_length":262144`, `"context_length":262144,"context_length":262144`},
+		{`"embedding_length":3840`, `"embedding_length":true`},
+		{`"embedding_length":3840`, `"embedding_length":18446744073709551616`},
+		{`"embedding_length":3840`, `"embedding_length":3840,"embedding_length":3840`},
+		{`"capabilities":["completion","tools","thinking"]`, `"capabilities":null`},
+		{`"capabilities":["completion","tools","thinking"]`, `"capabilities":["tools","TOOLS"]`},
+		{`"capabilities":["completion","tools","thinking"]`, `"capabilities":[1]`},
+		{`"capabilities":["completion","tools","thinking"]`, `"capabilities":["bad\nvalue"]`},
+		{`"capabilities":["completion","tools","thinking"]`, `"capabilities":[],"capabilities":[]`},
+		{`"capabilities":["completion","tools","thinking"]`, `"capabilities":[` + strings.Repeat(`"tools",`, 32) + `"thinking"]`},
+	} {
+		body := `{"models":[` + strings.Replace(valid, mutation.old, mutation.replacement, 1) + `]}`
+		if _, err := decodeInstalledModels([]byte(body), "ollama"); err != ErrInvalidListResponse {
+			t.Fatalf("invalid optional metadata accepted: %s", mutation.replacement)
+		}
+	}
+}

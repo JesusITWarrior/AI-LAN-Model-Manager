@@ -48,6 +48,7 @@ type snapshotSource interface{ LatestSnapshot() (snapshot.State, bool) }
 type fleetCollector struct {
 	source snapshotSource
 	ollama *ollama.Client
+	report *inventoryReporter
 }
 
 func (c fleetCollector) Collect(ctx context.Context) (fleet.Snapshot, error) {
@@ -62,8 +63,16 @@ func (c fleetCollector) Collect(ctx context.Context) (fleet.Snapshot, error) {
 	if c.ollama != nil {
 		probe, probeErr := c.ollama.Probe(ctx)
 		models, modelsErr := c.ollama.ListInstalled(ctx)
-		if probeErr == nil && modelsErr == nil {
+		// A failed list must not hide a successful provider probe. Never send
+		// models without their validated provider, or retain stale inventory.
+		if probeErr == nil {
+			if modelsErr != nil {
+				models = nil
+			}
 			result.Providers, result.Models = fleet.MapInventory([]provider.ProviderProbe{probe}, models, time.Now().UTC().Format("2006-01-02T15:04:05.000Z"))
+		}
+		if c.report != nil {
+			c.report.record(probeErr, modelsErr)
 		}
 	}
 	return result, nil
@@ -158,6 +167,7 @@ func runHost(ctx context.Context) int {
 }
 
 func maintainFleetSessions(ctx context.Context, certDir, stateDir string, host *service.Service, ollamaClient *ollama.Client) {
+	reporter := &inventoryReporter{stateDir: stateDir}
 	for ctx.Err() == nil {
 		// Rotation is attempted before every session generation. A durable pending
 		// CSR allows this call to recover when the prior process was interrupted
@@ -186,7 +196,7 @@ func maintainFleetSessions(ctx context.Context, certDir, stateDir string, host *
 		workers.Add(1)
 		go func() {
 			defer workers.Done()
-			_ = client.Run(sessionCtx, fleetCollector{source: host, ollama: ollamaClient}, runtime.GOOS, "")
+			_ = client.Run(sessionCtx, fleetCollector{source: host, ollama: ollamaClient, report: reporter}, runtime.GOOS, "")
 		}()
 		if ollamaClient != nil {
 			registry := command.NewRegistry(time.Now)

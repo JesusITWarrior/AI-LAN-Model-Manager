@@ -399,6 +399,10 @@ func decodeTagModel(decoder *json.Decoder) (tagModel, error) {
 			}
 		case "digest":
 			err = decoder.Decode(&model.digest)
+		case "capabilities":
+			// Current /api/tags includes capabilities. Validate the bounded
+			// metadata without inferring fleet capabilities from it.
+			err = decodeCapabilities(decoder)
 		case "details":
 			model.details, err = decodeTagDetails(decoder)
 		default:
@@ -408,7 +412,7 @@ func decodeTagModel(decoder *json.Decoder) (tagModel, error) {
 			return tagModel{}, ErrInvalidListResponse
 		}
 	}
-	if token, err := decoder.Token(); err != nil || token != json.Delim('}') || len(seen) != 6 {
+	if token, err := decoder.Token(); err != nil || token != json.Delim('}') {
 		return tagModel{}, ErrInvalidListResponse
 	}
 	for _, key := range []string{"name", "model", "modified_at", "size", "digest", "details"} {
@@ -444,6 +448,20 @@ func decodeTagDetails(decoder *json.Decoder) (tagDetails, error) {
 			err = decoder.Decode(&details.parameter)
 		case "quantization_level":
 			err = decoder.Decode(&details.quantization)
+		case "context_length", "embedding_length":
+			// Optional nonnegative integer dimensions in current ModelDetails.
+			// Keep the same bounded context limit used by /api/ps.
+			var token json.Token
+			token, err = decoder.Token()
+			if number, ok := token.(json.Number); err == nil && ok {
+				var value uint64
+				value, err = strconv.ParseUint(string(number), 10, 64)
+				if value > MaximumContextLength {
+					err = ErrInvalidListResponse
+				}
+			} else {
+				err = ErrInvalidListResponse
+			}
 		default:
 			return tagDetails{}, ErrInvalidListResponse
 		}
@@ -451,7 +469,7 @@ func decodeTagDetails(decoder *json.Decoder) (tagDetails, error) {
 			return tagDetails{}, ErrInvalidListResponse
 		}
 	}
-	if token, err := decoder.Token(); err != nil || token != json.Delim('}') || len(seen) != 6 {
+	if token, err := decoder.Token(); err != nil || token != json.Delim('}') {
 		return tagDetails{}, ErrInvalidListResponse
 	}
 	for _, key := range []string{"parent_model", "format", "family", "families", "parameter_size", "quantization_level"} {
@@ -460,6 +478,27 @@ func decodeTagDetails(decoder *json.Decoder) (tagDetails, error) {
 		}
 	}
 	return details, nil
+}
+
+// decodeCapabilities accepts the current optional tags array, not arbitrary JSON.
+// Tokens remain metadata only; unknown fields, duplicates, and malformed values
+// still fail closed. New capability names do not grant any command authority.
+func decodeCapabilities(decoder *json.Decoder) error {
+	if token, err := decoder.Token(); err != nil || token != json.Delim('[') {
+		return ErrInvalidListResponse
+	}
+	seen := make(map[string]bool)
+	for decoder.More() {
+		value, err := stringToken(decoder)
+		if err != nil || !validMetadata(value) || seen[strings.ToLower(value)] || len(seen) >= 32 {
+			return ErrInvalidListResponse
+		}
+		seen[strings.ToLower(value)] = true
+	}
+	if token, err := decoder.Token(); err != nil || token != json.Delim(']') {
+		return ErrInvalidListResponse
+	}
+	return nil
 }
 
 func decodeFamilies(decoder *json.Decoder) ([]string, error) {

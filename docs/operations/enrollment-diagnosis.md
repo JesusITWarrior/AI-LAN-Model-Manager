@@ -189,3 +189,31 @@ method failures and mismatched readback. The latter is not evidence that a real
 SCM configuration was changed correctly. Linux installer tests skip that native
 fixture, and Windows cross-compilation is not native execution or installed
 virtual-account acceptance.
+
+## Host online but Ollama inventory missing
+
+Enrollment/liveness success does not imply provider-inventory success. Check the
+agent service's `LANMM_OLLAMA_ENDPOINT` and the read-only `/api/version` and
+`/api/tags` endpoints separately. Never include private model names or raw
+provider responses in tracked diagnostics or issue fixtures.
+
+The protected state directory's `inventory-status.json` holds one latest
+**outcome transition** (not a heartbeat freshness marker): `status`, `probe`,
+`list`, and `observedAt`. Structured logs emit the same bounded reason codes:
+`ok`, `canceled`, `timeout`, `http_status`, `response_too_large`,
+`invalid_response`, or `request_failed`. Repeated identical outcomes do not
+append logs or rewrite the file; a ready transition clears earlier failures.
+No endpoint, model name, metadata, raw response, or transport error is retained.
+A successful version probe remains visible when inventory parsing fails; models
+are sent only with a successfully probed provider. Failed lists do not reuse
+stale models.
+
+Ollama `/api/tags` accepts the optional `capabilities` array and the optional
+`details.context_length` / `details.embedding_length` integer fields documented
+in upstream [`api/types.go`](https://github.com/ollama/ollama/blob/main/api/types.go)
+(`ListModelResponse` and `ModelDetails`). These fields are bounded and validated,
+not promoted to fleet capability claims. Legacy responses remain valid. Unknown
+fields, duplicate keys, invalid dimensions, malformed capability arrays,
+oversized bodies, and invalid model identities still fail closed. Registry-style
+synthetic names such as `ollama.com/example/synthetic:latest` are supported.
+This does not qualify every remote-model or manifest-runner response variant.
