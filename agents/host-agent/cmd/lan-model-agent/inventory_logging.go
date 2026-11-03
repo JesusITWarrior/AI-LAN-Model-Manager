@@ -15,9 +15,9 @@ import (
 // SCM operators have diagnostics even when stderr is not captured. Never log
 // endpoints, response bodies, names, arbitrary errors, or inventory metadata.
 type inventoryReporter struct {
-	stateDir            string
-	lastProbe, lastList string
-	initialized         bool
+	stateDir                         string
+	lastProbe, lastList, lastRunning string
+	initialized                      bool
 }
 
 func inventoryReason(err error) string {
@@ -39,25 +39,29 @@ func inventoryReason(err error) string {
 	}
 }
 
-func (r *inventoryReporter) record(probeErr, listErr error) {
+func (r *inventoryReporter) record(probeErr, listErr error, runningErr error) {
 	probe, list := inventoryReason(probeErr), inventoryReason(listErr)
-	if r.initialized && r.lastProbe == probe && r.lastList == list {
+	running := "ok"
+	if runningErr != nil {
+		running = "runtime_unavailable"
+	}
+	if r.initialized && r.lastProbe == probe && r.lastList == list && r.lastRunning == running {
 		return
 	}
-	r.initialized, r.lastProbe, r.lastList = true, probe, list
+	r.initialized, r.lastProbe, r.lastList, r.lastRunning = true, probe, list, running
 	status := "ready"
-	if probe != "ok" || list != "ok" {
+	if probe != "ok" || list != "ok" || running != "ok" {
 		status = "degraded"
 	}
-	raw, _ := json.Marshal(map[string]string{"status": status, "probe": probe, "list": list, "observedAt": time.Now().UTC().Format(time.RFC3339Nano)})
+	raw, _ := json.Marshal(map[string]string{"status": status, "probe": probe, "list": list, "running": running, "observedAt": time.Now().UTC().Format(time.RFC3339Nano)})
 	if saveDiagnostic(r.stateDir, "inventory-status.json", raw) != nil {
 		// Retry persistence next observation, without including filesystem details.
 		r.initialized = false
 		slog.Warn("host service inventory diagnostic unavailable")
 	}
 	if status == "ready" {
-		slog.Info("host service inventory ready", "probe", probe, "list", list)
+		slog.Info("host service inventory ready", "probe", probe, "list", list, "running", running)
 	} else {
-		slog.Warn("host service inventory degraded", "probe", probe, "list", list)
+		slog.Warn("host service inventory degraded", "probe", probe, "list", list, "running", running)
 	}
 }

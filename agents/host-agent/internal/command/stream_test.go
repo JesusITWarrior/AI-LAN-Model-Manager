@@ -254,6 +254,14 @@ func TestStreamPublicationCancellationDrainAndRelease(t *testing.T) {
 		done <- registry.ExecuteStream(ctx, r, func(ctx context.Context, _ []byte) error { close(entered); <-ctx.Done(); return ctx.Err() })
 	}()
 	<-entered
+	registry.mu.Lock()
+	registry.hostID = "synthetic-host"
+	registry.mu.Unlock()
+	_, _, installed := observationFixture()
+	observed, _ := registry.ObserveRuntime(context.Background(), "synthetic-host", "synthetic-provider", installed)
+	if len(observed) != 1 || observed[0].ActiveRequests != 1 {
+		t.Fatal("active stream lost from observation", observed)
+	}
 	if _, err := registry.runDrain(context.Background(), "synthetic-provider", "synthetic-model:fixture"); !errors.Is(err, ErrServingActive) {
 		t.Fatal("drain released before publisher outcome", err)
 	}
@@ -279,6 +287,10 @@ func TestStreamPublicationCancellationDrainAndRelease(t *testing.T) {
 	registry.mu.Unlock()
 	if active != 0 {
 		t.Fatal("lease leaked")
+	}
+	observed, _ = registry.ObserveRuntime(context.Background(), "synthetic-host", "synthetic-provider", installed)
+	if len(observed) != 1 || observed[0].ActiveRequests != 0 || observed[0].RuntimeState != "draining" {
+		t.Fatal("cancellation projection", observed)
 	}
 }
 func TestStreamTerminalOwnershipAndReplay(t *testing.T) {
@@ -327,6 +339,12 @@ func TestStreamTerminalOwnershipAndReplay(t *testing.T) {
 			want := "failed"
 			if mode == "success" || mode == "cancel-at-terminal" {
 				want = "succeeded"
+			}
+			registry.mu.Lock()
+			remaining := len(registry.active[modelKey("synthetic-provider", "synthetic-model:fixture")])
+			registry.mu.Unlock()
+			if remaining != 0 {
+				t.Fatal("terminal leaked admission")
 			}
 			if response.Status != want {
 				t.Fatalf("status %s want %s", response.Status, want)

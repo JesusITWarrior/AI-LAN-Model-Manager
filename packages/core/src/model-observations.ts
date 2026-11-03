@@ -157,7 +157,8 @@ export function parseInstalledModelObservation(input: unknown): ParseResult<Inst
   if (!ARTIFACT_STATES.has(artifactState)) return fail("ERR_ARTIFACT_STATE");
   if (!RUNTIME_STATES.has(runtimeState)) return fail("ERR_RUNTIME_STATE");
   if (typeof activeRequests !== "number" || !Number.isSafeInteger(activeRequests) || activeRequests < 0 || activeRequests > 1_000_000) return fail("ERR_ACTIVE_REQUESTS");
-  if (activeRequests > 0 && runtimeState !== "serving" && runtimeState !== "draining") return fail("ERR_RUNTIME_ACTIVITY");
+  // Runtime evidence may be unavailable while the host still owns in-flight handles.
+  if (activeRequests > 0 && runtimeState !== "serving" && runtimeState !== "draining" && runtimeState !== "unknown") return fail("ERR_RUNTIME_ACTIVITY");
   const rawSize = parsed.value.sizeBytes?.value as unknown;
   const size = rawSize === null ? { ok: true as const, value: null } : parseByteAmount(rawSize);
   if (!size.ok) return fail("ERR_SIZE_BYTES");

@@ -53,6 +53,7 @@ type fleetCollector struct {
 	source    snapshotSource
 	ollama    *ollama.Client
 	report    *inventoryReporter
+	registry  *command.Registry
 }
 
 func (c fleetCollector) Collect(ctx context.Context) (fleet.Snapshot, error) {
@@ -67,16 +68,34 @@ func (c fleetCollector) Collect(ctx context.Context) (fleet.Snapshot, error) {
 	if c.ollama != nil {
 		probe, probeErr := c.ollama.Probe(ctx)
 		models, modelsErr := c.ollama.ListInstalled(ctx)
+		runtimeErr := command.ErrRuntimeObservation
+		result.Idle = false
 		// A failed list must not hide a successful provider probe. Never send
 		// models without their validated provider, or retain stale inventory.
 		if probeErr == nil {
 			if modelsErr != nil {
 				models = nil
 			}
-			result.Providers, result.Models = fleet.MapInventory([]provider.ProviderProbe{probe}, models, time.Now().UTC().Format("2006-01-02T15:04:05.000Z"))
+			providers, mapped := fleet.MapInventory([]provider.ProviderProbe{probe}, models, time.Now().UTC().Format("2006-01-02T15:04:05.000Z"))
+			if modelsErr == nil {
+				var runtimeRows []command.RuntimeObservation
+				runtimeRows, runtimeErr = c.registry.ObserveRuntime(ctx, state.Record.HostID, probe.ProviderID, models)
+				if runtimeRows == nil {
+					mapped = []fleet.InstalledModelObservation{}
+				} else {
+					result.Idle = runtimeErr == nil
+					for i, row := range runtimeRows {
+						mapped[i].RuntimeState, mapped[i].ActiveRequests = row.RuntimeState, row.ActiveRequests
+						if row.ActiveRequests > 0 || row.RuntimeState == "unknown" || row.RuntimeState == "draining" {
+							result.Idle = false
+						}
+					}
+				}
+			}
+			result.Providers, result.Models = providers, mapped
 		}
 		if c.report != nil {
-			c.report.record(probeErr, modelsErr)
+			c.report.record(probeErr, modelsErr, runtimeErr)
 		}
 	}
 	if c.resources != nil {
@@ -181,6 +200,10 @@ func runHost(ctx context.Context) int {
 
 func maintainFleetSessions(ctx context.Context, certDir, stateDir string, host *service.Service, ollamaClient *ollama.Client) {
 	reporter := &inventoryReporter{stateDir: stateDir}
+	registry := command.NewHostRegistry(host.HostID(), time.Now)
+	if ollamaClient != nil {
+		registry.RegisterOllama("ollama-local", ollamaClient)
+	}
 	for ctx.Err() == nil {
 		// Rotation is attempted before every session generation. A durable pending
 		// CSR allows this call to recover when the prior process was interrupted
@@ -209,11 +232,9 @@ func maintainFleetSessions(ctx context.Context, certDir, stateDir string, host *
 		workers.Add(1)
 		go func() {
 			defer workers.Done()
-			_ = client.Run(sessionCtx, fleetCollector{source: host, resources: host, ollama: ollamaClient, report: reporter}, runtime.GOOS, "")
+			_ = client.Run(sessionCtx, fleetCollector{source: host, resources: host, ollama: ollamaClient, report: reporter, registry: registry}, runtime.GOOS, "")
 		}()
 		if ollamaClient != nil {
-			registry := command.NewRegistry(time.Now)
-			registry.RegisterOllama("ollama-local", ollamaClient)
 			if executor, e := command.NewPersistent(host.HostID(), registry, time.Now, filepath.Join(stateDir, "command-replay.json")); e == nil {
 				workers.Add(1)
 				go func() { defer workers.Done(); _ = client.RunCommands(sessionCtx, executor) }()

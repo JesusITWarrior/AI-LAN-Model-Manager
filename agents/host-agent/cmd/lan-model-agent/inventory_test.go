@@ -10,15 +10,24 @@ import (
 	"path/filepath"
 	"strings"
 	"testing"
+	"time"
 
+	"github.com/JesusITWarrior/AI-LAN-Model-Manager/agents/host-agent/internal/command"
 	"github.com/JesusITWarrior/AI-LAN-Model-Manager/agents/host-agent/internal/fleet"
+	"github.com/JesusITWarrior/AI-LAN-Model-Manager/agents/host-agent/internal/provider"
 	"github.com/JesusITWarrior/AI-LAN-Model-Manager/agents/host-agent/internal/provider/ollama"
 	"github.com/JesusITWarrior/AI-LAN-Model-Manager/agents/host-agent/internal/snapshot"
 )
 
+type inventoryHTTPFunc func(*http.Request) (*http.Response, error)
+
+func (f inventoryHTTPFunc) Do(r *http.Request) (*http.Response, error) { return f(r) }
+
 type inventorySnapshotSource struct{}
 
-func (inventorySnapshotSource) LatestSnapshot() (snapshot.State, bool) { return snapshot.State{}, true }
+func (inventorySnapshotSource) LatestSnapshot() (snapshot.State, bool) {
+	return snapshot.State{Record: snapshot.Record{HostID: "synthetic-host"}}, true
+}
 
 func TestFleetCollectorInventoryAndRedactedDiagnostics(t *testing.T) {
 	for _, scenario := range []struct {
@@ -31,7 +40,7 @@ func TestFleetCollectorInventoryAndRedactedDiagnostics(t *testing.T) {
 		{"probe_failed", `{"secret":"never-log-this"}`, `{"models":[]}`, 0, 0, "invalid_response", "ok"},
 	} {
 		t.Run(scenario.name, func(t *testing.T) {
-			server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+			handler := http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 				if r.Method != "GET" {
 					t.Error("non-read-only request")
 				}
@@ -39,18 +48,26 @@ func TestFleetCollectorInventoryAndRedactedDiagnostics(t *testing.T) {
 					_, _ = w.Write([]byte(scenario.version))
 				} else if r.URL.Path == "/api/tags" {
 					_, _ = w.Write([]byte(scenario.tags))
+				} else if r.URL.Path == "/api/ps" {
+					_, _ = w.Write([]byte(`{"models":[]}`))
 				} else {
 					t.Error("unexpected endpoint")
 				}
-			}))
-			defer server.Close()
-			client, err := ollama.New(ollama.Config{ProviderID: "ollama-local", Endpoint: server.URL})
+			})
+			const endpoint = "http://127.0.0.1:11434"
+			client, err := ollama.NewWithDependencies(ollama.Config{ProviderID: "ollama-local", Endpoint: endpoint}, inventoryHTTPFunc(func(r *http.Request) (*http.Response, error) {
+				recorder := httptest.NewRecorder()
+				handler.ServeHTTP(recorder, r)
+				return recorder.Result(), nil
+			}), provider.SystemClock{})
 			if err != nil {
 				t.Fatal(err)
 			}
 			dir := t.TempDir()
 			reporter := &inventoryReporter{stateDir: dir}
-			collector := fleetCollector{source: inventorySnapshotSource{}, ollama: client, report: reporter}
+			registry := command.NewHostRegistry("synthetic-host", time.Now)
+			registry.RegisterOllama("ollama-local", client)
+			collector := fleetCollector{registry: registry, source: inventorySnapshotSource{}, ollama: client, report: reporter}
 			result, err := collector.Collect(context.Background())
 			if err != nil || providerCount(result) != scenario.providers || modelCount(result) != scenario.models {
 				t.Fatalf("mapping counts: providers=%d models=%d err=%v", providerCount(result), modelCount(result), err)
@@ -64,7 +81,7 @@ func TestFleetCollectorInventoryAndRedactedDiagnostics(t *testing.T) {
 			if json.Unmarshal(raw, &record) != nil || record["probe"] != scenario.probe || record["list"] != scenario.list {
 				t.Fatalf("diagnostic %s", raw)
 			}
-			for _, secret := range []string{"never-log-this", server.URL, "synthetic"} {
+			for _, secret := range []string{"never-log-this", endpoint, "synthetic"} {
 				if strings.Contains(string(raw), secret) {
 					t.Fatal("provider data leaked")
 				}
@@ -74,7 +91,7 @@ func TestFleetCollectorInventoryAndRedactedDiagnostics(t *testing.T) {
 			if string(raw) != string(again) {
 				t.Fatal("unchanged outcome rewritten")
 			}
-			reporter.record(nil, nil)
+			reporter.record(nil, nil, nil)
 			raw, _ = os.ReadFile(path)
 			if strings.Contains(string(raw), "invalid_response") {
 				t.Fatal("stale failure retained")
@@ -95,7 +112,9 @@ func TestReadOnlyNativeOllamaInventory(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	result, err := (fleetCollector{source: inventorySnapshotSource{}, ollama: client}).Collect(context.Background())
+	registry := command.NewHostRegistry("synthetic-host", time.Now)
+	registry.RegisterOllama("ollama-local", client)
+	result, err := (fleetCollector{registry: registry, source: inventorySnapshotSource{}, ollama: client}).Collect(context.Background())
 	if err != nil || providerCount(result) != 1 || modelCount(result) == 0 {
 		t.Fatalf("read-only collection failed: providers=%d models=%d err=%v", providerCount(result), modelCount(result), err)
 	}

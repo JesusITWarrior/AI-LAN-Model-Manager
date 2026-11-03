@@ -36,7 +36,8 @@ type InstalledModelObservation struct {
 
 // MapInventory converts the existing provider-neutral probe and installed model
 // records into the exact shared fleet wire observations. It intentionally maps
-// no credentials, provider-specific payloads, or inferred capabilities.
+// no credentials, provider-specific payloads, or inferred capabilities. Runtime
+// defaults to unknown; callers must overlay validated running/admission evidence.
 func MapInventory(probes []provider.ProviderProbe, models []provider.InstalledModel, observedAt string) ([]ProviderObservation, []InstalledModelObservation) {
 	providers := make([]ProviderObservation, 0, len(probes))
 	for _, probe := range probes {
@@ -58,7 +59,7 @@ func MapInventory(probes []provider.ProviderProbe, models []provider.InstalledMo
 			value := model.SizeBytes
 			size = &value
 		}
-		installed = append(installed, InstalledModelObservation{ModelID: model.ModelID, ProviderID: model.ProviderID, DisplayName: model.DisplayName, ArtifactState: "installed", RuntimeState: "unloaded", SizeBytes: size, Capability: ModelCapability{Modalities: []string{}}, ObservedAt: observedAt})
+		installed = append(installed, InstalledModelObservation{ModelID: model.ModelID, ProviderID: model.ProviderID, DisplayName: model.DisplayName, ArtifactState: "installed", RuntimeState: "unknown", SizeBytes: size, Capability: ModelCapability{Modalities: []string{}}, ObservedAt: observedAt})
 	}
 	return providers, installed
 }

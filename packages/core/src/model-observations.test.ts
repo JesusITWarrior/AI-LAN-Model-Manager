@@ -36,9 +36,11 @@ test("accepts model state enums and field bounds", () => {
 });
 
 test("enforces active request/runtime invariants and nested validation", () => {
-  for (const runtimeState of ["unloaded", "loading", "loaded-idle", "unloading", "failed", "unknown"]) assert.equal(parseInstalledModelObservation(model({ runtimeState, activeRequests: 1 })).ok, false);
+  for (const runtimeState of ["unloaded", "loading", "loaded-idle", "unloading", "failed"]) assert.equal(parseInstalledModelObservation(model({ runtimeState, activeRequests: 1 })).ok, false);
   assert.equal(parseInstalledModelObservation(model({ runtimeState: "serving", activeRequests: 1 })).ok, true);
   assert.equal(parseInstalledModelObservation(model({ runtimeState: "draining", activeRequests: 1 })).ok, true);
+  assert.equal(parseInstalledModelObservation(model({ runtimeState: "unknown", activeRequests: 1 })).ok, true);
+  assert.equal(parseInstalledModelObservation(model({ runtimeState: "unknown", activeRequests: 1_000_001 })).ok, false);
   for (const value of [model({ modelId: "bad/id" }), model({ activeRequests: -1 }), model({ activeRequests: 1_000_001 }), model({ sizeBytes: -1 }), model({ pinned: "yes" }), model({ capability: capability({ tools: 1 }) })]) assert.equal(parseInstalledModelObservation(value).ok, false);
 });
 

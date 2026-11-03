@@ -7,3 +7,28 @@ test("stale/equal and wrong-address heartbeats fail without mutation",()=>{const
 test("revoked certificate and mismatched payload sequence are denied",()=>{const c=setup();try{const p={platform:"linux",protocolMinor:0,idle:true,observedAt:NOW,sequence:2,providers:[],models:[]};c.set(envelope(1,p));assert.equal(c.service.ingest({},"192.168.1.20").ok,false);c.certs.revoke(fp,NOW);c.set(envelope(1,{...p,sequence:1}));const denied=c.service.ingest({},"192.168.1.20");assert.equal(denied.ok,false);if(!denied.ok)assert.equal(denied.error,"ERR_HOST_REVOKED");}finally{c.db.close();}});
 test("newer empty inventory removes older providers and models",()=>{const c=setup();try{const p={platform:"linux",protocolMinor:0,idle:true,observedAt:NOW,sequence:1,providers:[provider()],models:[model()]};c.set(envelope(1,p));assert.equal(c.service.ingest({},"192.168.1.20").ok,true);const later="2026-09-28T05:01:00.000Z";c.set(envelope(2,{...p,observedAt:later,sequence:2,providers:[],models:[]}));assert.equal(c.service.ingest({},"192.168.1.20").ok,true);assert.equal(c.repos.providers.listByHost("agent-1").length,0);assert.equal(c.repos.models.listByHost("agent-1").length,0);}finally{c.db.close();}});
 test("migration9 records liveness",()=>{assert.ok(CONTROLLER_MIGRATIONS.length>=9);assert.equal(CONTROLLER_MIGRATIONS[8]!.name,"private-plan-fleet-liveness-v1");});
+
+test("runtime heartbeats retain serving, admission, and drain safety through reconciliation", () => {
+ const c = setup();
+ try {
+  const states = [
+   { runtimeState: "serving", activeRequests: 0, idle: true },
+   { runtimeState: "serving", activeRequests: 1, idle: false },
+   { runtimeState: "unknown", activeRequests: 1, idle: false },
+   { runtimeState: "draining", activeRequests: 1, idle: false },
+   { runtimeState: "draining", activeRequests: 0, idle: false },
+   { runtimeState: "unloaded", activeRequests: 0, idle: true },
+  ];
+  for (const [index, state] of states.entries()) {
+   const observedAt = new Date(Date.parse(NOW) + index * 1000).toISOString();
+   const {idle, ...runtime} = state;
+   const m = {...model(observedAt), ...runtime};
+   const payload = {platform:"linux", protocolMinor:0, idle, observedAt, sequence:index+1, providers:[provider(observedAt)], models:[m]};
+   c.set(envelope(index+1, payload));
+   assert.equal(c.service.ingest({}, "192.168.1.20").ok, true);
+   assert.deepEqual(JSON.parse(JSON.stringify(c.repos.models.get("model-1")?.snapshot)), m);
+   assert.equal(c.repos.providers.get("ollama-1")?.health, "ready");
+   assert.equal((c.repos.hosts.get("agent-1")?.snapshot as any).idle, idle);
+  }
+ } finally { c.db.close(); }
+});

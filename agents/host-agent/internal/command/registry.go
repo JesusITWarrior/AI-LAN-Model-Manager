@@ -99,14 +99,17 @@ type ArtifactInstaller interface {
 // Registry binds each fixed lifecycle operation to exactly one provider client.
 // No adapter may be added through any other path.
 type Registry struct {
-	now       func() time.Time
-	mu        sync.Mutex
-	clients   map[string]providerAdapter     // providerId -> adapter
-	running   map[string]struct{}            // modelKey -> currently loaded
-	draining  map[string]struct{}            // modelKey -> admission stopped
-	active    map[string]map[string]struct{} // modelKey -> outstanding request handles
-	installer ArtifactInstaller
-	peerRelay *PeerRelay
+	hostID           string
+	inventoryEpoch   uint64
+	inventoryPending uint64
+	now              func() time.Time
+	mu               sync.Mutex
+	clients          map[string]providerAdapter     // providerId -> adapter
+	running          map[string]struct{}            // modelKey -> currently loaded
+	draining         map[string]struct{}            // modelKey -> admission stopped
+	active           map[string]map[string]struct{} // modelKey -> outstanding request handles
+	installer        ArtifactInstaller
+	peerRelay        *PeerRelay
 }
 
 // NewRegistry creates an empty registry using the supplied clock (or time.Now
@@ -210,6 +213,15 @@ func (r *Registry) Execute(ctx context.Context, operation string, params json.Ra
 	r.mu.Unlock()
 	if adapter == nil {
 		return nil, NoProvider
+	}
+	// Invalidate observations overlapping lifecycle mutations, even if a
+	// provider call fails after changing runtime state.
+	if operation == "load" || operation == "unload" || operation == "set-options" || operation == "drain" {
+		r.mu.Lock()
+		r.inventoryEpoch++
+		r.inventoryPending++
+		r.mu.Unlock()
+		defer func() { r.mu.Lock(); r.inventoryEpoch++; r.inventoryPending--; r.mu.Unlock() }()
 	}
 	switch operation {
 	case "probe":
@@ -579,10 +591,8 @@ func (r *Registry) syncRunning(models []provider.RunningModel) {
 	for key := range r.running {
 		if _, ok := present[key]; !ok {
 			delete(r.running, key)
-			if len(r.active[key]) == 0 {
-				delete(r.draining, key)
-			}
-			// An observation cannot release an in-flight execution lease.
+			// Disappearance cannot release leases or reopen drained admission.
+			// Only an explicit successful lifecycle transition clears draining.
 		}
 	}
 	for key := range present {
