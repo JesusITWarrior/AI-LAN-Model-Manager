@@ -540,3 +540,7 @@ func snapshotStreamRequest(r Request) Request {
 	}
 	return r
 }
+
+// DecodeStreamWireJSON preserves duplicate/BOM/UTF-8 evidence at authenticated relay envelopes.
+// The caller supplies the exact typed envelope and an independent byte bound.
+func DecodeStreamWireJSON(raw []byte, target any) error { return strictStreamJSON(raw, target) }

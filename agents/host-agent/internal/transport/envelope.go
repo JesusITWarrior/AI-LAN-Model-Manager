@@ -163,7 +163,7 @@ func (s *Sequencer) Next() uint64          { s.mu.Lock(); defer s.mu.Unlock(); s
 func NewEnvelope(hostID, requestID, messageType, nonce, fingerprint, serial string, sequence uint64, now time.Time, payload any) (Envelope, error) {
 	body, err := json.Marshal(payload)
 	limit := 32768
-	if messageType == "agent.command.result" {
+	if messageType == "agent.command.result" || messageType == "agent.stream.event" || messageType == "agent.stream.result" {
 		limit = 512 * 1024
 	}
 	if err != nil || len(body) > limit {

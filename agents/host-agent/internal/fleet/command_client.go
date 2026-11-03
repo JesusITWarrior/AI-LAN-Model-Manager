@@ -29,6 +29,8 @@ type commandPollPayload struct {
 type commandPollResult struct {
 	Command         *command.Request `json:"command"`
 	CancelledJobIDs []string         `json:"cancelledJobIds"`
+	StreamCommand   *json.RawMessage `json:"streamCommand,omitempty"`
+	stream          *command.Request
 	PeerTransfer    *json.RawMessage `json:"peerTransfer,omitempty"`
 }
 
@@ -38,6 +40,9 @@ func (c *HTTPSClient) PollCommand(ctx context.Context, wait time.Duration) (*com
 	result, err := c.pollCommandWork(ctx, wait)
 	if err != nil {
 		return nil, nil, err
+	}
+	if result.stream != nil {
+		return nil, nil, ErrHTTPClient
 	}
 	return result.Command, result.CancelledJobIDs, nil
 }
@@ -70,11 +75,21 @@ func (c *HTTPSClient) pollCommandWork(ctx context.Context, wait time.Duration) (
 	if decoder.Decode(&result) != nil || decoder.Decode(&struct{}{}) != io.EOF || len(result.CancelledJobIDs) > 64 || result.Command != nil && result.PeerTransfer != nil {
 		return commandPollResult{}, ErrHTTPClient
 	}
-	if result.Command != nil && (result.Command.HostID != c.hostID || result.Command.Sequence == 0) {
+	if result.Command != nil && (result.Command.HostID != c.hostID || result.Command.Sequence == 0 || result.Command.Operation == command.StreamOperation) {
 		return commandPollResult{}, ErrHTTPClient
 	}
 	if result.PeerTransfer != nil && (len(*result.PeerTransfer) == 0 || len(*result.PeerTransfer) > maxCommandEnvelopeBody) {
 		return commandPollResult{}, ErrHTTPClient
+	}
+	if result.StreamCommand != nil && string(*result.StreamCommand) != "null" {
+		if result.Command != nil || result.PeerTransfer != nil && string(*result.PeerTransfer) != "null" {
+			return commandPollResult{}, ErrHTTPClient
+		}
+		r, err := command.ParseStreamCommand(*result.StreamCommand)
+		if err != nil || r.HostID != c.hostID {
+			return commandPollResult{}, ErrHTTPClient
+		}
+		result.stream = &r
 	}
 	if c.reserveControllerSequence(controller.Sequence) != nil {
 		return commandPollResult{}, ErrHTTPClient
@@ -145,7 +160,7 @@ func verifyControllerEnvelope(response *http.Response, request agenttransport.En
 	var env agenttransport.Envelope
 	decoder := json.NewDecoder(bytes.NewReader(raw))
 	decoder.DisallowUnknownFields()
-	if decoder.Decode(&env) != nil || decoder.Decode(&struct{}{}) != io.EOF || env.MessageType != "controller.command.poll" || env.HostID != hostID || env.RequestID != request.RequestID || env.Sequence != sequence {
+	if command.DecodeStreamWireJSON(raw, &env) != nil || decoder.Decode(&env) != nil || decoder.Decode(&struct{}{}) != io.EOF || env.MessageType != "controller.command.poll" || env.HostID != hostID || env.RequestID != request.RequestID || env.Sequence != sequence {
 		return agenttransport.Envelope{}, ErrHTTPClient
 	}
 	leaf := response.TLS.PeerCertificates[0]
@@ -246,6 +261,8 @@ func (c *HTTPSClient) RunCommands(ctx context.Context, executor *command.Executo
 	var cancelActive context.CancelFunc
 	var done chan completion
 	var pending *command.Response
+	var activeStream bool
+	var activeDigest string
 	for {
 		if done != nil && pending == nil {
 			select {
@@ -255,7 +272,16 @@ func (c *HTTPSClient) RunCommands(ctx context.Context, executor *command.Executo
 			}
 		}
 		if pending != nil {
-			if err := c.SendCommandResult(ctx, *pending); err == nil {
+			send := c.SendCommandResult
+			if activeStream {
+				send = func(ctx context.Context, result command.Response) error {
+					return c.SendStreamResult(ctx, result, activeDigest)
+				}
+			}
+			if err := send(ctx, *pending); err == nil || activeStream {
+				if cancelActive != nil {
+					cancelActive()
+				}
 				activeJob, cancelActive, done, pending = "", nil, nil, nil
 			} else if ctx.Err() != nil {
 				return nil
@@ -282,6 +308,9 @@ func (c *HTTPSClient) RunCommands(ctx context.Context, executor *command.Executo
 			}
 		}
 		request, cancelled := work.Command, work.CancelledJobIDs
+		if work.stream != nil {
+			request = work.stream
+		}
 		for _, jobID := range cancelled {
 			if jobID == activeJob && cancelActive != nil {
 				cancelActive()
@@ -289,9 +318,17 @@ func (c *HTTPSClient) RunCommands(ctx context.Context, executor *command.Executo
 		}
 		if request != nil && done == nil && pending == nil {
 			runCtx, cancel := context.WithCancel(ctx)
+			activeStream = work.stream != nil
+			activeDigest = request.Capability.RequestDigest
 			activeJob, cancelActive, done = request.JobID, cancel, make(chan completion, 1)
 			go func(value command.Request, output chan<- completion) {
-				result, runErr := executor.Execute(runCtx, value)
+				var result command.Response
+				var runErr error
+				if value.Operation == command.StreamOperation {
+					result, runErr = executor.ExecuteStream(runCtx, value, c.SendStreamEvent)
+				} else {
+					result, runErr = executor.Execute(runCtx, value)
+				}
 				if runErr != nil {
 					code := "COMMAND_REJECTED"
 					result = command.Response{RequestID: value.RequestID, JobID: value.JobID, HostID: value.HostID, Sequence: value.Sequence, Status: "failed", ObservedAt: time.Now().UTC().Format("2006-01-02T15:04:05.000Z"), ErrorCode: &code}

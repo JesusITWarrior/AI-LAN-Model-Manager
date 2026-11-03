@@ -58,10 +58,20 @@ type Hello struct {
 	PreferredWindowMs         int64  `json:"preferredWindowMs,omitempty"`
 }
 
-type SequenceStore struct{ CertDir string }
+type SequenceStore struct {
+	CertDir string
+	name    string
+}
+
+func (s SequenceStore) filename() string {
+	if s.name != "" {
+		return s.name
+	}
+	return sequenceName
+}
 
 func (s SequenceStore) Load() (uint64, error) {
-	raw, err := os.ReadFile(filepath.Join(s.CertDir, sequenceName))
+	raw, err := os.ReadFile(filepath.Join(s.CertDir, s.filename()))
 	if errors.Is(err, os.ErrNotExist) {
 		return 0, nil
 	}
@@ -99,7 +109,7 @@ func (s SequenceStore) Reserve(next uint64) error {
 	if _, err = fmt.Fprintf(tmp, "%d\n", next); err != nil || tmp.Sync() != nil || tmp.Close() != nil {
 		return ErrHTTPClient
 	}
-	if err = os.Rename(name, filepath.Join(s.CertDir, sequenceName)); err != nil {
+	if err = os.Rename(name, filepath.Join(s.CertDir, s.filename())); err != nil {
 		return ErrHTTPClient
 	}
 	committed = true
@@ -113,19 +123,21 @@ func (s SequenceStore) Reserve(next uint64) error {
 // HTTPSClient is an outbound-only TLS 1.3 mTLS fleet client. It uses only the
 // enrolled CA, never ambient roots, proxy variables, redirects, or credentials.
 type HTTPSClient struct {
-	mu           sync.Mutex
-	http         *http.Client
-	artifactHTTP *http.Client
-	base         string
-	hostID       string
-	minor        uint64
-	fingerprint  string
-	serial       string
-	privateKey   []byte
-	sequence     uint64
-	store        SequenceStore
-	now          func() time.Time
-	lastObserved time.Time
+	mu             sync.Mutex
+	http           *http.Client
+	artifactHTTP   *http.Client
+	streamHTTP     *http.Client
+	streamSequence uint64
+	base           string
+	hostID         string
+	minor          uint64
+	fingerprint    string
+	serial         string
+	privateKey     []byte
+	sequence       uint64
+	store          SequenceStore
+	now            func() time.Time
+	lastObserved   time.Time
 	// Runner seams are private and used to deterministically verify reconnect,
 	// backoff, and cancellation behavior without weakening production defaults.
 	runHello       func(context.Context, string, string, time.Duration, time.Duration, time.Duration) (Ack, error)
@@ -176,7 +188,15 @@ func NewHTTPSClient(certDir string) (*HTTPSClient, error) {
 	noRedirect := func(*http.Request, []*http.Request) error { return http.ErrUseLastResponse }
 	client := &http.Client{Transport: transport, Timeout: 10 * time.Second, CheckRedirect: noRedirect}
 	artifactClient := &http.Client{Transport: transport, CheckRedirect: noRedirect}
-	return &HTTPSClient{http: client, artifactHTTP: artifactClient, base: result.ControllerURL, hostID: result.Binding.CandidateID, minor: uint64(result.Binding.ProtocolMinor), fingerprint: hex.EncodeToString(digest[:]), serial: serial, privateKey: keyPEM, sequence: sequence, store: store, now: time.Now}, nil
+	streamTransport := transport.Clone()
+	streamTransport.ResponseHeaderTimeout = 0
+	streamTransport.MaxConnsPerHost = 2
+	streamClient := &http.Client{Transport: streamTransport, CheckRedirect: noRedirect}
+	streamSequence, err := (SequenceStore{CertDir: certDir, name: "stream-sequence-" + hex.EncodeToString(digest[:])}).Load()
+	if err != nil {
+		return nil, err
+	}
+	return &HTTPSClient{streamHTTP: streamClient, streamSequence: streamSequence, http: client, artifactHTTP: artifactClient, base: result.ControllerURL, hostID: result.Binding.CandidateID, minor: uint64(result.Binding.ProtocolMinor), fingerprint: hex.EncodeToString(digest[:]), serial: serial, privateKey: keyPEM, sequence: sequence, store: store, now: time.Now}, nil
 }
 
 func (c *HTTPSClient) observedAt() string {
@@ -280,6 +300,9 @@ func (c *HTTPSClient) Send(ctx context.Context, snapshot Snapshot) (uint64, erro
 }
 func (c *HTTPSClient) CloseIdleConnections() {
 	c.http.CloseIdleConnections()
+	if c.streamHTTP != nil {
+		c.streamHTTP.CloseIdleConnections()
+	}
 	if c.artifactHTTP != nil {
 		c.artifactHTTP.CloseIdleConnections()
 	}

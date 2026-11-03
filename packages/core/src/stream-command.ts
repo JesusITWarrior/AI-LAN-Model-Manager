@@ -1,4 +1,5 @@
-/** Local-only command/event contract. No controller transport admits this operation. */
+/** Strict stream command/event contract. Ordinary command dispatch stays closed;
+ * only an explicitly injected authenticated relay may admit this operation. */
 import {commandAuthorizationDigest, parseCommandRequest, parseInferenceChatCommandParams, type CommandRequest, type InferenceChatCommandParams} from "./command.js";
 
 export interface StreamParams {
@@ -28,7 +29,7 @@ function wellFormed(s:string):boolean{return !/[\uD800-\uDBFF](?![\uDC00-\uDFFF]
 function canonicalModel(s:string):boolean{return s===s.toLowerCase()&&/^[a-z0-9][a-z0-9._:/-]{0,255}$/.test(s)&&s.split("/").every(v=>v!==""&&!v.startsWith(".")&&!v.endsWith("."));}
 function integer(n:unknown,min:number,max:number):n is number{return typeof n==="number"&&Number.isSafeInteger(n)&&n>=min&&n<=max;}
 /** Raw boundary only: rejects duplicate keys before JSON.parse loses evidence. */
-function strictJSON(raw:Uint8Array,max:number):any {
+export function parseStreamWireJSON(raw:Uint8Array,max:number):any {
  if(raw.byteLength>max||(raw[0]===0xef&&raw[1]===0xbb&&raw[2]===0xbf))return reject();const text=new TextDecoder("utf-8",{fatal:true}).decode(raw);
  let i=0;const ws=()=>{while(/[\x20\t\r\n]/.test(text[i]??"x"))i++;};
  const string=():string=>{const start=i++;while(i<text.length){const c=text[i++]!;if(c==='"')return JSON.parse(text.slice(start,i));if(c==='\\')i++;}return reject();};
@@ -46,7 +47,7 @@ export function streamAuthorizationDigest(request:StreamCommandRequest):string {
 }
 export function parseStreamCommand(raw:Uint8Array):StreamCommandRequest {
  try {
- const r=exact(strictJSON(raw,550000),["requestId","jobId","hostId","operation","idempotencyKey","sequence","deadline","capability","params"]);
+ const r=exact(parseStreamWireJSON(raw,550000),["requestId","jobId","hostId","operation","idempotencyKey","sequence","deadline","capability","params"]);
  if(r.operation!=="inference.chat.stream")return reject();
  const p=exact(r.params,["schemaVersion","chat","upstreamFrameBytes","maxEventBytes","maxTotalEventBytes","maxEvents"]);
  if(p.schemaVersion!==1||p.upstreamFrameBytes!==65536||!integer(p.maxEventBytes,1024,131072)||!integer(p.maxTotalEventBytes,p.maxEventBytes,1048576)||!integer(p.maxEvents,1,4096)||Buffer.byteLength(JSON.stringify(p))>524288)return reject();
@@ -72,7 +73,7 @@ export class StreamEventValidator {
   try {
    const r=this.request,p=r.params;
    if(this.invalid||this.terminal||this.next>=p.maxEvents||raw.byteLength>p.maxTotalEventBytes-this.total)return reject();
-   const e=exact(strictJSON(raw,p.maxEventBytes),["schemaVersion","hostId","jobId","requestId","commandDigest","index","kind","chunk","errorCode"]);
+   const e=exact(parseStreamWireJSON(raw,p.maxEventBytes),["schemaVersion","hostId","jobId","requestId","commandDigest","index","kind","chunk","errorCode"]);
    if(e.schemaVersion!==1||e.hostId!==r.hostId||e.jobId!==r.jobId||e.requestId!==r.requestId||e.commandDigest!==r.capability.requestDigest||!integer(e.index,0,4095)||e.index!==this.next)return reject();
    if(e.kind==="chunk"||e.kind==="succeeded"){
     const c=exact(e.chunk,e.kind==="succeeded"?["id","object","model","choices","usage"]:["id","object","model","choices"]);

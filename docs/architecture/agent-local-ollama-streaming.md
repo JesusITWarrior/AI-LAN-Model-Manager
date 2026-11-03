@@ -1,3 +1,8 @@
+> Follow-up: [Authenticated bounded stream relay component](authenticated-stream-relay.md)
+> implements the opt-in transport dependency. This document records the accepted
+> local primitive/contract baseline; its historical "no relay" statements describe
+> that earlier slice, not production readiness. Public runtime/SSE remain closed.
+
 # Agent-local Ollama streaming primitive
 
 `agents/host-agent/internal/provider/ollama.Client.ChatStream` is a bounded,
