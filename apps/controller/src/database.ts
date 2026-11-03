@@ -417,6 +417,45 @@ ALTER TABLE approvals ADD COLUMN consumed_command_digest TEXT
   CHECK(consumed_command_digest IS NULL OR (length(consumed_command_digest)=64 AND consumed_command_digest NOT GLOB '*[^a-f0-9]*'));
 `;
 
+// Preserve historical migration bytes. Rebuild the three constrained policy
+// tables together, copying children before dropping them so FK cascades cannot
+// erase approvals/decision history. Original row order preserves decision tails.
+const inferencePolicyTablesSql = migration11Sql
+  .slice(migration11Sql.indexOf("CREATE TABLE authorization_requests"))
+  .replaceAll(`IN (${POLICY_OPERATION_TYPES})`, `IN (${POLICY_OPERATION_TYPES},'model-inference')`)
+  .replace(/CREATE INDEX[^;]+;/g, "")
+  .replace(/\b(authorization_requests|approvals|decisions)\b/g, "$1_v16");
+const migration16Sql = `
+${inferencePolicyTablesSql}
+ALTER TABLE approvals_v16 ADD COLUMN consumed_command_digest TEXT
+ CHECK(consumed_command_digest IS NULL OR (length(consumed_command_digest)=64 AND consumed_command_digest NOT GLOB '*[^a-f0-9]*'));
+INSERT INTO authorization_requests_v16 SELECT * FROM authorization_requests ORDER BY rowid;
+INSERT INTO approvals_v16 SELECT * FROM approvals ORDER BY rowid;
+INSERT INTO decisions_v16 SELECT * FROM decisions ORDER BY rowid;
+DROP TABLE approvals;
+DROP TABLE decisions;
+DROP TABLE authorization_requests;
+ALTER TABLE authorization_requests_v16 RENAME TO authorization_requests;
+ALTER TABLE approvals_v16 RENAME TO approvals;
+ALTER TABLE decisions_v16 RENAME TO decisions;
+CREATE INDEX authorization_requests_policy_idx ON authorization_requests(policy_version, policy_hash);
+CREATE INDEX approvals_request_idx ON approvals(request_id);
+CREATE INDEX decisions_request_idx ON decisions(request_id);
+
+CREATE TABLE inference_executions (
+ request_id TEXT PRIMARY KEY, job_id TEXT NOT NULL UNIQUE,
+ token_id TEXT NOT NULL, owner_id TEXT NOT NULL,
+ host_id TEXT NOT NULL, provider_id TEXT NOT NULL, model_id TEXT NOT NULL,
+ command_digest TEXT NOT NULL CHECK(length(command_digest)=64 AND command_digest NOT GLOB '*[^a-f0-9]*'),
+ policy_version INTEGER NOT NULL CHECK(policy_version>0),
+ policy_hash TEXT NOT NULL CHECK(length(policy_hash)=64), deadline TEXT NOT NULL,
+ started_at TEXT NOT NULL, finished_at TEXT,
+ outcome TEXT NOT NULL CHECK(outcome IN ('running','succeeded','failed','cancelled','interrupted','deadline')),
+ CHECK((outcome='running' AND finished_at IS NULL) OR (outcome<>'running' AND finished_at IS NOT NULL))
+) STRICT;
+CREATE INDEX inference_executions_active_idx ON inference_executions(outcome,started_at);
+`;
+
 export const CONTROLLER_MIGRATIONS: readonly Migration[] = Object.freeze([
   Object.freeze({ version: 1, name: "inventory-v1", sql: migration1Sql, checksum: migrationChecksum(migration1Sql) }),
   Object.freeze({ version: 2, name: "durable-jobs-v1", sql: migration2Sql, checksum: migrationChecksum(migration2Sql) }),
@@ -433,6 +472,7 @@ export const CONTROLLER_MIGRATIONS: readonly Migration[] = Object.freeze([
   Object.freeze({ version: 13, name: "verified-artifact-delivery-v1", sql: migration13Sql, checksum: migrationChecksum(migration13Sql) }),
   Object.freeze({ version: 14, name: "peer-transfer-checkpoints-v1", sql: migration14Sql, checksum: migrationChecksum(migration14Sql) }),
   Object.freeze({ version: 15, name: "approval-command-binding-v1", sql: migration15Sql, checksum: migrationChecksum(migration15Sql) }),
+  Object.freeze({ version: 16, name: "redacted-inference-executions-v1", sql: migration16Sql, checksum: migrationChecksum(migration16Sql) }),
 ]);
 
 function validateMigrations(migrations: readonly Migration[]): void {

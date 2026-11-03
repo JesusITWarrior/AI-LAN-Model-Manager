@@ -1,3 +1,4 @@
+import { RemoteInferenceService } from "./remote-inference.js";
 import * as fs from "node:fs";
 import { randomBytes } from "node:crypto";
 import { resolve, sep } from "node:path";
@@ -68,6 +69,7 @@ export interface ControllerCoreServices {
   readonly commands: AgentCommandStore;
   readonly admissions: AdmissionController;
   readonly lifecycle: RemoteLifecycleController;
+  readonly inference: RemoteInferenceService;
 }
 
 export interface CoreServiceDependencies {
@@ -307,6 +309,7 @@ class RuntimeImpl {
     try {
       this.servicesValue.lifecycle.recover();
       this.servicesValue.lifecycle.start();
+      this.servicesValue.inference.start();
       this.hooks?.onStart?.(context);
       this.state = "active";
     } catch (error) {
@@ -323,6 +326,7 @@ class RuntimeImpl {
     if (this.state !== "active") return;
     const context: RuntimeHookContext = Object.freeze({ plan: this.plan, directories: Object.freeze([...this.createdDirs]) });
     try {
+      this.servicesValue.inference.close();
       this.hooks?.onStop?.(context);
       this.state = "stopped";
     } catch {
@@ -336,6 +340,7 @@ class RuntimeImpl {
 
   close(): void {
     if (this.state === "closed") return;
+    this.servicesValue?.inference.close();
     this.state = "closed";
     this.#closeDbOnce();
   }
@@ -409,11 +414,14 @@ class RuntimeImpl {
       const admissions = createAdmissionController({ clock: this.now });
       const dispatcher = new CommandDispatcher(this.jobStoresValue, commands, this.now);
       const lifecycle = new RemoteLifecycleController(new LifecycleService(policy, dispatcher, this.repositoriesValue, admissions), commands, this.repositoriesValue, this.jobStoresValue, admissions, this.now);
+      const inferenceTokens = createInferenceTokenManager(this.db, authorizeSession, { clock: this.now, random: this.random });
+      const inference = new RemoteInferenceService(this.repositoriesValue, inferenceTokens, policy, admissions, this.jobStoresValue, this.now);
       this.servicesValue = Object.freeze({
+        inference,
         commands, admissions, lifecycle,
         owner,
         sessions,
-        inferenceTokens: createInferenceTokenManager(this.db, authorizeSession, { clock: this.now, random: this.random }),
+        inferenceTokens,
         pairing: new PairingManager(this.db, authorizeOwner, { clock: this.now, random: this.random }),
         certificates: new CertificateManager(this.db, this.certificateEngine, this.plan.certificateDir, { clock: this.now, random: this.random }),
         fleet: new FleetQueryService(this.db, this.repositoriesValue, { clock: this.now }),
@@ -461,6 +469,7 @@ class RuntimeImpl {
 
   #closeDbOnce(): void {
     if (this.dbSettled) return;
+    this.servicesValue?.inference.close();
     this.dbSettled = true;
     const db = this.db;
     this.db = null;

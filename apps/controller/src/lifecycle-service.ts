@@ -60,9 +60,9 @@ export class LifecycleService {
       try {
         if (request.operation === "drain") void this.admissions.stopAdmission(model.modelId);
         const authoritative = this.admissions.snapshot(model.modelId);
-        if (request.operation === "load" && authoritative.active !== 0) return fail("ERR_LIFECYCLE_STATE");
+        if (request.operation === "load" && (authoritative.uncertain || authoritative.active !== 0)) return fail("ERR_LIFECYCLE_STATE");
         if (request.operation === "drain" && authoritative.active !== 0) return fail("ERR_LIFECYCLE_STATE");
-        if (request.operation === "unload" && (!authoritative.draining || authoritative.active !== 0)) return fail("ERR_LIFECYCLE_STATE");
+        if (request.operation === "unload" && (authoritative.uncertain || !authoritative.draining || authoritative.active !== 0)) return fail("ERR_LIFECYCLE_STATE");
       } catch { return fail("ERR_LIFECYCLE_STATE"); }
     }
     const before = model?.observedAt ?? "1970-01-01T00:00:00.000Z";

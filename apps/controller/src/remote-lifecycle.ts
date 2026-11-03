@@ -166,6 +166,7 @@ export class RemoteLifecycleController {
       if (resumeAdmission && this.admissions) void this.admissions.stopAdmission(before.modelId).catch(() => {});
       return Object.freeze({ ok: false, error: "ERR_LIFECYCLE_STATE" });
     }
+    if (request.operation === "drain" && this.admissions) this.admissions.confirmIdle(before.modelId);
     return Object.freeze({ ok: true, state: "succeeded", observation: response.observation });
   }
 

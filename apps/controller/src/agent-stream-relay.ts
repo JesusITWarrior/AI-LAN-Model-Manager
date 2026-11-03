@@ -7,6 +7,8 @@ export interface StreamRelayHandle {
  /** Transfer of one bounded event to the sole consumer is its acceptance point. */
  next(signal:AbortSignal):Promise<StreamEvent|null>;
  readonly outcome:Promise<StreamRelayOutcome>;
+ /** Synchronous first-terminal proof, including before promise continuations. */
+ readonly settledOutcome:StreamRelayOutcome|null;
  cancel():void;
  /** Required on consumer disconnect/final cleanup; releases all retained bytes. */
  close():void;
@@ -34,7 +36,8 @@ export class AgentStreamRelay {
    entry.timer.unref();this.entries.set(request.jobId,entry);
   });
   for(const id of [request.jobId,request.requestId,request.idempotencyKey])this.used.add(id);
-  return {next:signal=>this.next(request.jobId,signal),outcome,cancel:()=>this.end(request.jobId,"cancelled"),close:()=>{this.end(request.jobId,"cancelled");this.entries.delete(request.jobId);}};
+  const entry=this.entries.get(request.jobId)!;
+  return {get settledOutcome(){return entry.outcome;},next:signal=>this.next(request.jobId,signal),outcome,cancel:()=>this.end(request.jobId,"cancelled"),close:()=>{this.end(request.jobId,"cancelled");this.entries.delete(request.jobId);}};
  }
  /** Destructive lease: never requeue, even on polling disconnect or lost response. */
  busy(hostId:string):boolean{return [...this.entries.values()].some(e=>e.request.hostId===hostId&&e.leased&&e.outcome===null);}

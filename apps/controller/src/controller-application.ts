@@ -63,7 +63,7 @@ export function createControllerApplication(options:ControllerApplicationOptions
    try{
     // Reject new lifecycle submissions and release owned HTTP waits while all
     // repositories and listeners are still alive. Never close DB under a waiter.
-    await runtime.services.lifecycle.shutdown();
+    await Promise.all([runtime.services.inference.shutdown(),runtime.services.lifecycle.shutdown()]);
     await Promise.all([...(currentAgent?[closeServer(currentAgent,remaining())]:[]),...(current?[closeServer(current,remaining())]:[])]);
     try{discovery.stop?.();}catch{}runtime.stop();
    }catch{runtime.close();closed=true;throw new ControllerApplicationError("ERR_APP_STOP");}
