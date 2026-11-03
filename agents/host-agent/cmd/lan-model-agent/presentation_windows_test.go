@@ -5,6 +5,7 @@ package main
 import (
 	"bytes"
 	"context"
+	"errors"
 	"strings"
 	"syscall"
 	"testing"
@@ -32,7 +33,7 @@ func TestWindowsTransientCodePresentation(t *testing.T) {
 	}
 	cleanup()
 	out.Reset()
-	if code := readEnrollmentCode(&out); code == 0 || strings.Contains(out.String(), "23456789") {
+	if code := readEnrollmentCode(&out); code == 0 || out.Len() == 0 || strings.Contains(out.String(), "23456789") {
 		t.Fatal("code remained available after cleanup")
 	}
 }
@@ -44,7 +45,7 @@ func TestWindowsCodePresentationExpires(t *testing.T) {
 	time.Sleep(100 * time.Millisecond)
 	cleanup()
 	var out bytes.Buffer
-	if code := readEnrollmentCode(&out); code == 0 || strings.Contains(out.String(), "23456789") {
+	if code := readEnrollmentCode(&out); code == 0 || out.Len() == 0 || strings.Contains(out.String(), "23456789") {
 		t.Fatal("expired code available")
 	}
 }
@@ -57,7 +58,7 @@ func TestWindowsFakePresentationServerRejected(t *testing.T) {
 	defer cleanup()
 	var out bytes.Buffer
 	started := time.Now()
-	if code := readEnrollmentCode(&out); code == 0 || strings.Contains(out.String(), "23456789") {
+	if code := readEnrollmentCode(&out); code == 0 || out.Len() == 0 || strings.Contains(out.String(), "23456789") {
 		t.Fatal("non-service server displayed a forged code")
 	}
 	if time.Since(started) > 5*time.Second {
@@ -103,7 +104,40 @@ func TestWindowsSilentPresentationServerReadIsBounded(t *testing.T) {
 		}
 	}, 150*time.Millisecond)
 	elapsed := time.Since(started)
-	if code == 0 || out.Len() != 0 || elapsed < 100*time.Millisecond || elapsed > 2*time.Second {
+	if code == 0 || !strings.Contains(out.String(), "read-timeout") || elapsed < 100*time.Millisecond || elapsed > 2*time.Second {
 		t.Fatalf("silent server read not bounded: code=%d elapsed=%s", code, elapsed)
+	}
+}
+
+func TestWindowsPresentationAuthenticationDiagnostics(t *testing.T) {
+	for _, tc := range []struct {
+		name     string
+		failure  error
+		rejectAt int
+		reason   string
+	}{
+		{"unsafe-service-path", errPipeServerPath, 1, "unsafe-service-image-path"},
+		{"untrusted-server", errors.New("untrusted sensitive detail"), 1, "server-authentication"},
+		{"binding-changed-before-display", errPipeServer, 2, "server-authentication"},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			cleanup, err := presentEnrollmentCode(context.Background(), "23456789", time.Now().Add(time.Minute))
+			if err != nil {
+				t.Fatal(err)
+			}
+			defer cleanup()
+			var out bytes.Buffer
+			calls := 0
+			code := readEnrollmentCodeVerified(&out, func(syscall.Handle) error {
+				calls++
+				if calls == tc.rejectAt {
+					return tc.failure
+				}
+				return nil
+			}, time.Second)
+			if code == 0 || !strings.Contains(out.String(), tc.reason) || strings.Contains(out.String(), "23456789") || strings.Contains(out.String(), "sensitive detail") || out.Len() > 200 {
+				t.Fatalf("unsafe or missing failure diagnostic: code=%d output=%q", code, out.String())
+			}
+		})
 	}
 }

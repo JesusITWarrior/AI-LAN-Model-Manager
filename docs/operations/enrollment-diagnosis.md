@@ -138,3 +138,54 @@ therefore insufficient. A successful quarantine returns the recoverable
 allowing `New` to treat the still-live state as permission to reenroll. Tests
 exercise the original portable quarantine case, close-before-rename ordering,
 and terminal failure handling without touching live state.
+
+## Installed Windows service ImagePath and reader diagnostics
+
+The code reader treats SCM's `BinaryPath` as a command line, not as a file path.
+It requires exactly one quoted, canonical local-drive `.exe` path with no
+arguments, then binds that path to both the reader executable and the running
+pipe server's image. The own-process service PID, virtual account, process-token
+SID, and second binding check remain mandatory. An unquoted `C:\Program Files\...`
+configuration is unsafe even when SCM happens to have started the intended
+binary; do not make the reader accept it or split at spaces to guess a binary.
+
+Windows PowerShell 5.1's native argument marshalling can remove literal quotes
+from `sc.exe config ... binPath= ('"{0}"' -f $binary)`. The installer now passes
+`PathName`, `StartMode`, and `StartName` as typed CIM `Win32_Service.Change`
+arguments instead. Create, upgrade and rollback check both the method return
+value and a fresh exact path/account/start-mode readback; activation checks the
+binding again before `Start-Service`. Existing unquoted installations still fail
+the strict ownership preflight. This is intentional: ordinary upgrade must not
+silently adopt or reinterpret an unsafe service command line.
+
+An affected installation needs a separately owner-authorized administrator repair
+of **only** the service's known exact ImagePath after confirming the expected
+release binary, current service PID/image, virtual account and own-process type.
+Use a typed service configuration API, preserve all other configuration, and
+read back the literal outer quotes from both SCM and the raw registry. Do not
+change enrollment keys, certificates, state ACLs or the reader's authentication.
+A configuration repair alone does not establish enrollment or reconnect
+acceptance, and does not retroactively change the running process image.
+
+Reader failures now return a nonzero exit and a fixed bounded reason, including
+`unsafe-service-image-path`, `server-authentication`, `read-timeout`, and
+response/pipe stage identifiers. These messages contain no server-supplied error,
+code, raw payload, path, nonce, or proof. If stdout itself cannot be written the
+reader still returns nonzero; an output failure cannot carry a diagnostic.
+
+Native safe fixtures (no SCM or registry writes):
+
+```powershell
+cd agents/host-agent
+go test ./cmd/lan-model-agent -run 'Windows(ConfiguredServiceExecutable|PowerShellLegacyServiceQuoteLoss|NativeArgvProbe|PresentationAuthenticationDiagnostics|FakePresentationServerRejected|SilentPresentationServerReadIsBounded)'
+cd ../..
+npm run test:installer
+```
+
+The native argv fixture invokes only the test executable to reproduce the legacy
+quote loss. The installer fixture extracts the two production configuration
+functions and mocks both CIM commands; it exercises quote preservation, rollback,
+method failures and mismatched readback. The latter is not evidence that a real
+SCM configuration was changed correctly. Linux installer tests skip that native
+fixture, and Windows cross-compilation is not native execution or installed
+virtual-account acceptance.

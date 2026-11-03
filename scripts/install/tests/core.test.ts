@@ -3,6 +3,8 @@ import assert from "node:assert/strict";
 import {mkdtemp, mkdir, readFile, writeFile, access, symlink} from "node:fs/promises";
 import {tmpdir} from "node:os";
 import {join} from "node:path";
+import {fileURLToPath} from "node:url";
+import {spawnSync} from "node:child_process";
 import {contained,createManifest,installPlan,installRelease,inventoryTree,safeRelative,uninstall,verifyManifest} from "../core.js";
 
 const COMMIT="9f9f243e76991e4fd5e8365001f2074bdfe44ffd";
@@ -29,3 +31,26 @@ test("Windows service environments are deterministic and strictly role-bound",as
 
 test("Windows package exposes matched PowerShell 5.1 install and uninstall entrypoints",async()=>{const cli=await readFile(new URL("../cli.js",import.meta.url),"utf8"),installer=await readFile(new URL("../templates/windows/Install-LANModelAgent.ps1",import.meta.url),"utf8"),uninstaller=await readFile(new URL("../templates/windows/Uninstall-LANModelAgent.ps1",import.meta.url),"utf8"),service=await readFile(new URL("../templates/windows/Install-LANModelService.ps1",import.meta.url),"utf8");for(const source of[installer,uninstaller,service])assert.match(source,/#Requires -Version 5\.1/);assert.match(cli,/root=args\.root\?\?"\/"/);assert.match(installer,/cli\.js/);assert.match(installer,/Install-LANModelService\.ps1/);assert.match(installer,/--dry-run/);assert.match(uninstaller,/preserving enrollment state and configuration/);assert.match(uninstaller,/if\(\$Purge\)/);assert.match(uninstaller,/--purge/);assert.match(uninstaller,/--dry-run/);assert.doesNotMatch(installer+uninstaller,/['"]--root['"]/);assert.doesNotMatch(installer+uninstaller,/firewall|New-NetFirewallRule/i);});
 test("Linux definitions are disabled until explicitly enabled and Windows uses virtual accounts",async()=>{for(const platform of ["linux","windows"] as const){const root=await mkdtemp(join(tmpdir(),`lmm-${platform}-`)),p=await payload(root,"3.0.0","binary");await installRelease({payload:p.dir,manifest:p.manifest,platform,root});const plan=installPlan({platform,root,role:"agent",version:"3.0.0"});if(platform==="linux"){const unit=await readFile(plan.serviceFiles[0]!,"utf8");assert.match(unit,/User=lanmodel-agent/);assert.match(unit,/NoNewPrivileges=yes/);assert.match(unit,/LANMM_STATE_DIR=/);assert.doesNotMatch(unit,/systemctl|enable --now/);}else{const descriptor=JSON.parse(await readFile(plan.serviceFiles[0]!,"utf8"));assert.equal(descriptor.account,"NT SERVICE\\LANModelAgent");assert.equal(descriptor.startup,"disabled");assert.equal(descriptor.firewallChanges,false);}}const ps=await readFile(new URL("../templates/windows/Install-LANModelService.ps1",import.meta.url),"utf8");assert.match(ps,/if\(-not \$WhatIfPreference -and -not \(Test-Path/);assert.ok(ps.indexOf("if($Action -eq 'Uninstall')")<ps.indexOf("$serviceEnvironment=if($Role -eq 'agent')"));assert.match(ps,/StartupType Disabled/);assert.match(ps,/if\(\$Activate/);assert.match(ps,/ERR_UPGRADE_ROLLBACK/);assert.match(ps,/ValidateSet\('controller','agent'\)/);});
+
+
+test("Windows service paths use typed CIM and fail closed before activation",async()=>{
+  const ps=await readFile(new URL("../templates/windows/Install-LANModelService.ps1",import.meta.url),"utf8");
+  assert.doesNotMatch(ps,/sc\.exe[^\r\n]*binPath=/i);
+  assert.match(ps,/Invoke-CimMethod -InputObject \$service -MethodName Change -Arguments @\{PathName=\$Path;StartMode=\$StartMode;StartName=\$Account\}/);
+  assert.match(ps,/\$null-eq\$result\.ReturnValue-or\$result\.ReturnValue-ne 0/);
+  assert.match(ps,/\$actual\.PathName-cne\$Path/);
+  assert.match(ps,/\$actual\.StartName-ine\$Account/);
+  assert.match(ps,/\$actual\.StartMode-ine\$expectedMode/);
+  assert.match(ps,/Assert-ServiceConfiguration \$Name \$Path \$StartMode \$Account/);
+  assert.match(ps,/try\{Set-ServiceConfiguration \$name \$oldCim\.PathName \$start \$oldCim\.StartName\}catch\{\$rollbackFailed=\$true\}/);
+  assert.match(ps,/Assert-ServiceConfiguration \$name \('"\{0\}"'-f\$binary\) 'Manual' "NT SERVICE\\\$name";Start-Service/);
+  assert.equal((ps.match(/Set-ServiceConfiguration \$name \('"\{0\}"'-f\$binary\) 'Disabled'/g)??[]).length,2,"create and upgrade must both verify the quoted path");
+});
+
+test("Windows native service configuration fixture (mock CIM; no live changes)",{skip:process.platform!=="win32"},()=>{
+  const fixture=fileURLToPath(new URL("./windows-service-config.ps1",import.meta.url));
+  const result=spawnSync("powershell.exe",["-NoProfile","-NonInteractive","-File",fixture],{encoding:"utf8",timeout:15000});
+  assert.equal(result.error,undefined);
+  assert.equal(result.status,0,result.stdout+result.stderr);
+  assert.match(result.stdout,/PASS typed service configuration/);
+});

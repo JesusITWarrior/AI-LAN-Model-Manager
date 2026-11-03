@@ -12,6 +12,32 @@ import (
 )
 
 var errPipeServer = errors.New("enrollment presentation server rejected")
+var errPipeServerPath = errors.New("unsafe enrollment service executable configuration")
+
+// SCM BinaryPath is a command line, not a path. Require one quoted, canonical
+// local-drive executable with no arguments. In particular, do not repair an
+// unquoted path with spaces here: SCM may have launched a different executable.
+func configuredServiceExecutable(command string) (string, error) {
+	if len(command) < 3 || command[0] != '"' || command[len(command)-1] != '"' {
+		return "", errPipeServerPath
+	}
+	path := command[1 : len(command)-1]
+	if len(path) < 7 || !((path[0] >= 'A' && path[0] <= 'Z') || (path[0] >= 'a' && path[0] <= 'z')) || path[1:3] != `:\` || !filepath.IsAbs(path) || filepath.Clean(path) != path || !strings.EqualFold(filepath.Ext(path), ".exe") || strings.ContainsAny(path[2:], "\"\x00\r\n\t:/") {
+		return "", errPipeServerPath
+	}
+	for _, c := range path {
+		if c < 32 || c == 127 {
+			return "", errPipeServerPath
+		}
+	}
+	for _, part := range strings.Split(path[3:], `\`) {
+		if part == "" || strings.HasSuffix(part, ".") || strings.HasSuffix(part, " ") {
+			return "", errPipeServerPath
+		}
+	}
+	return path, nil
+}
+
 var getPipeServerPID = pipeKernel.NewProc("GetNamedPipeServerProcessId")
 var queryProcessImage = pipeKernel.NewProc("QueryFullProcessImageNameW")
 var openSCManager = advapi.NewProc("OpenSCManagerW")
@@ -81,13 +107,13 @@ func verifyEnrollmentPipeServer(pipe syscall.Handle) error {
 	if !valid || !strings.EqualFold(account, `NT SERVICE\LANModelAgent`) {
 		return errPipeServer
 	}
-	binary, valid := stringInBuffer(config.BinaryPath)
-	if !valid || len(binary) < 3 || binary[0] != '"' || binary[len(binary)-1] != '"' {
-		return errPipeServer
+	command, valid := stringInBuffer(config.BinaryPath)
+	if !valid {
+		return errPipeServerPath
 	}
-	binary = binary[1 : len(binary)-1]
-	if strings.ContainsRune(binary, '"') || !filepath.IsAbs(binary) {
-		return errPipeServer
+	binary, err := configuredServiceExecutable(command)
+	if err != nil {
+		return err
 	}
 	executable, err := os.Executable()
 	if err != nil || !strings.EqualFold(filepath.Clean(binary), filepath.Clean(executable)) {

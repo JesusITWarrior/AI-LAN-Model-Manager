@@ -4,6 +4,7 @@ package main
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"io"
 	"os"
@@ -122,13 +123,15 @@ func readEnrollmentCodeVerified(out io.Writer, verify func(syscall.Handle) error
 	name, _ := syscall.UTF16PtrFromString(enrollmentPipe)
 	handle, err := syscall.CreateFile(name, syscall.GENERIC_READ|syscall.GENERIC_WRITE, 0, nil, syscall.OPEN_EXISTING, 0x00110000, 0)
 	if err != nil {
-		_, _ = fmt.Fprintln(out, "Enrollment code unavailable; use an elevated console while enrollment is pending.")
-		return exitGeneral
+		return enrollmentReadFailure(out, "pipe-open; use an elevated console while enrollment is pending")
 	}
 	file := os.NewFile(uintptr(handle), enrollmentPipe)
 	defer file.Close()
-	if verify == nil || verify(handle) != nil {
-		return exitGeneral
+	if verify == nil {
+		return enrollmentReadFailure(out, "server-authentication")
+	}
+	if err := verify(handle); err != nil {
+		return enrollmentReadAuthenticationFailure(out, err)
 	}
 	// Switch the connected client handle to nonblocking byte mode. Never rely
 	// on a malicious server to write or close; no orphan reader goroutine.
@@ -136,13 +139,13 @@ func readEnrollmentCodeVerified(out io.Writer, verify func(syscall.Handle) error
 	setMode := pipeKernel.NewProc("SetNamedPipeHandleState")
 	ok, _, _ := setMode.Call(uintptr(handle), uintptr(unsafe.Pointer(&mode)), 0, 0)
 	if ok == 0 {
-		return exitGeneral
+		return enrollmentReadFailure(out, "pipe-mode")
 	}
 	deadline := time.Now().Add(timeout)
 	raw := make([]byte, 0, 160)
 	for {
 		if !time.Now().Before(deadline) {
-			return exitGeneral
+			return enrollmentReadFailure(out, "read-timeout")
 		}
 		var chunk [160]byte
 		var n uint32
@@ -150,35 +153,51 @@ func readEnrollmentCodeVerified(out io.Writer, verify func(syscall.Handle) error
 		if n > 0 {
 			raw = append(raw, chunk[:n]...)
 			if len(raw) > 160 {
-				return exitGeneral
+				return enrollmentReadFailure(out, "response-size")
 			}
 			if strings.ContainsRune(string(raw), '\n') {
 				break
 			}
 		}
 		if err != nil && err != syscall.Errno(232) {
-			return exitGeneral
+			return enrollmentReadFailure(out, "pipe-read")
 		}
 		time.Sleep(10 * time.Millisecond)
 	}
 	line := string(raw)
 	if strings.Count(line, "\n") != 1 || !strings.HasSuffix(line, "\n") {
-		return exitGeneral
+		return enrollmentReadFailure(out, "response-format")
 	}
-	if verify(handle) != nil {
-		return exitGeneral
+	if err := verify(handle); err != nil {
+		return enrollmentReadAuthenticationFailure(out, err)
 	}
 	fields := strings.Fields(line)
 	if len(fields) != 2 {
-		return exitGeneral
+		return enrollmentReadFailure(out, "response-format")
 	}
 	expires, err := time.Parse(time.RFC3339Nano, fields[0])
 	if err != nil || !time.Now().Before(expires) || expires.After(time.Now().Add(2*time.Minute)) || !operatorCodePattern.MatchString(fields[1]) {
-		return exitGeneral
+		return enrollmentReadFailure(out, "response-invalid-or-expired")
 	}
 	if _, err := file.Write([]byte{1}); err != nil {
-		return exitGeneral
+		return enrollmentReadFailure(out, "pipe-acknowledgement")
 	}
-	_, _ = fmt.Fprintf(out, "Enrollment code (expires %s): %s\n", expires.UTC().Format(time.RFC3339), fields[1])
+	if _, err := fmt.Fprintf(out, "Enrollment code (expires %s): %s\n", expires.UTC().Format(time.RFC3339), fields[1]); err != nil {
+		return exitGeneral // A failing output writer cannot carry a diagnostic.
+	}
 	return 0
+}
+
+// Reasons are fixed local stage identifiers. Never echo server data, paths,
+// tokens, or operating-system error strings to the code-reader output.
+func enrollmentReadFailure(out io.Writer, reason string) int {
+	_, _ = fmt.Fprintf(out, "Enrollment code unavailable [%s].\n", reason)
+	return exitGeneral
+}
+
+func enrollmentReadAuthenticationFailure(out io.Writer, err error) int {
+	if errors.Is(err, errPipeServerPath) {
+		return enrollmentReadFailure(out, "unsafe-service-image-path; installer repair required")
+	}
+	return enrollmentReadFailure(out, "server-authentication")
 }

@@ -31,6 +31,20 @@ function Test-CanonicalIPv4([string]$Value){$parts=$Value.Split('.');if($parts.C
 function Test-PrivateIPv4([string]$Value){if(-not(Test-CanonicalIPv4 $Value)){return $false};$p=$Value.Split('.')|ForEach-Object{[int]$_};return $p[0]-eq 10-or($p[0]-eq 172-and$p[1]-ge 16-and$p[1]-le 31)-or($p[0]-eq 192-and$p[1]-eq 168)}
 function Test-RegularFile([string]$Path){if(-not(Test-Path -LiteralPath $Path -PathType Leaf)){return $false};return -not((Get-Item -LiteralPath $Path -Force).Attributes-band[IO.FileAttributes]::ReparsePoint)}
 function Assert-SafePath([string]$Path,[switch]$AllowLeafFile){$full=[IO.Path]::GetFullPath($Path);$current=$full;$leaf=$true;while($current){if(Test-Path -LiteralPath $current){$item=Get-Item -LiteralPath $current -Force;if($item.Attributes-band[IO.FileAttributes]::ReparsePoint){throw 'ERR_INSTALL_PATH'};if(-not$item.PSIsContainer-and-not($leaf-and$AllowLeafFile)){throw 'ERR_INSTALL_PATH'}};$parent=Split-Path -Parent $current;if($parent-eq$current){break};$current=$parent;$leaf=$false}}
+# Use typed CIM strings, never PowerShell 5.1 native argv marshalling for
+# ImagePath. sc.exe can consume the executable's literal quotes on upgrade.
+function Assert-ServiceConfiguration([string]$Name,[string]$Path,[string]$StartMode,[string]$Account){
+  $expectedMode=if($StartMode-eq'Automatic'){'Auto'}else{$StartMode}
+  $actual=Get-CimInstance Win32_Service -Filter "Name='$Name'" -ErrorAction Stop
+  if($null-eq$actual-or$actual.PathName-cne$Path-or$actual.StartName-ine$Account-or$actual.StartMode-ine$expectedMode){throw 'ERR_SERVICE_CONFIG_READBACK'}
+}
+function Set-ServiceConfiguration([string]$Name,[string]$Path,[string]$StartMode,[string]$Account){
+  $service=Get-CimInstance Win32_Service -Filter "Name='$Name'" -ErrorAction Stop
+  if($null-eq$service){throw 'ERR_SERVICE_CONFIG'}
+  $result=Invoke-CimMethod -InputObject $service -MethodName Change -Arguments @{PathName=$Path;StartMode=$StartMode;StartName=$Account} -ErrorAction Stop
+  if($null-eq$result-or$null-eq$result.ReturnValue-or$result.ReturnValue-ne 0){throw 'ERR_SERVICE_CONFIG'}
+  Assert-ServiceConfiguration $Name $Path $StartMode $Account
+}
 function Restore-AtomicBytes([string]$Path,[byte[]]$Bytes){$temporary="$Path.rollback-$([Guid]::NewGuid().ToString('N'))";[IO.File]::WriteAllBytes($temporary,$Bytes);Move-Item -LiteralPath $temporary -Destination $Path -Force}
 if($Role -eq 'agent'){
   $uri=$null;if(-not[Uri]::TryCreate($ControllerUrl,[UriKind]::Absolute,[ref]$uri)-or$uri.Scheme-ne'https'-or-not(Test-PrivateIPv4 $uri.Host)-or$uri.AbsolutePath-ne'/'-or$uri.Query-or$uri.Fragment-or$uri.UserInfo-or$uri.Port-lt 1-or$uri.Port-gt 65535){throw 'ERR_INSTALL_AGENT_CONFIG'}
@@ -50,20 +64,20 @@ $oldCa=$null;$hadCa=Test-Path -LiteralPath $caTarget -PathType Leaf;if($hadCa){i
 $hadReEnrollMarker=Test-Path -LiteralPath $reenrollMarker -PathType Leaf;$oldReEnrollMarker=if($hadReEnrollMarker){[IO.File]::ReadAllBytes($reenrollMarker)}else{$null}
 $serviceEnvironment=if($Role -eq 'agent'){@("LANMM_STATE_DIR=$state","LANMM_CERT_DIR=$(Join-Path $state 'cert')","LANMM_CACHE_DIR=$(Join-Path $state 'cache')","LANMM_ENROLLMENT_CONTROLLER_URL=$ControllerUrl","LANMM_ENROLLMENT_CA_CERT_FILE=$caTarget","LANMM_ENROLLMENT_CA_FINGERPRINT_SHA256=$CaFingerprint","LANMM_ENROLLMENT_CANDIDATE_ADDRESS=$CandidateAddress","LANMM_ENROLLMENT_CANDIDATE_PORT=$AdvertisedPort","LANMM_ENROLLMENT_PROTOCOL_MAJOR=1","LANMM_ENROLLMENT_PROTOCOL_MINOR=0","LANMM_DISCOVERY_DISPLAY_NAME=$DisplayName","LANMM_DISCOVERY_ADDRESS=$CandidateAddress","LANMM_DISCOVERY_PORT=$AdvertisedPort","LANMM_DISCOVERY_TTL_SECONDS=120","LANMM_OLLAMA_ENDPOINT=http://127.0.0.1:11434")}else{@("LANMM_DATA_DIR=$state")}
 try{
-  if(-not$existing){if($PSCmdlet.ShouldProcess($name,'Create disabled service')){New-Service -Name $name -BinaryPathName ('"{0}"'-f$binary) -StartupType Disabled -Description "LAN Model Manager $Role"|Out-Null;$createdService=$true;& sc.exe config $name obj= "NT SERVICE\$name"|Out-Null;if($LASTEXITCODE-ne 0){throw 'ERR_SERVICE_ACCOUNT'}}}
-  elseif($PSCmdlet.ShouldProcess($name,'Stage service binary path')){if($existing.Status-ne'Stopped'){throw 'ERR_SERVICE_RUNNING'};& sc.exe config $name binPath= ('"{0}"'-f$binary) start= disabled obj= "NT SERVICE\$name"|Out-Null;if($LASTEXITCODE-ne 0){throw 'ERR_SERVICE_CONFIG'}}
+  if(-not$existing){if($PSCmdlet.ShouldProcess($name,'Create disabled service')){New-Service -Name $name -BinaryPathName ('"{0}"'-f$binary) -StartupType Disabled -Description "LAN Model Manager $Role"|Out-Null;$createdService=$true;Set-ServiceConfiguration $name ('"{0}"'-f$binary) 'Disabled' "NT SERVICE\$name"}}
+  elseif($PSCmdlet.ShouldProcess($name,'Stage service binary path')){if($existing.Status-ne'Stopped'){throw 'ERR_SERVICE_RUNNING'};Set-ServiceConfiguration $name ('"{0}"'-f$binary) 'Disabled' "NT SERVICE\$name"}
   foreach($path in @($state,$config)){if($PSCmdlet.ShouldProcess($path,'Create protected directory')){if(Test-Path -LiteralPath $path){$item=Get-Item -LiteralPath $path -Force;if(-not$item.PSIsContainer-or($item.Attributes-band[IO.FileAttributes]::ReparsePoint)){throw 'ERR_SERVICE_ACL'};$oldDirectoryAcls[$path]=Get-Acl -LiteralPath $path}else{New-Item -ItemType Directory -Path $path -Force|Out-Null;$createdDirectories.Add($path)};& icacls.exe $path /inheritance:r /grant:r "SYSTEM:(OI)(CI)F" "Administrators:(OI)(CI)F" "NT SERVICE\${name}:(OI)(CI)M"|Out-Null;if($LASTEXITCODE-ne 0){throw 'ERR_SERVICE_ACL'}}}
   if($Role-eq'agent'-and$PSCmdlet.ShouldProcess($caTarget,'Atomically install public controller CA certificate')){$caTemp=Join-Path $config ('.controller-ca-'+[Guid]::NewGuid().ToString('N')+'.tmp');Copy-Item -LiteralPath $CaCertificatePath -Destination $caTemp -Force;Move-Item -LiteralPath $caTemp -Destination $caTarget -Force}
   if($Role-eq'agent'-and$ReEnroll-and$PSCmdlet.ShouldProcess($reenrollMarker,'Request owner-confirmed re-enrollment')){$markerTemp="$reenrollMarker.$([Guid]::NewGuid().ToString('N')).tmp";[IO.File]::WriteAllText($markerTemp,"owner-authorized-reenroll`n",(New-Object Text.UTF8Encoding($false)));Move-Item -LiteralPath $markerTemp -Destination $reenrollMarker -Force}
   if($PSCmdlet.ShouldProcess($serviceKey,'Set bounded service environment')){New-ItemProperty -Path $serviceKey -Name Environment -PropertyType MultiString -Value $serviceEnvironment -Force|Out-Null}
-  if($Activate-and$PSCmdlet.ShouldProcess($name,'Activate and health-check service')){& sc.exe config $name start= demand|Out-Null;if($LASTEXITCODE-ne 0){throw 'ERR_SERVICE_CONFIG'};Start-Service -Name $name;(Get-Service -Name $name).WaitForStatus('Running',[TimeSpan]::FromSeconds(15));if((Get-Service -Name $name).Status-ne'Running'){throw 'ERR_INSTALL_HEALTH'}}
+  if($Activate-and$PSCmdlet.ShouldProcess($name,'Activate and health-check service')){& sc.exe config $name start= demand|Out-Null;if($LASTEXITCODE-ne 0){throw 'ERR_SERVICE_CONFIG'};Assert-ServiceConfiguration $name ('"{0}"'-f$binary) 'Manual' "NT SERVICE\$name";Start-Service -Name $name;(Get-Service -Name $name).WaitForStatus('Running',[TimeSpan]::FromSeconds(15));if((Get-Service -Name $name).Status-ne'Running'){throw 'ERR_INSTALL_HEALTH'}}
 }catch{
   $rollbackFailed=$false
   foreach($temporary in @($caTemp,$markerTemp)){if($temporary-and(Test-Path -LiteralPath $temporary)){try{Remove-Item -LiteralPath $temporary -Force -ErrorAction Stop}catch{$rollbackFailed=$true}}}
   $rollbackService=Get-Service -Name $name -ErrorAction SilentlyContinue;if($rollbackService-and$rollbackService.Status-ne'Stopped'){try{Stop-Service -Name $name -Force -ErrorAction Stop}catch{$rollbackFailed=$true}}
   if($createdService){& sc.exe delete $name|Out-Null;if($LASTEXITCODE-ne 0){$rollbackFailed=$true}}
   else{
-    if($oldCim){$start=if($oldCim.StartMode-eq'Auto'){'auto'}elseif($oldCim.StartMode-eq'Disabled'){'disabled'}else{'demand'};& sc.exe config $name binPath= $oldCim.PathName start= $start obj= $oldCim.StartName|Out-Null;if($LASTEXITCODE-ne 0){$rollbackFailed=$true}}
+    if($oldCim){$start=if($oldCim.StartMode-eq'Auto'){'Automatic'}elseif($oldCim.StartMode-eq'Disabled'){'Disabled'}else{'Manual'};try{Set-ServiceConfiguration $name $oldCim.PathName $start $oldCim.StartName}catch{$rollbackFailed=$true}}
     try{if($hadEnvironment){New-ItemProperty -Path $serviceKey -Name Environment -PropertyType MultiString -Value $oldEnvironment -Force -ErrorAction Stop|Out-Null}else{Remove-ItemProperty -Path $serviceKey -Name Environment -ErrorAction SilentlyContinue;if($null-ne(Get-ItemProperty -Path $serviceKey -Name Environment -ErrorAction SilentlyContinue)){throw 0}}}catch{$rollbackFailed=$true}
   }
   if($Role-eq'agent'){try{if($hadCa){Restore-AtomicBytes $caTarget $oldCa}else{if(Test-Path -LiteralPath $caTarget){Remove-Item -LiteralPath $caTarget -Force -ErrorAction Stop}};if($hadReEnrollMarker){Restore-AtomicBytes $reenrollMarker $oldReEnrollMarker}else{Remove-Item -LiteralPath $reenrollMarker -Force -ErrorAction SilentlyContinue;if(Test-Path -LiteralPath $reenrollMarker){throw 0}}}catch{$rollbackFailed=$true}}
