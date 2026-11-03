@@ -31,13 +31,15 @@ type Service struct {
 	cfg resolved
 
 	// mu guards the closed lifecycle state so Start/Stop/Close cannot race.
-	mu        sync.Mutex
-	cancel    context.CancelFunc
-	done      chan struct{}
-	started   bool
-	closed    bool
-	latest    snapshot.State
-	hasLatest bool
+	mu          sync.Mutex
+	cancel      context.CancelFunc
+	done        chan struct{}
+	started     bool
+	closed      bool
+	latest      snapshot.State
+	hasLatest   bool
+	resource    *observation.HostResourceObservation
+	resourceCtx context.Context
 }
 
 // Start performs an initial observation (unless InitialObservation is false),
@@ -110,6 +112,7 @@ func (s *Service) Close(ctx context.Context) error {
 	cancel := s.cancel
 	s.cancel = nil
 	s.closed = true
+	s.resource = nil
 	done := s.done
 	s.mu.Unlock()
 
@@ -147,6 +150,7 @@ func (s *Service) fail() {
 		s.cancel = nil
 	}
 	s.closed = true
+	s.resource = nil
 	s.mu.Unlock()
 }
 
@@ -154,6 +158,11 @@ func (s *Service) fail() {
 // and recording the first successful observation. It never panics.
 func (s *Service) runObservation(ctx context.Context) (ObservationRecord, error) {
 	record := ObservationRecord{HostID: s.cfg.HostID}
+	s.mu.Lock()
+	s.resource = nil
+	s.mu.Unlock()
+	var candidate *observation.HostResourceObservation
+	resourcesValid := true
 
 	var firstErr error
 	for _, observer := range s.cfg.Registry.Observers {
@@ -167,6 +176,18 @@ func (s *Service) runObservation(ctx context.Context) (ObservationRecord, error)
 			continue
 		}
 		data, err := observer.Observe(ctx)
+		if err == nil {
+			if data.ValidateFresh(s.cfg.HostID, observation.HostPlatform(runtime.GOOS), time.Now()) == nil {
+				copy := data.Clone()
+				if candidate == nil {
+					candidate = &copy
+				}
+			} else {
+				resourcesValid = false
+				// Summary continuity is independent of resource authority.
+				candidate = nil
+			}
+		}
 		if err != nil {
 			if firstErr == nil {
 				firstErr = err
@@ -239,6 +260,13 @@ func (s *Service) runObservation(ctx context.Context) (ObservationRecord, error)
 		}
 	}
 
+	s.mu.Lock()
+	if !s.closed && ctx.Err() == nil && firstErr == nil && resourcesValid && candidate != nil {
+		s.resource = candidate
+		s.resourceCtx = ctx
+	}
+	s.mu.Unlock()
+
 	record.Err = firstErr
 	return record, sanitize(firstErr)
 }
@@ -253,6 +281,18 @@ func (s *Service) LatestSnapshot() (snapshot.State, bool) {
 		return snapshot.State{}, false
 	}
 	return s.latest, true
+}
+
+// LatestResourceObservation returns runtime-only authority, never a disk summary.
+// Returned slices and optional utilization values belong exclusively to the caller.
+func (s *Service) LatestResourceObservation() (observation.HostResourceObservation, bool) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	if s.closed || s.resource == nil || s.resourceCtx.Err() != nil || s.resource.ValidateFresh(s.cfg.HostID, observation.HostPlatform(runtime.GOOS), time.Now()) != nil {
+		s.resource = nil
+		return observation.HostResourceObservation{}, false
+	}
+	return s.resource.Clone(), true
 }
 
 // loop performs repeated observation passes until the loop context is cancelled.

@@ -45,10 +45,14 @@ const (
 var version = "18.9b"
 
 type snapshotSource interface{ LatestSnapshot() (snapshot.State, bool) }
+type resourceSource interface {
+	LatestResourceObservation() (observation.HostResourceObservation, bool)
+}
 type fleetCollector struct {
-	source snapshotSource
-	ollama *ollama.Client
-	report *inventoryReporter
+	resources resourceSource
+	source    snapshotSource
+	ollama    *ollama.Client
+	report    *inventoryReporter
 }
 
 func (c fleetCollector) Collect(ctx context.Context) (fleet.Snapshot, error) {
@@ -74,6 +78,15 @@ func (c fleetCollector) Collect(ctx context.Context) (fleet.Snapshot, error) {
 		if c.report != nil {
 			c.report.record(probeErr, modelsErr)
 		}
+	}
+	if c.resources != nil {
+		resource, available := c.resources.LatestResourceObservation()
+		if available && resource.ValidateFresh(state.Record.HostID, observation.HostPlatform(result.Platform), time.Now()) == nil {
+			result.Resource = resource.Clone()
+		}
+	}
+	if ctx.Err() != nil {
+		return fleet.Snapshot{}, fleet.ErrFleet
 	}
 	return result, nil
 }
@@ -196,7 +209,7 @@ func maintainFleetSessions(ctx context.Context, certDir, stateDir string, host *
 		workers.Add(1)
 		go func() {
 			defer workers.Done()
-			_ = client.Run(sessionCtx, fleetCollector{source: host, ollama: ollamaClient, report: reporter}, runtime.GOOS, "")
+			_ = client.Run(sessionCtx, fleetCollector{source: host, resources: host, ollama: ollamaClient, report: reporter}, runtime.GOOS, "")
 		}()
 		if ollamaClient != nil {
 			registry := command.NewRegistry(time.Now)
