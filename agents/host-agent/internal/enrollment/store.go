@@ -14,8 +14,10 @@ import (
 )
 
 var (
-	ErrNotFound = errors.New("enrollment state not found")
-	ErrCorrupt  = errors.New("enrollment state corrupt")
+	ErrNotFound   = errors.New("enrollment state not found")
+	ErrCorrupt    = errors.New("enrollment state corrupt")
+	ErrStateClose = errors.New("enrollment state close failed")
+	ErrQuarantine = errors.New("enrollment state quarantine failed")
 )
 
 const (
@@ -42,23 +44,29 @@ func (s FileStore) Load(ctx context.Context) (Result, error) {
 	if err != nil {
 		return Result{}, ErrCorrupt
 	}
-	defer f.Close()
+	return loadEnrollmentState(f, path, s.quarantine)
+}
+
+// Read and close before attempting a rename: Windows does not permit renaming
+// this open handle. Close/quarantine failures are terminal, bounded errors, not
+// recoverable corruption (New must not create fresh enrollment over live state).
+func loadEnrollmentState(f io.ReadCloser, path string, quarantine func(string) error) (Result, error) {
 	limited := io.LimitReader(f, maxState+1)
 	raw, err := io.ReadAll(limited)
+	if f.Close() != nil {
+		return Result{}, ErrStateClose
+	}
 	if err != nil || len(raw) == 0 || len(raw) > maxState {
-		s.quarantine(path)
-		return Result{}, ErrCorrupt
+		return Result{}, quarantine(path)
 	}
 	var result Result
 	decoder := json.NewDecoder(bytes.NewReader(raw))
 	decoder.DisallowUnknownFields()
 	if err := decoder.Decode(&result); err != nil {
-		s.quarantine(path)
-		return Result{}, ErrCorrupt
+		return Result{}, quarantine(path)
 	}
 	if err := requireEOF(decoder); err != nil || !validStoredResult(result) {
-		s.quarantine(path)
-		return Result{}, ErrCorrupt
+		return Result{}, quarantine(path)
 	}
 	return result, nil
 }
@@ -127,7 +135,10 @@ func (s FileStore) Save(ctx context.Context, result Result) error {
 	return nil
 }
 
-func (s FileStore) quarantine(path string) {
+func (s FileStore) quarantine(path string) error {
 	stamp := time.Now().UTC().Format("20060102T150405.000000000Z")
-	_ = os.Rename(path, fmt.Sprintf("%s.corrupt-%s", path, stamp))
+	if os.Rename(path, fmt.Sprintf("%s.corrupt-%s", path, stamp)) != nil {
+		return ErrQuarantine
+	}
+	return ErrCorrupt
 }

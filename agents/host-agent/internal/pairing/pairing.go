@@ -115,3 +115,12 @@ func zero(value []byte) {
 		value[i] = 0
 	}
 }
+
+// Discard destroys a pending human code when enrollment is cancelled or fails
+// before BuildProof. Dropping the session pointer alone does not zero memory.
+func (s *Session) Discard() {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	zero(s.code)
+	s.consumed = true
+}

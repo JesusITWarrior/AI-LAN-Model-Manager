@@ -57,3 +57,14 @@ func TestConfiguredEnrollmentRunsBeforeObservationAndFailureDegrades(t *testing.
 		}
 	}
 }
+
+func TestEnrollmentFailureSummaryIsAllowlistedAndNotSuccess(t *testing.T) {
+	entry := EnrollmentSummary(enrollment.Outcome{Status: enrollment.StatusDegraded, OperatorCode: "23456789"}, &enrollment.Failure{Stage: "identity", Reason: "failed"})
+	if entry.Level != "warn" || entry.Fields["stage"] != "identity" || entry.Fields["reason"] != "failed" || entry.Message == "host service enrollment complete" {
+		t.Fatalf("failure hidden: %+v", entry)
+	}
+	entry = EnrollmentSummary(enrollment.Outcome{}, &enrollment.Failure{Stage: "23456789-secret-path", Reason: "secret-proof", HTTPStatus: 99999})
+	if entry.Fields["stage"] != "enrollment" || entry.Fields["reason"] != "failed" || entry.Fields["httpStatus"] != nil {
+		t.Fatalf("unvalidated diagnostics: %+v", entry)
+	}
+}

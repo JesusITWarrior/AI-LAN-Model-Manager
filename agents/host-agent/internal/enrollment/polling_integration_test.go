@@ -18,6 +18,7 @@ import (
 	"net/http/httptest"
 	"os"
 	"path/filepath"
+	"runtime"
 	"strings"
 	"sync"
 	"sync/atomic"
@@ -63,7 +64,7 @@ func TestCrossLanguageEnrollmentHelper(t *testing.T) {
 		t.Fatalf("outcome=%+v err=%v", outcome, err)
 	}
 	keyInfo, err := os.Stat(filepath.Join(certDir, "host-key.pem"))
-	if err != nil || keyInfo.Mode().Perm() != 0o600 {
+	if err != nil || (runtime.GOOS != "windows" && keyInfo.Mode().Perm() != 0o600) {
 		t.Fatalf("private key mode=%v err=%v", keyInfo, err)
 	}
 	publicState, err := os.ReadFile(filepath.Join(certDir, stateName))

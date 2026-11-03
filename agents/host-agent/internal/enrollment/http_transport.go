@@ -163,28 +163,40 @@ func (t *HTTPTransport) post(ctx context.Context, path string, input, output any
 	request.Header.Set("Accept", "application/json")
 	response, err := t.client.Do(request)
 	if err != nil {
-		return remoteError(ctx)
+		if ctx.Err() != nil {
+			return ctx.Err()
+		}
+		return &Failure{Stage: "http", Reason: "network"}
 	}
 	defer response.Body.Close()
+	reject := func(reason string) error {
+		if ctx.Err() != nil {
+			return ctx.Err()
+		}
+		return &Failure{Stage: "http", Reason: reason, HTTPStatus: response.StatusCode}
+	}
 	if mediaType := strings.ToLower(strings.TrimSpace(strings.Split(response.Header.Get("Content-Type"), ";")[0])); mediaType != "application/json" {
-		return remoteError(ctx)
+		return reject("response")
 	}
 	if response.ContentLength > EnrollmentResponseLimit {
-		return remoteError(ctx)
+		return reject("response")
 	}
 	raw, err := io.ReadAll(io.LimitReader(response.Body, EnrollmentResponseLimit+1))
 	if err != nil || len(raw) == 0 || len(raw) > EnrollmentResponseLimit {
-		return remoteError(ctx)
+		return reject("response")
 	}
 	if response.StatusCode == http.StatusConflict {
 		var pending errorEnvelope
 		if decodeExactJSON(raw, &pending) == nil && !pending.OK && pending.Error.Code == "OWNER_CONFIRMATION_PENDING" && pending.Error.Message == "Owner confirmation pending." {
 			return ErrPending
 		}
-		return remoteError(ctx)
+		return reject("response")
 	}
-	if response.StatusCode != http.StatusOK || decodeExactJSON(raw, output) != nil {
-		return remoteError(ctx)
+	if response.StatusCode != http.StatusOK {
+		return reject("rejected")
+	}
+	if decodeExactJSON(raw, output) != nil {
+		return reject("response")
 	}
 	if err := ctx.Err(); err != nil {
 		return err

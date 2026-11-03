@@ -190,13 +190,24 @@ func (c *Client) Begin(ctx context.Context) (string, error) {
 		return "", ErrUnavailable
 	}
 	c.consumed = true
+	// Fail local identity/CSR preparation before asking the operator to approve
+	// a challenge that this host cannot complete. This grants no enrollment.
+	csr, key, err := c.identity.CreateCSR(c.binding)
+	if err != nil || ctx.Err() != nil {
+		_, failure := failedOutcome("identity", "failed", err)
+		return "", failure
+	}
+	c.csr, c.key = csr, key
 	challenge, err := c.transport.Begin(ctx, c.binding)
 	if err != nil || ctx.Err() != nil || !c.validChallenge(challenge) {
-		return "", ErrFailed
+		c.clearPending()
+		_, failure := failedOutcome("begin", "failed", err)
+		return "", failure
 	}
 	session, err := pairing.NewSession(challenge.Pairing, []byte(challenge.OperatorCode), func(string) error { return nil })
 	if err != nil {
-		return "", ErrFailed
+		c.clearPending()
+		return "", &Failure{Stage: "begin", Reason: "failed"}
 	}
 	code := challenge.OperatorCode
 	challenge.OperatorCode = ""
@@ -229,14 +240,9 @@ func (c *Client) Complete(ctx context.Context) (Outcome, error) {
 		proof, err := session.BuildProof(c.now())
 		if err != nil || ctx.Err() != nil {
 			c.clearPending()
-			return Outcome{Status: StatusDegraded}, ErrFailed
+			return failedOutcome("proof", "failed", err)
 		}
-		csr, key, err := c.identity.CreateCSR(c.binding)
-		if err != nil || ctx.Err() != nil {
-			c.clearPending()
-			return Outcome{Status: StatusDegraded}, ErrFailed
-		}
-		c.proof, c.csr, c.key = &proof, csr, key
+		c.proof = &proof
 	}
 	result, err := c.transport.Complete(ctx, challenge, *c.proof, c.csr)
 	if errors.Is(err, ErrPending) && ctx.Err() == nil {
@@ -244,15 +250,15 @@ func (c *Client) Complete(ctx context.Context) (Outcome, error) {
 	}
 	if err != nil || ctx.Err() != nil {
 		c.clearPending()
-		return Outcome{Status: StatusDegraded}, ErrFailed
+		return failedOutcome("complete", "failed", err)
 	}
 	if !c.validResult(result, challenge.Pairing.ChallengeID) || VerifyIssued(result, c.key, result.CAPEM, c.cfg.PinnedCAFingerprintSHA256, c.now()) != nil {
 		c.clearPending()
-		return Outcome{Status: StatusDegraded}, ErrFailed
+		return failedOutcome("verify", "failed", nil)
 	}
 	if err := c.store.Save(ctx, result); err != nil {
 		c.clearPending()
-		return Outcome{Status: StatusDegraded}, ErrFailed
+		return failedOutcome("save", "failed", err)
 	}
 	c.enrolled = &result
 	c.clearPending()
@@ -260,6 +266,9 @@ func (c *Client) Complete(ctx context.Context) (Outcome, error) {
 }
 
 func (c *Client) clearPending() {
+	if c.session != nil {
+		c.session.Discard()
+	}
 	c.pending, c.session, c.proof, c.key = nil, nil, nil, nil
 	for index := range c.csr {
 		c.csr[index] = 0

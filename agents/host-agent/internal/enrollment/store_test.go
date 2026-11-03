@@ -53,3 +53,54 @@ func TestFileStoreStrictJSONAndCorruptionQuarantine(t *testing.T) {
 		t.Fatalf("quarantine=%v err=%v", matches, err)
 	}
 }
+
+type quarantineReader struct {
+	*strings.Reader
+	closed   bool
+	closeErr error
+}
+
+func (r *quarantineReader) Close() error { r.closed = true; return r.closeErr }
+
+func TestCorruptStateClosedBeforeQuarantine(t *testing.T) {
+	for _, raw := range []string{"", `{"unknown":true}`, `{} {}`, strings.Repeat("x", maxState+1)} {
+		reader := &quarantineReader{Reader: strings.NewReader(raw)}
+		calls := 0
+		_, err := loadEnrollmentState(reader, "not-a-real-state-path", func(string) error {
+			calls++
+			if !reader.closed {
+				t.Fatal("rename attempted with live handle")
+			}
+			return ErrCorrupt
+		})
+		if !errors.Is(err, ErrCorrupt) || calls != 1 || !reader.closed {
+			t.Fatalf("unexpected corruption result: %v", err)
+		}
+	}
+}
+func TestStateCloseAndQuarantineFailuresAreTerminalAndRedacted(t *testing.T) {
+	reader := &quarantineReader{Reader: strings.NewReader("bad"), closeErr: errors.New("secret path")}
+	_, err := loadEnrollmentState(reader, "secret path", func(string) error { t.Fatal("quarantine after failed close"); return nil })
+	if err != ErrStateClose || strings.Contains(err.Error(), "secret") {
+		t.Fatal("unbounded close failure")
+	}
+	reader = &quarantineReader{Reader: strings.NewReader("bad")}
+	_, err = loadEnrollmentState(reader, "secret path", func(string) error { return ErrQuarantine })
+	if err != ErrQuarantine || errors.Is(err, ErrCorrupt) {
+		t.Fatal("failed quarantine treated as recoverable")
+	}
+	dir := t.TempDir()
+	store := FileStore{CertDir: dir}
+	if err := store.quarantine(filepath.Join(dir, "absent-secret")); err != ErrQuarantine {
+		t.Fatalf("rename failure hidden: %v", err)
+	}
+	cfg, _, _, transport := fixture(t)
+	if _, err := New(cfg, transport, terminalStateStore{}); !errors.Is(err, ErrUnavailable) || transport.begins != 0 {
+		t.Fatal("quarantine failure allowed enrollment")
+	}
+}
+
+type terminalStateStore struct{}
+
+func (terminalStateStore) Load(context.Context) (Result, error) { return Result{}, ErrQuarantine }
+func (terminalStateStore) Save(context.Context, Result) error   { return nil }

@@ -19,6 +19,7 @@ import (
 	"time"
 
 	"github.com/JesusITWarrior/AI-LAN-Model-Manager/agents/host-agent/internal/pairing"
+	"github.com/JesusITWarrior/AI-LAN-Model-Manager/agents/host-agent/internal/privatefile"
 )
 
 var (
@@ -43,6 +44,9 @@ type IdentityStore struct {
 // A concurrently-created valid identity always wins and is never overwritten.
 func (s IdentityStore) LoadOrCreate() (*ecdsa.PrivateKey, error) {
 	if !validCertDir(s.CertDir) {
+		return nil, ErrIdentity
+	}
+	if err := os.MkdirAll(s.CertDir, 0700); err != nil || privatefile.Directory(s.CertDir) != nil {
 		return nil, ErrIdentity
 	}
 	path := filepath.Join(s.CertDir, identityKeyName)
@@ -92,7 +96,7 @@ func (s IdentityStore) LoadOrCreate() (*ecdsa.PrivateKey, error) {
 
 // Load returns the existing identity without generating one.
 func (s IdentityStore) Load() (*ecdsa.PrivateKey, error) {
-	if !validCertDir(s.CertDir) {
+	if !validCertDir(s.CertDir) || privatefile.Directory(s.CertDir) != nil {
 		return nil, ErrIdentity
 	}
 	key, err := loadIdentityKey(filepath.Join(s.CertDir, identityKeyName))
@@ -110,11 +114,11 @@ func (s IdentityStore) Load() (*ecdsa.PrivateKey, error) {
 // The returned key is the persistent key used to sign the request.
 func (s IdentityStore) CreateCSR(binding pairing.Binding) ([]byte, *ecdsa.PrivateKey, error) {
 	if !validIdentityBinding(binding) {
-		return nil, nil, ErrIdentity
+		return nil, nil, &identityFailure{reason: "binding"}
 	}
 	key, err := s.LoadOrCreate()
 	if err != nil {
-		return nil, nil, err
+		return nil, nil, &identityFailure{reason: "key"}
 	}
 	random := s.Random
 	if random == nil {
@@ -128,11 +132,17 @@ func (s IdentityStore) CreateCSR(binding pairing.Binding) ([]byte, *ecdsa.Privat
 		SignatureAlgorithm: x509.ECDSAWithSHA256,
 	}, key)
 	if err != nil {
-		return nil, nil, ErrIdentity
+		return nil, nil, &identityFailure{reason: "csr-create"}
 	}
 	csr, err := x509.ParseCertificateRequest(der)
-	if err != nil || csr.CheckSignature() != nil || !csrMatchesBinding(csr, binding) {
-		return nil, nil, ErrIdentity
+	if err != nil {
+		return nil, nil, &identityFailure{reason: "csr-parse"}
+	}
+	if csr.CheckSignature() != nil {
+		return nil, nil, &identityFailure{reason: "csr-signature"}
+	}
+	if !csrMatchesBinding(csr, binding) {
+		return nil, nil, &identityFailure{reason: "csr-binding"}
 	}
 	return pem.EncodeToMemory(&pem.Block{Type: "CERTIFICATE REQUEST", Bytes: der}), key, nil
 }
@@ -233,11 +243,16 @@ func loadIdentityKey(path string) (*ecdsa.PrivateKey, error) {
 	if err != nil {
 		return nil, err
 	}
-	if !info.Mode().IsRegular() || info.Mode()&os.ModeSymlink != 0 || info.Mode().Perm() != 0o600 || info.Size() <= 0 || info.Size() > maxIdentityKey {
+	if !info.Mode().IsRegular() || info.Mode()&os.ModeSymlink != 0 || info.Size() <= 0 || info.Size() > maxIdentityKey {
 		return nil, ErrIdentityCorrupt
 	}
 	file, err := os.Open(path)
 	if err != nil {
+		return nil, ErrIdentityCorrupt
+	}
+	opened, statErr := file.Stat()
+	if statErr != nil || !os.SameFile(info, opened) || privatefile.Check(file, 0600) != nil {
+		file.Close()
 		return nil, ErrIdentityCorrupt
 	}
 	data, err := io.ReadAll(io.LimitReader(file, maxIdentityKey+1))
@@ -274,6 +289,10 @@ func publishIdentity(path string, data []byte) error {
 	if err := temp.Chmod(0o600); err != nil {
 		temp.Close()
 		return err
+	}
+	if privatefile.Check(temp, 0600) != nil {
+		temp.Close()
+		return ErrIdentity
 	}
 	if _, err := temp.Write(data); err != nil {
 		temp.Close()

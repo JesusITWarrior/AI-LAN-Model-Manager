@@ -81,9 +81,12 @@ func handleCommandLine(args []string, out io.Writer) (int, bool) {
 		return 0, false
 	}
 	if len(args) == 1 && (args[0] == "-h" || args[0] == "--help") {
-		_, _ = fmt.Fprintln(out, "Usage: lan-model-agent [--help] [--version]")
+		_, _ = fmt.Fprintln(out, "Usage: lan-model-agent [--help] [--version] [--enrollment-code]")
 		_, _ = fmt.Fprintln(out, "Runs the LAN Model Manager host agent; configuration is read from LANMM_* environment variables.")
 		return 0, true
+	}
+	if len(args) == 1 && args[0] == "--enrollment-code" {
+		return readEnrollmentCode(out), true
 	}
 	if len(args) == 1 && args[0] == "--version" {
 		_, _ = fmt.Fprintf(out, "lan-model-agent %s\n", version)
@@ -293,6 +296,7 @@ func loadConfig() (service.Config, error) {
 			return service.Config{}, service.ErrInvalidConfig
 		}
 	}
+	cfg.Log = enrollmentLogger(cfg.StateDir)
 	return cfg, nil
 }
 
@@ -410,9 +414,7 @@ func configureEnrollment(cfg *service.Config) error {
 	if err != nil {
 		return service.ErrInvalidConfig
 	}
-	cfg.Enroller = enrollment.PollingEnroller{Client: client, Present: func(code string) {
-		slog.Info("host-service enrollment pending; confirm this code in the controller", "operatorCode", code)
-	}}
+	cfg.Enroller = enrollment.PollingEnroller{Client: client, SecurePresent: presentEnrollmentCode}
 	return nil
 }
 

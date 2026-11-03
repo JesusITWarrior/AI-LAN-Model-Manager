@@ -290,15 +290,15 @@ func (s *Service) emit(ctx context.Context, record ObservationRecord) {
 // EnrollmentSummary reports only a stable allowlisted status. In particular it
 // never emits the operator code, controller address, certificate, or error.
 func EnrollmentSummary(outcome enrollment.Outcome, err error) LogEntry {
-	status := enrollment.StatusDegraded
 	if err == nil && outcome.Status == enrollment.StatusEnrolled {
-		status = enrollment.StatusEnrolled
+		return LogEntry{Level: "info", Message: "host service enrollment complete", Fields: map[string]any{"status": enrollment.StatusEnrolled}}
 	}
-	return LogEntry{
-		Level:   "info",
-		Message: "host service enrollment complete",
-		Fields:  map[string]any{"status": status},
+	stage, reason, status := enrollment.FailureDetails(err)
+	fields := map[string]any{"status": enrollment.StatusDegraded, "stage": stage, "reason": reason}
+	if status != 0 {
+		fields["httpStatus"] = status
 	}
+	return LogEntry{Level: "warn", Message: "host service enrollment failed; local observation only", Fields: fields}
 }
 
 // StartupSummary is the safe/redacted summary recorded on Start. It never

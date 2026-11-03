@@ -22,6 +22,7 @@ import (
 
 	agentcert "github.com/JesusITWarrior/AI-LAN-Model-Manager/agents/host-agent/internal/certificate"
 	"github.com/JesusITWarrior/AI-LAN-Model-Manager/agents/host-agent/internal/enrollment"
+	"github.com/JesusITWarrior/AI-LAN-Model-Manager/agents/host-agent/internal/privatefile"
 )
 
 const identityPointerName = "fleet-identity-current"
@@ -56,7 +57,7 @@ func loadFleetIdentity(certDir string) (enrollment.Result, *ecdsa.PrivateKey, er
 		}
 		root := filepath.Join(certDir, "fleet-identities", generation)
 		info, e := os.Lstat(root)
-		if e != nil || !info.IsDir() || info.Mode()&os.ModeSymlink != 0 || info.Mode().Perm() != 0700 {
+		if e != nil || !info.IsDir() || info.Mode()&os.ModeSymlink != 0 || privatefile.Directory(root) != nil || (runtime.GOOS != "windows" && info.Mode().Perm() != 0700) {
 			return enrollment.Result{}, nil, ErrHTTPClient
 		}
 		result, e := loadResultFile(filepath.Join(root, "enrollment.json"))
@@ -80,11 +81,21 @@ func loadFleetIdentity(certDir string) (enrollment.Result, *ecdsa.PrivateKey, er
 }
 func loadResultFile(path string) (enrollment.Result, error) {
 	info, err := os.Lstat(path)
-	if err != nil || !info.Mode().IsRegular() || info.Mode()&os.ModeSymlink != 0 || info.Mode().Perm() != 0600 || info.Size() < 2 || info.Size() > 1<<20 {
+	if err != nil || !info.Mode().IsRegular() || info.Mode()&os.ModeSymlink != 0 || info.Size() < 2 || info.Size() > 1<<20 {
 		return enrollment.Result{}, ErrHTTPClient
 	}
-	raw, err := os.ReadFile(path)
+	file, err := os.Open(path)
 	if err != nil {
+		return enrollment.Result{}, ErrHTTPClient
+	}
+	opened, err := file.Stat()
+	if err != nil || !os.SameFile(info, opened) || privatefile.Check(file, 0600) != nil {
+		file.Close()
+		return enrollment.Result{}, ErrHTTPClient
+	}
+	raw, err := io.ReadAll(io.LimitReader(file, info.Size()+1))
+	closeErr := file.Close()
+	if err != nil || closeErr != nil || int64(len(raw)) != info.Size() {
 		return enrollment.Result{}, ErrHTTPClient
 	}
 	var result enrollment.Result
@@ -97,11 +108,21 @@ func loadResultFile(path string) (enrollment.Result, error) {
 }
 func loadPrivateKeyFile(path string) (*ecdsa.PrivateKey, error) {
 	info, err := os.Lstat(path)
-	if err != nil || !info.Mode().IsRegular() || info.Mode()&os.ModeSymlink != 0 || info.Mode().Perm() != 0600 || info.Size() < 1 || info.Size() > 64<<10 {
+	if err != nil || !info.Mode().IsRegular() || info.Mode()&os.ModeSymlink != 0 || info.Size() < 1 || info.Size() > 64<<10 {
 		return nil, ErrHTTPClient
 	}
-	raw, err := os.ReadFile(path)
+	file, err := os.Open(path)
 	if err != nil {
+		return nil, ErrHTTPClient
+	}
+	opened, err := file.Stat()
+	if err != nil || !os.SameFile(info, opened) || privatefile.Check(file, 0600) != nil {
+		file.Close()
+		return nil, ErrHTTPClient
+	}
+	raw, err := io.ReadAll(io.LimitReader(file, info.Size()+1))
+	closeErr := file.Close()
+	if err != nil || closeErr != nil || int64(len(raw)) != info.Size() {
 		return nil, ErrHTTPClient
 	}
 	block, rest := pem.Decode(raw)
