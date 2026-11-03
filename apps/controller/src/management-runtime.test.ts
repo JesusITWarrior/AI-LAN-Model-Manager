@@ -41,7 +41,7 @@ test("authenticated management reads are live and owner sessions persist across 
   result=await get("/api/v1/inference/tokens");assert.equal(result.response.status,200);assert.equal(result.body.value.length,1);assert.equal(result.body.value[0].label,"console");assert.equal("ownerId" in result.body.value[0],false);assert.equal("token" in result.body.value[0],false);
 
   const noCsrf=await fetch(`${base}/api/v1/lifecycle/operations`,{method:"POST",headers:{...postHeaders,cookie},body:"{}"});assert.equal(noCsrf.status,403);
-  const deferred=await fetch(`${base}/api/v1/lifecycle/operations`,{method:"POST",headers:{...postHeaders,cookie,"x-csrf-token":csrf},body:"{}"});assert.equal(deferred.status,405);
+  const deferred=await fetch(`${base}/api/v1/lifecycle/operations`,{method:"POST",headers:{...postHeaders,cookie,"x-csrf-token":csrf},body:"{}"});assert.equal(deferred.status,400);
   assert.equal((await fetch(`${base}/api/v1/fleet/summary`,{headers:{authorization:"Bearer not-a-management-session",connection:"close"}})).status,401);
 
   await first.close();first=null;

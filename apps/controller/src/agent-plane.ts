@@ -12,7 +12,7 @@ import {ControllerTransport} from "./transport/controller-transport.js";
 import {CertificateRepository} from "./certificate-repository.js";
 import {FleetService} from "./fleet-service.js";
 import {createFleetAgentHttpHandler} from "./fleet-agent-http.js";
-import {AgentCommandService,AgentCommandStore} from "./agent-command-channel.js";
+import {AgentCommandService} from "./agent-command-channel.js";
 import type {ControllerRuntimeHandle} from "./controller-runtime.js";
 
 export interface AgentPlaneMaterial{readonly key:string;readonly certificate:string;readonly ca:string;readonly generation:string}
@@ -58,7 +58,7 @@ export function createProductionAgentPlane(runtime:ControllerRuntimeHandle,mater
  const transport=new ControllerTransport({certificateRepository:certificates,replayStore:runtime.services.replay,clock,verifier:pem=>{const parsed=parseTransportParsedLeaf(pem,material.ca);if(!parsed.ok)return null;const built=buildTransportNativeVerifier(createPublicKey(pem).export({type:"spki",format:"pem"}) as string,parsed.value);return built.ok?built.value:null;}});
  const fleet=new FleetService(runtime.repositories.db,transport,certificates,runtime.repositories,{clock});
  const parsed=parseTransportParsedLeaf(material.certificate,material.ca);if(!parsed.ok)throw new Error("ERR_AGENT_PLANE_CERTIFICATE");const signer=buildTransportNativeSigner(material.key,parsed.value);if(!signer.ok)throw new Error("ERR_AGENT_PLANE_CERTIFICATE");const signers=new Map<string,TransportSigner>([[parsed.value.fingerprint,signer.value]]);
- const commands=new AgentCommandService(transport,certificates,new AgentCommandStore(runtime.repositories.db,clock,30_000,runtime.jobStores),runtime.jobStores,signer.value,{clock});
+ const commands=new AgentCommandService(transport,certificates,runtime.services.commands,runtime.jobStores,signer.value,{clock});
  const commandSigner=(request:Parameters<RequestListener>[0])=>{const socket=request.socket as TLSSocket,local=(typeof socket.getCertificate==="function"?socket.getCertificate():null) as {raw?:Buffer}|null;if(!local?.raw)return null;return signers.get(createHash("sha256").update(local.raw).digest("hex"))??null};
  const fleetHandler=createFleetAgentHttpHandler({fleet,certificates,commands,rotation:runtime.services.certificates,commandSigner});
  const handler:RequestListener=(request,response)=>{const path=request.url?.split("?",1)[0]??"";if(path.startsWith("/agent/v1/enrollment/")){enrollment(request,response);return;}fleetHandler(request,response);};

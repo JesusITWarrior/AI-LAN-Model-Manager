@@ -51,19 +51,20 @@ export class LifecycleService {
     const model = input.intent.modelId === null ? null : this.repositories.models.get(input.intent.modelId);
     const activeRequests = active(model);
     if (!this.targetMatches(request, model) || !this.precondition(request.operation, model) || (model !== null && activeRequests === null)) return fail("ERR_LIFECYCLE_STATE");
-    if (model !== null && this.admissions) {
-      try {
-        if (request.operation === "drain") void this.admissions.stopAdmission(model.modelId);
-        const authoritative = this.admissions.snapshot(model.modelId);
-        if (request.operation === "drain" && authoritative.active !== 0) return fail("ERR_LIFECYCLE_STATE");
-        if (request.operation === "unload" && (!authoritative.draining || authoritative.active !== 0)) return fail("ERR_LIFECYCLE_STATE");
-      } catch { return fail("ERR_LIFECYCLE_STATE"); }
-    }
     if (request.operation === "unload" && activeRequests !== null && activeRequests > 0 && (!input.drainIntent || !input.drainRequest)) return fail("ERR_LIFECYCLE_STATE");
     const authorization = this.policy.authorize(input.intent);
     if (!authorization.ok) return fail("ERR_LIFECYCLE_DENIED");
     const approvalOnly = authorization.value.requiresApproval && authorization.value.reasons.every(reason => reason === "approval-required");
-    if ((!authorization.value.allowed && !approvalOnly) || !this.policy.validateCapability(request.capability, input.intent, authorization.value)) return fail("ERR_LIFECYCLE_CAPABILITY");
+    if ((!authorization.value.allowed && !approvalOnly) || !this.policy.validateCapability(request.capability, input.intent, authorization.value, request)) return fail("ERR_LIFECYCLE_CAPABILITY");
+    if (model !== null && this.admissions) {
+      try {
+        if (request.operation === "drain") void this.admissions.stopAdmission(model.modelId);
+        const authoritative = this.admissions.snapshot(model.modelId);
+        if (request.operation === "load" && authoritative.active !== 0) return fail("ERR_LIFECYCLE_STATE");
+        if (request.operation === "drain" && authoritative.active !== 0) return fail("ERR_LIFECYCLE_STATE");
+        if (request.operation === "unload" && (!authoritative.draining || authoritative.active !== 0)) return fail("ERR_LIFECYCLE_STATE");
+      } catch { return fail("ERR_LIFECYCLE_STATE"); }
+    }
     const before = model?.observedAt ?? "1970-01-01T00:00:00.000Z";
     let evictionStarted=false,evictionArtifact:string|null=null;
     if(request.operation==="remove-managed-artifact"&&model&&this.cache){const value=snapshot(model)?.artifactId;if(typeof value!=="string")return fail("ERR_LIFECYCLE_STATE");try{this.cache.beginEviction(value);evictionStarted=true;evictionArtifact=value;}catch{return fail("ERR_LIFECYCLE_STATE");}}
@@ -97,7 +98,7 @@ export class LifecycleService {
     switch (operation) {
       case "load": return model !== null && requests === 0 && ["installed", "unloaded", "failed"].includes(state);
       case "set-options": return model !== null && requests === 0 && ["loaded", "loaded-idle"].includes(state);
-      case "drain": return model !== null && requests !== null && requests > 0 && ["serving", "running", "loaded", "loaded-idle"].includes(state);
+      case "drain": return model !== null && requests !== null && requests >= 0 && ["serving", "running", "loaded", "loaded-idle"].includes(state);
       case "unload": return model !== null && ["serving", "running", "loaded", "loaded-idle"].includes(state);
       case "install": return model === null;
       case "remove-managed-artifact": return model !== null && requests === 0 && snap?.managedTemporary === true && snap?.pinned !== true && ["installed", "unloaded"].includes(state);

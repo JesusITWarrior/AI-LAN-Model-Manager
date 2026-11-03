@@ -34,3 +34,19 @@ test("unknown authoritative accounting fails lifecycle closed",()=>{const x=setu
 test("authoritative cache leases and pins block removal until atomic eviction",()=>{const x=setup("unloaded",0,true,false);try{x.repositories.models.upsert({modelId:"model-1",providerId:"provider-1",hostId:"host-1",canonicalName:"acme/bert:latest",state:"installed",type:"llm",digest:"",digestKnown:false,observedAt:AFTER,snapshot:{runtimeState:"unloaded",activeRequests:0,managedTemporary:true,pinned:false,artifactId:"artifact-1"}});const cache=createArtifactCacheRegistry({authorizePin:()=>true});cache.register({artifactId:"artifact-1",modelId:"model-1",sizeBytes:100,managedTemporary:true,pinned:false,lastUsedAt:NOW});const lease=cache.acquire("artifact-1"),i=intent("remove-managed-artifact","c".repeat(64)),r=request("remove-managed-artifact",i.requestId,i);let sent=0;const wire={send:()=>{sent++;return{requestId:r.requestId,jobId:r.jobId,hostId:r.hostId,sequence:1,status:"succeeded",progress:100,observedAt:"2026-09-28T08:00:02.000Z",observation:{observedAt:"2026-09-28T08:00:02.000Z",artifactState:"absent",providerId:"provider-1",canonicalModelName:"acme/bert:latest"},errorCode:null}}},lifecycle=new LifecycleService(x.policyService,new CommandDispatcher(x.stores,wire,()=>NOW),x.repositories,undefined,cache);assert.deepEqual(lifecycle.execute({intent:i,request:r}),{ok:false,error:"ERR_LIFECYCLE_STATE"});assert.equal(sent,0);lease.release();assert.equal(lifecycle.execute({intent:i,request:r}).ok,true);assert.equal(sent,1);assert.throws(()=>cache.snapshot("artifact-1"));}finally{x.db.close();}});
 
 test("missing active-request observation is never treated as idle",()=>{const x=setup("loaded-idle",0);try{x.repositories.models.upsert({modelId:"model-1",providerId:"provider-1",hostId:"host-1",canonicalName:"acme/bert:latest",state:"running",type:"llm",digest:"",digestKnown:false,observedAt:AFTER,snapshot:{runtimeState:"loaded-idle",managedTemporary:true,pinned:false}});const i=intent("unload","b".repeat(64)),r=request("unload",i.requestId,i),lifecycle=new LifecycleService(x.policyService,new CommandDispatcher(x.stores,{send:()=>{throw new Error("must not dispatch")}},()=>NOW),x.repositories);assert.deepEqual(lifecycle.execute({intent:i,request:r}),{ok:false,error:"ERR_LIFECYCLE_STATE"});}finally{x.db.close();}});
+
+test("idle drain stops admission, but denied drain cannot mutate accounting",()=>{
+ for(const denied of [false,true]){
+  const x=setup("loaded-idle",0);
+  try{
+   const i={...intent("drain",denied?"e".repeat(64):"d".repeat(64)),observationFresh:!denied},r=request("drain",i.requestId,i);
+   const admissions=createAdmissionController({clock:()=>NOW});admissions.register("model-1");let sent=0;
+   const wire={send:()=>{sent++;return{requestId:r.requestId,jobId:r.jobId,hostId:r.hostId,sequence:1,status:"succeeded",progress:100,observedAt:AFTER,observation:{observedAt:AFTER,runtimeState:"loaded-idle",activeRequests:0,providerId:"provider-1",canonicalModelName:"acme/bert:latest"},errorCode:null}}};
+   const lifecycle=new LifecycleService(x.policyService,new CommandDispatcher(x.stores,wire,()=>NOW),x.repositories,admissions);
+   assert.equal(lifecycle.execute({intent:i,request:r}).ok,!denied);
+   assert.equal(sent,denied?0:1);assert.equal(admissions.snapshot("model-1").draining,!denied);
+   if(denied){const lease=admissions.acquire("model-1","still-admitted");lease.release();}
+   else assert.throws(()=>admissions.acquire("model-1","blocked"));
+  }finally{x.db.close();}
+ }
+});

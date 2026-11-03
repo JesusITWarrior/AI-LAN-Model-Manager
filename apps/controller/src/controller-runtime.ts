@@ -12,6 +12,11 @@ import { PolicyService } from "./policy-service.js";
 import { PersistentReplayStore } from "./transport/replay-store.js";
 import { CertificateManager } from "./certificate-manager.js";
 import { OpenSslCertificateEngine } from "./certificate-adapter.js";
+import { AgentCommandStore } from "./agent-command-channel.js";
+import { CommandDispatcher } from "./command-dispatch.js";
+import { createAdmissionController, type AdmissionController } from "./admission-accounting.js";
+import { LifecycleService } from "./lifecycle-service.js";
+import { RemoteLifecycleController } from "./remote-lifecycle.js";
 import type { CertificateEngine } from "./certificate-types.js";
 
 import { openControllerDatabase } from "./database.js";
@@ -60,6 +65,9 @@ export interface ControllerCoreServices {
   readonly fleet: FleetQueryService;
   readonly policy: PolicyService;
   readonly replay: PersistentReplayStore;
+  readonly commands: AgentCommandStore;
+  readonly admissions: AdmissionController;
+  readonly lifecycle: RemoteLifecycleController;
 }
 
 export interface CoreServiceDependencies {
@@ -297,6 +305,8 @@ class RuntimeImpl {
     if (this.state === "active") return;
     const context: RuntimeHookContext = Object.freeze({ plan: this.plan, directories: Object.freeze([...this.createdDirs]) });
     try {
+      this.servicesValue.lifecycle.recover();
+      this.servicesValue.lifecycle.start();
       this.hooks?.onStart?.(context);
       this.state = "active";
     } catch (error) {
@@ -394,14 +404,20 @@ class RuntimeImpl {
       const sessions = new SessionManager(this.db, owner, { clock: this.now, random: this.random });
       const authorizeOwner = (value: unknown) => owner.authenticate(value);
       const authorizeSession = async (value: unknown) => sessions.authenticate(value) !== null;
+      const policy = new PolicyService(this.db, { clock: this.now, random: this.random, stores: this.jobStoresValue });
+      const commands = new AgentCommandStore(this.db, this.now, 30_000, this.jobStoresValue, true);
+      const admissions = createAdmissionController({ clock: this.now });
+      const dispatcher = new CommandDispatcher(this.jobStoresValue, commands, this.now);
+      const lifecycle = new RemoteLifecycleController(new LifecycleService(policy, dispatcher, this.repositoriesValue, admissions), commands, this.repositoriesValue, this.jobStoresValue, admissions, this.now);
       this.servicesValue = Object.freeze({
+        commands, admissions, lifecycle,
         owner,
         sessions,
         inferenceTokens: createInferenceTokenManager(this.db, authorizeSession, { clock: this.now, random: this.random }),
         pairing: new PairingManager(this.db, authorizeOwner, { clock: this.now, random: this.random }),
         certificates: new CertificateManager(this.db, this.certificateEngine, this.plan.certificateDir, { clock: this.now, random: this.random }),
         fleet: new FleetQueryService(this.db, this.repositoriesValue, { clock: this.now }),
-        policy: new PolicyService(this.db, { clock: this.now, random: this.random, stores: this.jobStoresValue }),
+        policy,
         replay: new PersistentReplayStore(this.db),
       });
     } catch {

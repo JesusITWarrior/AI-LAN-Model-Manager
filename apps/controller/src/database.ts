@@ -410,6 +410,13 @@ CREATE INDEX peer_relay_source_idx ON peer_relay_chunks(source_host_id,phase,upd
 CREATE INDEX peer_relay_destination_idx ON peer_relay_chunks(destination_host_id,phase,updated_at,transfer_id);
 `;
 
+// A consumed legacy approval has no execution binding and must never authorize
+// a command. New consumptions bind the complete canonical command digest.
+const migration15Sql = `
+ALTER TABLE approvals ADD COLUMN consumed_command_digest TEXT
+  CHECK(consumed_command_digest IS NULL OR (length(consumed_command_digest)=64 AND consumed_command_digest NOT GLOB '*[^a-f0-9]*'));
+`;
+
 export const CONTROLLER_MIGRATIONS: readonly Migration[] = Object.freeze([
   Object.freeze({ version: 1, name: "inventory-v1", sql: migration1Sql, checksum: migrationChecksum(migration1Sql) }),
   Object.freeze({ version: 2, name: "durable-jobs-v1", sql: migration2Sql, checksum: migrationChecksum(migration2Sql) }),
@@ -425,6 +432,7 @@ export const CONTROLLER_MIGRATIONS: readonly Migration[] = Object.freeze([
   Object.freeze({ version: 12, name: "private-plan-agent-commands-v1", sql: migration12Sql, checksum: migrationChecksum(migration12Sql) }),
   Object.freeze({ version: 13, name: "verified-artifact-delivery-v1", sql: migration13Sql, checksum: migrationChecksum(migration13Sql) }),
   Object.freeze({ version: 14, name: "peer-transfer-checkpoints-v1", sql: migration14Sql, checksum: migrationChecksum(migration14Sql) }),
+  Object.freeze({ version: 15, name: "approval-command-binding-v1", sql: migration15Sql, checksum: migrationChecksum(migration15Sql) }),
 ]);
 
 function validateMigrations(migrations: readonly Migration[]): void {

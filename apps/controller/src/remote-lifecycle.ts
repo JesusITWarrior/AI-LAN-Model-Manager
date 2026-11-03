@@ -16,6 +16,27 @@ const object = (value: unknown): Record<string, unknown> | null => typeof value 
  * It accepts no endpoint, command, shell, path, or provider configuration.
  */
 export class RemoteLifecycleController {
+  private accepting = true;
+  private readonly executions = new Map<AbortController, { promise: Promise<LifecycleResult>; modelId: string | null }>();
+  get acceptsSubmissions(): boolean { return this.accepting; }
+  start(): void { this.accepting = true; }
+
+  /** Close admission synchronously, settle durable results before cancellation,
+   * and await every owned waiter before the application closes SQLite. */
+  async shutdown(): Promise<void> {
+    this.accepting = false;
+    let failure: unknown;
+    try { this.recover(); } catch (error) { failure = error; }
+    for (const [controller, execution] of this.executions) {
+      if (execution.modelId && this.admissions) {
+        try { void this.admissions.stopAdmission(execution.modelId); } catch { /* unknown remains fail-closed */ }
+      }
+      controller.abort();
+    }
+    await Promise.allSettled([...this.executions.values()].map(execution => execution.promise));
+    if (failure) throw failure;
+  }
+
   constructor(
     private readonly lifecycle: LifecycleService,
     private readonly commands: AgentCommandStore,
@@ -26,6 +47,17 @@ export class RemoteLifecycleController {
   ) { if (!commands.defersLifecycle()) throw new Error("ERR_REMOTE_LIFECYCLE_CONFIG"); }
 
   async execute(input: LifecycleExecution, signal: AbortSignal): Promise<LifecycleResult> {
+    if (!this.accepting || signal.aborted) return Object.freeze({ ok: false, error: "ERR_LIFECYCLE_STATE" });
+    const controller = new AbortController();
+    const abort = () => controller.abort();
+    signal.addEventListener("abort", abort, { once: true });
+    const pending = this.executeOwned(input, controller.signal);
+    this.executions.set(controller, { promise: pending, modelId: input?.request?.capability?.modelId ?? null });
+    try { return await pending; }
+    finally { this.executions.delete(controller); signal.removeEventListener("abort", abort); }
+  }
+
+  private async executeOwned(input: LifecycleExecution, signal: AbortSignal): Promise<LifecycleResult> {
     const parsed = parseCommandRequest(input?.request);
     if (!parsed.ok || !OPERATIONS.has(parsed.value.operation) || parsed.value.capability.targetKind !== "model" || parsed.value.capability.modelId === null) return Object.freeze({ ok: false, error: "ERR_LIFECYCLE_INPUT" });
     const request = parsed.value;
@@ -46,6 +78,8 @@ export class RemoteLifecycleController {
       const response = await this.commands.waitResult(request.jobId, request.deadline, signal);
       return this.finish(request, response);
     } catch {
+      const state = this.jobs.jobs.get(request.jobId)?.state;
+      if (state && ["succeeded", "failed", "timed-out", "cancelled"].includes(state)) return Object.freeze({ ok: true, state, observation: this.commands.result(request.jobId)?.observation ?? null });
       if (signal.aborted) abort();
       else this.commands.poll(request.hostId);
       return Object.freeze({ ok: false, error: "ERR_LIFECYCLE_DISPATCH" });
@@ -55,6 +89,29 @@ export class RemoteLifecycleController {
   }
 
   cancel(jobId: string): LifecycleResult { return this.lifecycle.cancel(jobId); }
+
+  /** Startup never blindly replays model mutations. Reconcile a durable final
+   * observation, or cancel interrupted queued/leased work for host readback.
+   * Serving-model accounting remains unknown until separately reconciled.
+   */
+  recover(): void {
+    for (const request of this.commands.recoverableLifecycleRequests()) {
+      const response = this.commands.result(request.jobId);
+      if (response) this.finish(request, response);
+      else {
+        // Cancellation cannot establish that a provider finished loading or
+        // draining. Preserve observations and keep any known target closed.
+        const modelId = request.capability.modelId;
+        if (modelId && this.admissions) {
+          try { void this.admissions.stopAdmission(modelId); } catch { /* unknown remains fail-closed */ }
+        }
+        this.cancel(request.jobId);
+      }
+      const state = this.jobs.jobs.get(request.jobId)?.state;
+      if (!state || !["succeeded", "failed", "timed-out", "cancelled"].includes(state)) throw new Error("ERR_REMOTE_LIFECYCLE_RECOVERY");
+    }
+  }
+
 
   private finish(request: CommandRequest, response: CommandResponse): LifecycleResult {
     if (response.status !== "succeeded") return Object.freeze({ ok: true, state: response.status, observation: response.observation });
