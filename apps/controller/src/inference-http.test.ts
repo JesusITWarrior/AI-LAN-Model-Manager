@@ -14,7 +14,7 @@ function server(stream=false){
     resolve:async model=>({targetId:"internal-target",model}),
     acquireLease:async()=>({release(){}}),
     transport:async request=>stream
-      ? {kind:"stream" as const,events:(async function*(){yield{id:"one",object:"chat.completion.chunk",model:request.model,choices:[]};})()}
+      ? {kind:"stream" as const,events:(async function*(){yield{id:"one",object:"chat.completion.chunk",model:request.model,choices:[{index:0,delta:{role:"assistant",content:"fixture"},finish_reason:"stop"}],usage:{prompt_tokens:1,completion_tokens:1,total_tokens:2}};})()}
       : {kind:"json" as const,value:{id:"one",object:"chat.completion",model:request.model,choices:[]}}
   });
   return createControllerServer(undefined,createInferenceHttpHandler(async()=>({status:404,headers:{"content-type":"application/json"},body:{error:"not_found"}}),chat));
@@ -25,3 +25,11 @@ test("HTTP adapter bounds and forwards chat JSON without management cookies",asy
 test("HTTP adapter emits ordered SSE and terminal marker",async context=>{const instance=server(true);instance.listen(0,"127.0.0.1");await once(instance,"listening");context.after(()=>instance.close());const address=instance.address();assert.ok(address&&typeof address==="object");const response=await fetch(`http://127.0.0.1:${address.port}/v1/chat/completions`,{method:"POST",headers:{authorization:"Bearer valid","content-type":"application/json"},body:JSON.stringify({model:"m",messages:[{role:"user",content:"hello"}],stream:true})});assert.equal(response.headers.get("content-type"),"text/event-stream; charset=utf-8");assert.match(await response.text(),/^data: .*\n\ndata: \[DONE\]\n\n$/s);});
 
 test("HTTP adapter rejects excessive declared bodies before routing",async context=>{const instance=server();instance.listen(0,"127.0.0.1");await once(instance,"listening");context.after(()=>instance.close());const address=instance.address();assert.ok(address&&typeof address==="object");const status=await new Promise<number>((resolve,reject)=>{const request=httpRequest({host:"127.0.0.1",port:address.port,path:"/v1/chat/completions",method:"POST",headers:{authorization:"Bearer valid","content-type":"application/json","content-length":"1048577"}},response=>{resolve(response.statusCode??0);response.resume();});request.on("error",reject);request.end();});assert.equal(status,413);});
+
+test("HTTP stream failure aborts transport and never emits a success marker",async context=>{
+ let upstreamSignal!:AbortSignal,released=0;
+ const chat=createChatCompletionsHandler({tokens:{authenticateAuthorization:()=>({ok:true,token}),touchAuthorization:()=>true} as never,resolve:async model=>({targetId:"fixture-target",model}),acquireLease:async()=>({release(){released++;}}),transport:async input=>{upstreamSignal=input.signal;return{kind:"stream",events:(async function*(){yield{id:"fixture",object:"chat.completion.chunk",model:input.model,choices:[{index:0,delta:{role:"assistant",content:"fixture"},finish_reason:null}]};throw new Error("private provider diagnostic");})()};}});
+ const instance=createControllerServer(undefined,createInferenceHttpHandler(async()=>({status:404,headers:{},body:{}}),chat));instance.listen(0,"127.0.0.1");await once(instance,"listening");context.after(()=>instance.close());const address=instance.address();assert.ok(address&&typeof address==="object");
+ const response=await fetch(`http://127.0.0.1:${address.port}/v1/chat/completions`,{method:"POST",headers:{authorization:"Bearer fixture","content-type":"application/json"},body:JSON.stringify({model:"fixture",messages:[{role:"user",content:"fixture"}],stream:true})});
+ const text=await response.text();assert.match(text,/upstream_error/);assert.equal(text.includes("[DONE]"),false);assert.equal(text.includes("private provider diagnostic"),false);assert.equal(upstreamSignal.aborted,true);assert.equal(released,1);
+});
