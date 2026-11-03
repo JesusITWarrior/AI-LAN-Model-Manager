@@ -27,6 +27,10 @@ func failedOutcome(stage, reason string, cause error) (Outcome, error) {
 	if errors.As(cause, &local) {
 		failure.Reason = local.reason
 	}
+	var issued *issuedFailure
+	if errors.As(cause, &issued) {
+		failure.Reason = issued.reason
+	}
 	var remote *Failure
 	if errors.As(cause, &remote) {
 		failure.Reason, failure.HTTPStatus = remote.Reason, remote.HTTPStatus
@@ -44,6 +48,8 @@ func FailureDetails(err error) (stage, reason string, status int) {
 			stage = failure.Stage
 		}
 		switch failure.Reason {
+		case "result-invalid", "verify-input", "certificate-parse", "key-mismatch", "binding-mismatch", "certificate-not-yet-valid", "certificate-expired", "certificate-purpose", "ca-parse", "ca-pin", "ca-source", "chain-not-yet-valid", "chain-expired", "chain-untrusted":
+			reason = failure.Reason
 		case "failed", "network", "response", "rejected", "timeout", "cancelled", "expired", "permissions", "key", "binding", "csr-create", "csr-parse", "csr-signature", "csr-binding":
 			reason = failure.Reason
 		}

@@ -147,26 +147,61 @@ func (s IdentityStore) CreateCSR(binding pairing.Binding) ([]byte, *ecdsa.Privat
 	return pem.EncodeToMemory(&pem.Block{Type: "CERTIFICATE REQUEST", Bytes: der}), key, nil
 }
 
+// issuedFailure carries a fixed diagnostic, never the underlying x509 error,
+// which can contain certificate subjects and other remote-controlled material.
+type issuedFailure struct{ reason string }
+
+func (*issuedFailure) Error() string { return "issued certificate invalid" }
+func (*issuedFailure) Unwrap() error { return ErrIssuedInvalid }
+
+func issuedInvalid(reason string) error { return &issuedFailure{reason: reason} }
+
+func issuedChainFailure(err error, now time.Time) error {
+	var invalid x509.CertificateInvalidError
+	if errors.As(err, &invalid) && invalid.Reason == x509.Expired && invalid.Cert != nil {
+		if now.Before(invalid.Cert.NotBefore) {
+			return issuedInvalid("chain-not-yet-valid")
+		}
+		if now.After(invalid.Cert.NotAfter) {
+			return issuedInvalid("chain-expired")
+		}
+	}
+	return issuedInvalid("chain-untrusted")
+}
+
 // VerifyIssued verifies the controller-issued leaf against the persistent key,
 // pairing binding, pinned CA, requested time, and client-auth purpose. caSource
 // may be a *x509.CertPool, CA PEM as []byte/string, or nil when Result.CAPEM is
 // populated. Result.CAPEM is always used to identify the pinned CA certificate.
 func VerifyIssued(result Result, key *ecdsa.PrivateKey, caSource any, pinnedFingerprint string, now time.Time) error {
 	if key == nil || key.Curve != elliptic.P256() || now.IsZero() || !hex64.MatchString(pinnedFingerprint) || result.PinnedCAFingerprintSHA256 != pinnedFingerprint || !validIdentityBinding(result.Binding) {
-		return ErrIssuedInvalid
+		return issuedInvalid("verify-input")
 	}
 	leaf, err := parseOneCertificate([]byte(result.CertificatePEM))
 	if err != nil {
-		return ErrIssuedInvalid
+		return issuedInvalid("certificate-parse")
 	}
 	publicKey, ok := leaf.PublicKey.(*ecdsa.PublicKey)
-	if !ok || !publicKey.Equal(&key.PublicKey) || leaf.Subject.CommonName != result.Binding.CandidateID || len(leaf.IPAddresses) != 1 || leaf.IPAddresses[0].String() != result.Binding.Address || now.Before(leaf.NotBefore) || now.After(leaf.NotAfter) || !hasClientAuth(leaf.ExtKeyUsage) {
-		return ErrIssuedInvalid
+	if !ok || !publicKey.Equal(&key.PublicKey) {
+		return issuedInvalid("key-mismatch")
+	}
+	if leaf.Subject.CommonName != result.Binding.CandidateID || len(leaf.IPAddresses) != 1 || leaf.IPAddresses[0].String() != result.Binding.Address {
+		return issuedInvalid("binding-mismatch")
+	}
+	// Never shift the verifier clock or skip validity checks to hide clock skew.
+	if now.Before(leaf.NotBefore) {
+		return issuedInvalid("certificate-not-yet-valid")
+	}
+	if now.After(leaf.NotAfter) {
+		return issuedInvalid("certificate-expired")
+	}
+	if !hasClientAuth(leaf.ExtKeyUsage) {
+		return issuedInvalid("certificate-purpose")
 	}
 
 	caCertificates, err := parseCertificates([]byte(result.CAPEM))
 	if err != nil {
-		return ErrIssuedInvalid
+		return issuedInvalid("ca-parse")
 	}
 	var pinnedCA *x509.Certificate
 	for _, cert := range caCertificates {
@@ -176,9 +211,8 @@ func VerifyIssued(result Result, key *ecdsa.PrivateKey, caSource any, pinnedFing
 		}
 	}
 	if pinnedCA == nil || !pinnedCA.IsCA {
-		return ErrIssuedInvalid
+		return issuedInvalid("ca-pin")
 	}
-
 	roots := x509.NewCertPool()
 	roots.AddCert(pinnedCA)
 	intermediates := x509.NewCertPool()
@@ -187,39 +221,43 @@ func VerifyIssued(result Result, key *ecdsa.PrivateKey, caSource any, pinnedFing
 			intermediates.AddCert(cert)
 		}
 	}
+	verify := func(pool *x509.CertPool) error {
+		_, err := leaf.Verify(x509.VerifyOptions{Roots: pool, Intermediates: intermediates, CurrentTime: now, KeyUsages: []x509.ExtKeyUsage{x509.ExtKeyUsageClientAuth}})
+		if err != nil {
+			return issuedChainFailure(err, now)
+		}
+		return nil
+	}
 	switch source := caSource.(type) {
 	case nil:
 	case *x509.CertPool:
 		if source == nil {
-			return ErrIssuedInvalid
+			return issuedInvalid("ca-source")
 		}
-		// Verify once against the caller's trust input as well as the pinned root.
-		if _, err := leaf.Verify(x509.VerifyOptions{Roots: source, Intermediates: intermediates, CurrentTime: now, KeyUsages: []x509.ExtKeyUsage{x509.ExtKeyUsageClientAuth}}); err != nil {
-			return ErrIssuedInvalid
+		// Verify against both the caller's trust input and the pinned root.
+		if err := verify(source); err != nil {
+			return err
 		}
 	case []byte:
 		pool, certs, err := poolFromPEM(source)
 		if err != nil || !containsFingerprint(certs, pinnedFingerprint) {
-			return ErrIssuedInvalid
+			return issuedInvalid("ca-source")
 		}
-		if _, err := leaf.Verify(x509.VerifyOptions{Roots: pool, Intermediates: intermediates, CurrentTime: now, KeyUsages: []x509.ExtKeyUsage{x509.ExtKeyUsageClientAuth}}); err != nil {
-			return ErrIssuedInvalid
+		if err := verify(pool); err != nil {
+			return err
 		}
 	case string:
 		pool, certs, err := poolFromPEM([]byte(source))
 		if err != nil || !containsFingerprint(certs, pinnedFingerprint) {
-			return ErrIssuedInvalid
+			return issuedInvalid("ca-source")
 		}
-		if _, err := leaf.Verify(x509.VerifyOptions{Roots: pool, Intermediates: intermediates, CurrentTime: now, KeyUsages: []x509.ExtKeyUsage{x509.ExtKeyUsageClientAuth}}); err != nil {
-			return ErrIssuedInvalid
+		if err := verify(pool); err != nil {
+			return err
 		}
 	default:
-		return ErrIssuedInvalid
+		return issuedInvalid("ca-source")
 	}
-	if _, err := leaf.Verify(x509.VerifyOptions{Roots: roots, Intermediates: intermediates, CurrentTime: now, KeyUsages: []x509.ExtKeyUsage{x509.ExtKeyUsageClientAuth}}); err != nil {
-		return ErrIssuedInvalid
-	}
-	return nil
+	return verify(roots)
 }
 
 func validCertDir(directory string) bool {

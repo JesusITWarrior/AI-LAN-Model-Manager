@@ -21,16 +21,18 @@ import (
 )
 
 type fakeTransport struct {
-	challenge Challenge
-	result    Result
-	beginErr  error
-	endErr    error
-	begins    int
-	completes int
-	got       Challenge
-	gotCSR    []byte
-	caKey     *ecdsa.PrivateKey
-	caCert    *x509.Certificate
+	challenge  Challenge
+	result     Result
+	beginErr   error
+	endErr     error
+	begins     int
+	completes  int
+	got        Challenge
+	gotCSR     []byte
+	caKey      *ecdsa.PrivateKey
+	caCert     *x509.Certificate
+	now        time.Time
+	mutateLeaf func(*x509.Certificate)
 }
 
 func (f *fakeTransport) Begin(context.Context, pairing.Binding) (Challenge, error) {
@@ -52,8 +54,14 @@ func (f *fakeTransport) Complete(_ context.Context, ch Challenge, _ pairing.Proo
 	if err != nil || csr.CheckSignature() != nil {
 		return Result{}, errors.New("bad csr")
 	}
-	now := time.Now().UTC()
+	now := f.now
+	if now.IsZero() {
+		now = time.Now().UTC()
+	}
 	leaf := &x509.Certificate{SerialNumber: big.NewInt(2), Subject: pkix.Name{CommonName: f.result.Binding.CandidateID}, IPAddresses: []net.IP{net.ParseIP(f.result.Binding.Address)}, NotBefore: now.Add(-time.Minute), NotAfter: now.Add(time.Hour), KeyUsage: x509.KeyUsageDigitalSignature, ExtKeyUsage: []x509.ExtKeyUsage{x509.ExtKeyUsageClientAuth}}
+	if f.mutateLeaf != nil {
+		f.mutateLeaf(leaf)
+	}
 	der, err := x509.CreateCertificate(rand.Reader, leaf, f.caCert, csr.PublicKey, f.caKey)
 	if err != nil {
 		return Result{}, err
@@ -65,7 +73,11 @@ func (f *fakeTransport) Complete(_ context.Context, ch Challenge, _ pairing.Proo
 
 func fixture(t *testing.T) (Config, Challenge, Result, *fakeTransport) {
 	t.Helper()
-	now := time.Now().UTC()
+	return fixtureAt(t, time.Now().UTC())
+}
+
+func fixtureAt(t *testing.T, now time.Time) (Config, Challenge, Result, *fakeTransport) {
+	t.Helper()
 	caKey, err := ecdsa.GenerateKey(elliptic.P256(), rand.Reader)
 	if err != nil {
 		t.Fatal(err)
@@ -88,7 +100,7 @@ func fixture(t *testing.T) (Config, Challenge, Result, *fakeTransport) {
 	}
 	ch := Challenge{ControllerURL: cfg.ControllerURL, PinnedCAFingerprintSHA256: pin, OperatorCode: "23456789", Pairing: pairing.Challenge{ChallengeID: strings.Repeat("a", 64), ControllerNonce: "BwcHBwcHBwcHBwcHBwcHBwcHBwcHBwcHBwcHBwcHBwc", Binding: binding, ExpiresAt: now.Add(time.Hour)}}
 	result := Result{ControllerURL: cfg.ControllerURL, PinnedCAFingerprintSHA256: pin, ChallengeID: ch.Pairing.ChallengeID, Binding: binding, CAPEM: caPEM, EnrolledAt: now}
-	transport := &fakeTransport{challenge: ch, result: result, caKey: caKey, caCert: caCert}
+	transport := &fakeTransport{challenge: ch, result: result, caKey: caKey, caCert: caCert, now: now}
 	return cfg, ch, result, transport
 }
 
@@ -196,5 +208,60 @@ func TestErrorsAreRedacted(t *testing.T) {
 	_, err = client.Enroll(context.Background())
 	if !errors.Is(err, ErrFailed) || strings.Contains(err.Error(), secret) || strings.Contains(err.Error(), ch.OperatorCode) {
 		t.Fatalf("leak: %v", err)
+	}
+}
+
+// Synthetic clocks reproduce issuance at 17:43:39 and a verifier 15 seconds
+// behind. No live certificates, keys, or clock changes are involved.
+func TestClockSkewFailsClosedOrUsesBoundedIssuanceBackdate(t *testing.T) {
+	controllerNow := time.Date(2026, 11, 3, 17, 43, 39, 468000000, time.UTC)
+	for _, tc := range []struct {
+		name          string
+		backdate, lag time.Duration
+		reason        string
+	}{
+		{"legacy-zero-backdate", 0, 15 * time.Second, "certificate-not-yet-valid"},
+		{"bounded-15-second-lag", time.Minute, 15 * time.Second, ""},
+		{"bounded-60-second-lag", time.Minute, time.Minute, ""},
+		{"beyond-bound-fails-closed", time.Minute, 61 * time.Second, "certificate-not-yet-valid"},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			cfg, _, _, transport := fixtureAt(t, controllerNow)
+			transport.mutateLeaf = func(leaf *x509.Certificate) {
+				leaf.NotBefore = controllerNow.Add(-tc.backdate)
+				leaf.NotAfter = controllerNow.Add(30 * 24 * time.Hour)
+			}
+			client, err := New(cfg, transport, nil)
+			if err != nil {
+				t.Fatal(err)
+			}
+			client.now = func() time.Time { return controllerNow.Add(-tc.lag) }
+			out, err := client.Enroll(context.Background())
+			if tc.reason == "" {
+				if err != nil || out.Status != StatusEnrolled {
+					t.Fatalf("bounded backdate failed: %v", err)
+				}
+				if _, err := (FileStore{CertDir: cfg.CertDir}).Load(context.Background()); err != nil {
+					t.Fatal(err)
+				}
+			} else {
+				stage, reason, status := FailureDetails(err)
+				if !errors.Is(err, ErrFailed) || out.Status != StatusDegraded || stage != "verify" || reason != tc.reason || status != 0 {
+					t.Fatalf("unexpected result: %s %s %d %v", stage, reason, status, err)
+				}
+				if _, err := os.Stat(filepath.Join(cfg.CertDir, "enrollment.json")); !errors.Is(err, os.ErrNotExist) {
+					t.Fatal("failed verification persisted enrollment")
+				}
+				if _, err := os.Stat(filepath.Join(cfg.CertDir, identityKeyName)); err != nil {
+					t.Fatal("persistent key missing")
+				}
+				if client.pending != nil || client.key != nil {
+					t.Fatal("failed verification retained pending authorization")
+				}
+				if _, err := client.Enroll(context.Background()); !errors.Is(err, ErrUnavailable) || transport.begins != 1 || transport.completes != 1 {
+					t.Fatal("failed verification replayed consumed challenge")
+				}
+			}
+		})
 	}
 }

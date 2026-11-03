@@ -108,3 +108,24 @@ func TestDiscardBeforeProofZerosOperatorCode(t *testing.T) {
 		t.Fatal("discard left plaintext code in session")
 	}
 }
+
+func TestVerificationResultBindingFailureIsDistinctAndUnknownReasonsAreRedacted(t *testing.T) {
+	cfg, _, _, transport := fixture(t)
+	transport.result.ChallengeID = strings.Repeat("b", 64)
+	client, err := New(cfg, transport, nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	_, err = client.Enroll(context.Background())
+	stage, reason, status := FailureDetails(err)
+	if !errors.Is(err, ErrFailed) || stage != "verify" || reason != "result-invalid" || status != 0 {
+		t.Fatalf("unexpected result: %s %s %d %v", stage, reason, status, err)
+	}
+	if _, err := os.Stat(filepath.Join(cfg.CertDir, "enrollment.json")); !errors.Is(err, os.ErrNotExist) {
+		t.Fatal("invalid result persisted enrollment")
+	}
+	stage, reason, status = FailureDetails(&Failure{Stage: "remote-private-detail", Reason: "remote-private-detail", HTTPStatus: 999})
+	if stage != "enrollment" || reason != "failed" || status != 0 {
+		t.Fatal("untrusted diagnostics were not redacted")
+	}
+}

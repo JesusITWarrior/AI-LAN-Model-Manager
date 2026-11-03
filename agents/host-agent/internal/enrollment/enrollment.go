@@ -252,9 +252,13 @@ func (c *Client) Complete(ctx context.Context) (Outcome, error) {
 		c.clearPending()
 		return failedOutcome("complete", "failed", err)
 	}
-	if !c.validResult(result, challenge.Pairing.ChallengeID) || VerifyIssued(result, c.key, result.CAPEM, c.cfg.PinnedCAFingerprintSHA256, c.now()) != nil {
+	if !c.validResult(result, challenge.Pairing.ChallengeID) {
 		c.clearPending()
-		return failedOutcome("verify", "failed", nil)
+		return failedOutcome("verify", "result-invalid", nil)
+	}
+	if err := VerifyIssued(result, c.key, result.CAPEM, c.cfg.PinnedCAFingerprintSHA256, c.now()); err != nil {
+		c.clearPending()
+		return failedOutcome("verify", "failed", err)
 	}
 	if err := c.store.Save(ctx, result); err != nil {
 		c.clearPending()

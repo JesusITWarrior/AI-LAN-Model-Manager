@@ -292,3 +292,44 @@ func TestVerifyIssuedErrorsAreRedactedAndLeafIsExact(t *testing.T) {
 func bigInt(value int64) *big.Int { return big.NewInt(value) }
 
 var _ io.Reader = failingReader{}
+
+func TestVerifyIssuedFixedDiagnosticsAndStrictChainTime(t *testing.T) {
+	cases := []struct {
+		name       string
+		mutateLeaf func(*x509.Certificate)
+		mutate     func(*issuedFixture)
+		reason     string
+	}{
+		{name: "future-leaf", mutateLeaf: func(c *x509.Certificate) { c.NotBefore = time.Date(2026, 9, 29, 12, 0, 1, 0, time.UTC) }, reason: "certificate-not-yet-valid"},
+		{name: "expired-leaf", mutateLeaf: func(c *x509.Certificate) { c.NotAfter = time.Date(2026, 9, 29, 11, 59, 59, 0, time.UTC) }, reason: "certificate-expired"},
+		{name: "wrong-purpose", mutateLeaf: func(c *x509.Certificate) { c.ExtKeyUsage = []x509.ExtKeyUsage{x509.ExtKeyUsageServerAuth} }, reason: "certificate-purpose"},
+		{name: "future-ca", mutateLeaf: func(c *x509.Certificate) { c.NotBefore = c.NotBefore.Add(-3 * time.Hour) }, mutate: func(f *issuedFixture) { f.now = f.now.Add(-2 * time.Hour) }, reason: "chain-not-yet-valid"},
+		{name: "expired-ca", mutateLeaf: func(c *x509.Certificate) { c.NotAfter = c.NotAfter.Add(48 * time.Hour) }, mutate: func(f *issuedFixture) { f.now = f.now.Add(25 * time.Hour) }, reason: "chain-expired"},
+		{name: "wrong-trust-pool", mutate: func(f *issuedFixture) { f.roots = x509.NewCertPool() }, reason: "chain-untrusted"},
+		{name: "bad-signature", mutate: func(f *issuedFixture) {
+			block, _ := pem.Decode([]byte(f.result.CertificatePEM))
+			block.Bytes[len(block.Bytes)-1] ^= 1
+			f.result.CertificatePEM = string(pem.EncodeToMemory(block))
+		}, reason: "chain-untrusted"},
+		{name: "wrong-binding", mutate: func(f *issuedFixture) { f.result.Binding.CandidateID = "other-agent" }, reason: "binding-mismatch"},
+		{name: "wrong-key", mutate: func(f *issuedFixture) { f.key, _ = ecdsa.GenerateKey(elliptic.P256(), rand.Reader) }, reason: "key-mismatch"},
+		{name: "invalid-pem", mutate: func(f *issuedFixture) { f.result.CertificatePEM = "remote-private-detail" }, reason: "certificate-parse"},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			f := makeIssued(t, tc.mutateLeaf)
+			if tc.mutate != nil {
+				tc.mutate(&f)
+			}
+			err := VerifyIssued(f.result, f.key, f.roots, f.pin, f.now)
+			if !errors.Is(err, ErrIssuedInvalid) {
+				t.Fatalf("accepted invalid certificate: %v", err)
+			}
+			_, failure := failedOutcome("verify", "failed", err)
+			stage, reason, status := FailureDetails(failure)
+			if stage != "verify" || reason != tc.reason || status != 0 || err.Error() != "issued certificate invalid" || failure.Error() != "enrollment failed" {
+				t.Fatalf("diagnostic/redaction: %s %s %d %v", stage, reason, status, err)
+			}
+		})
+	}
+}
