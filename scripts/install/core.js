@@ -8,7 +8,24 @@ const HEX=/^[a-f0-9]{64}$/;
 const ROLES=new Set(["controller","agent"]);
 
 export function safeVersion(value){if(typeof value!=="string"||value.length>128||!VERSION.test(value)||value.includes(".."))throw new Error("ERR_INSTALL_VERSION");return value;}
-export function compareVersions(a,b){safeVersion(a);safeVersion(b);const [ac,ap]=a.split("-",2),[bc,bp]=b.split("-",2),an=ac.split(".").map(Number),bn=bc.split(".").map(Number);for(let i=0;i<3;i++)if(an[i]!==bn[i])return an[i]<bn[i]?-1:1;if(ap===bp)return 0;if(ap===undefined)return 1;if(bp===undefined)return -1;return ap<bp?-1:ap>bp?1:0;}
+// Keep the storage grammar unchanged; compare accepted numeric spellings without
+// Number precision loss, and retain every hyphen after the core/prerelease split.
+function compareNumeric(a,b){const ac=a.replace(/^0+/,"")||"0",bc=b.replace(/^0+/,"")||"0";return ac.length!==bc.length?(ac.length<bc.length?-1:1):ac<bc?-1:ac>bc?1:0;}
+export function compareVersions(a,b){
+ safeVersion(a);safeVersion(b);
+ const split=value=>{const dash=value.indexOf("-");return dash<0?[value,undefined]:[value.slice(0,dash),value.slice(dash+1)];};
+ const [ac,ap]=split(a),[bc,bp]=split(b),an=ac.split("."),bn=bc.split(".");
+ for(let i=0;i<3;i++){const order=compareNumeric(an[i],bn[i]);if(order)return order;}
+ if(ap===bp)return 0;if(ap===undefined)return 1;if(bp===undefined)return -1;
+ const ai=ap.split("."),bi=bp.split(".");
+ for(let i=0;i<Math.min(ai.length,bi.length);i++){
+  const x=ai[i],y=bi[i];if(x===y)continue;
+  const xn=/^[0-9]+$/.test(x),yn=/^[0-9]+$/.test(y);
+  const order=xn&&yn?compareNumeric(x,y):xn!==yn?(xn?-1:1):x<y?-1:x>y?1:0;
+  if(order)return order;
+ }
+ return ai.length<bi.length?-1:ai.length>bi.length?1:0;
+}
 export function safeRole(value){if(!ROLES.has(value))throw new Error("ERR_INSTALL_ROLE");return value;}
 export function safeRelative(value){if(typeof value!=="string"||!REL.test(value)||isAbsolute(value)||value.split("/").some(part=>part===""||part==="."||part===".."))throw new Error("ERR_INSTALL_PATH");return value;}
 export function contained(root,path){const r=resolve(root),p=resolve(path),prefix=r.endsWith(sep)?r:r+sep;return p===r||p.startsWith(prefix);}

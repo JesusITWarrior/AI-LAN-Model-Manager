@@ -5,7 +5,7 @@ import {tmpdir} from "node:os";
 import {join} from "node:path";
 import {fileURLToPath} from "node:url";
 import {spawnSync} from "node:child_process";
-import {contained,createManifest,installPlan,installRelease,inventoryTree,safeRelative,uninstall,verifyManifest} from "../core.js";
+import {compareVersions,safeVersion,contained,createManifest,installPlan,installRelease,inventoryTree,safeRelative,uninstall,verifyManifest} from "../core.js";
 
 const COMMIT="9f9f243e76991e4fd5e8365001f2074bdfe44ffd";
 async function payload(root:string,version:string,body:string,role="agent"){const dir=join(root,`payload-${version}`);await mkdir(join(dir,"bin"),{recursive:true});await writeFile(join(dir,"bin",role==="agent"?"lan-model-agent":"lan-model-controller"),body,{mode:0o755});const files=await inventoryTree(dir);return{dir,manifest:createManifest({role,version,files,sourceCommit:COMMIT})};}
@@ -53,4 +53,48 @@ test("Windows native service configuration fixture (mock CIM; no live changes)",
   assert.equal(result.error,undefined);
   assert.equal(result.status,0,result.stdout+result.stderr);
   assert.match(result.stdout,/PASS typed service configuration/);
+});
+
+
+test("version precedence follows SemVer identifiers without truncation or numeric overflow",()=>{
+  const chain=["1.0.0-alpha","1.0.0-alpha.1","1.0.0-alpha.beta","1.0.0-beta","1.0.0-beta.2","1.0.0-beta.11","1.0.0-rc.1","1.0.0"];
+  for(let i=0;i<chain.length;i++)for(let j=0;j<chain.length;j++)assert.equal(compareVersions(chain[i],chain[j]),Math.sign(i-j),`${chain[i]} vs ${chain[j]}`);
+  const pairs=[
+    ["0.1.0-alpha.8","0.1.0-alpha.10"],
+    ["1.0.0-alpha-1","1.0.0-alpha-2"],
+    ["1.0.0-alpha-1.8","1.0.0-alpha-1.10"],
+    ["1.0.0-9","1.0.0-A"],["1.0.0-Z","1.0.0-a"],
+    ["9007199254740992.0.0","9007199254740993.0.0"],
+    ["1.9007199254740992.0","1.9007199254740993.0"],
+    ["1.0.9007199254740992","1.0.9007199254740993"],
+    ["1.0.0-9007199254740992","1.0.0-9007199254740993"],
+    ["1.0.0-"+"9".repeat(119),"1.0.0-1"+"0".repeat(120)],
+    ["1.2.3","1.2.4"],["1.2.99","1.3.0"],["1.99.99","2.0.0"]
+  ];
+  for(const [a,b] of pairs){assert.equal(compareVersions(a,b),-1,`${a} < ${b}`);assert.equal(compareVersions(b,a),1);assert.equal(compareVersions(a,a),0);assert.equal(compareVersions(b,b),0);}
+  // Historical path-safe spellings remain accepted, with numeric components
+  // compared by value; build metadata and unsafe/unbounded paths stay rejected.
+  for(const version of ["01.002.0003-alpha.01","1.0.0-a-1","1.0.0-.","1.0.0-a."])assert.equal(safeVersion(version),version);
+  assert.equal(compareVersions("01.002.0003-alpha.01","1.2.3-alpha.1"),0);
+  for(const version of ["1.0.0+build","1.0.0-a..b","../1.0.0","1.0.0-","1.0.0-"+"a".repeat(123)]){
+    assert.throws(()=>compareVersions(version,"1.0.0"),/ERR_INSTALL_VERSION/);
+    assert.throws(()=>compareVersions("1.0.0",version),/ERR_INSTALL_VERSION/);
+  }
+});
+
+test("Windows package CLI permits Alpha8 to Alpha10 and rejects reverse before mutation",async()=>{
+  const root=await mkdtemp(join(tmpdir(),"lmm-win-alpha-")),v8=await payload(root,"0.1.0-alpha.8","alpha8"),v10=await payload(root,"0.1.0-alpha.10","alpha10");
+  const cli=fileURLToPath(new URL("../cli.js",import.meta.url));
+  for(const p of [v8,v10])await writeFile(join(p.dir,"manifest.json"),JSON.stringify(p.manifest));
+  const run=(command:string,p:typeof v8,dryRun=false)=>spawnSync(process.execPath,[cli,command,"--platform","windows","--root",root,"--payload",p.dir,"--manifest",join(p.dir,"manifest.json"),...(dryRun?["--dry-run"]:[])],{encoding:"utf8"});
+  let result=run("install",v8);assert.equal(result.status,0,result.stderr);
+  const plan=installPlan({platform:"windows",root,role:"agent",version:v10.manifest.version});
+  await writeFile(join(plan.state,"enrollment.key"),"keep-enrollment");await writeFile(join(plan.config,"keep.conf"),"keep-config");
+  const before=await inventoryTree(join(root,"Program Files")),dataBefore=await inventoryTree(join(root,"ProgramData"));
+  result=run("upgrade",v10,true);assert.equal(result.status,0,result.stderr);assert.equal(JSON.parse(result.stdout).changed,false);
+  assert.deepEqual(await inventoryTree(join(root,"Program Files")),before);assert.deepEqual(await inventoryTree(join(root,"ProgramData")),dataBefore);
+  result=run("upgrade",v10);assert.equal(result.status,0,result.stderr);assert.equal(JSON.parse(result.stdout).changed,true);assert.equal(await readFile(plan.pointer,"utf8"),v10.manifest.version+"\n");
+  assert.equal(await readFile(join(plan.state,"enrollment.key"),"utf8"),"keep-enrollment");assert.equal(await readFile(join(plan.config,"keep.conf"),"utf8"),"keep-config");
+  const installed=await inventoryTree(join(root,"Program Files")),installedData=await inventoryTree(join(root,"ProgramData"));
+  for(const dryRun of [true,false]){result=run("upgrade",v8,dryRun);assert.notEqual(result.status,0);assert.match(result.stderr,/ERR_INSTALL_DOWNGRADE/);assert.deepEqual(await inventoryTree(join(root,"Program Files")),installed);assert.deepEqual(await inventoryTree(join(root,"ProgramData")),installedData);}
 });
