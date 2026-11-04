@@ -10,3 +10,20 @@
 @media(max-width:1000px){.settingsStack .tokenForm{display:grid;grid-template-columns:repeat(auto-fit,minmax(220px,1fr));align-items:end}.settingsStack .tokenForm>h3,.settingsStack .tokenForm>p{grid-column:1/-1}.settingsStack .tokenForm>button{width:100%}}
 @media(max-width:800px){.railFooter{display:flex;align-items:center;justify-content:space-between;gap:12px;padding:14px 0 0}.railLogout{min-width:100px}.stepGuide{grid-template-columns:1fr}.panelHead .primaryLink{width:100%}}
 @media(max-width:480px){.railFooter{align-items:stretch;flex-direction:column}.railLogout{width:100%}.settingsStack .tokenForm{grid-template-columns:minmax(0,1fr)}.settingsStack .secretReveal{margin:12px}.settingsStack>.panel>button{width:calc(100% - 24px);margin:0 12px 12px}.stepGuide{padding:0 12px 12px}}
+
+/* Lifecycle notices are documents, not the global horizontal notice row.
+   Keep overflow protection local; other panels retain their clipping behavior. */
+.lifecycleReview{min-width:0;max-width:100%;overflow-wrap:anywhere;line-height:1.5}
+.lifecycleReview .lifecycleNotice{display:grid;grid-template-columns:minmax(0,1fr);gap:14px;min-width:0;margin-top:16px}
+.lifecycleReview .lifecycleNotice>*{min-width:0;max-width:100%;margin:0}
+.lifecycleTarget{display:grid;gap:10px}
+.lifecycleTarget>div{display:grid;grid-template-columns:minmax(0,1fr);gap:2px}
+.lifecycleTarget dt{font-size:12px}
+.lifecycleTarget dd{display:block;min-width:0;margin:0}
+.lifecycleReview details>p{margin-top:8px}
+.lifecycleReview summary{cursor:pointer}
+.lifecycleReview ul{padding-left:20px}
+.lifecycleReview .controls{min-width:0;max-width:100%;padding:12px;gap:10px;align-items:stretch}
+.lifecycleReview .controls>*{flex:1 1 160px;min-width:0;max-width:100%;white-space:normal;overflow-wrap:anywhere}
+.lifecycleReview button{max-width:100%;white-space:normal;overflow-wrap:anywhere}
+.lifecycleReview .notice button{margin-left:0;justify-self:start}
