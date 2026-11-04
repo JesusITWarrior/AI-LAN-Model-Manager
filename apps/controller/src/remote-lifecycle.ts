@@ -17,6 +17,8 @@ const object = (value: unknown): Record<string, unknown> | null => typeof value 
  */
 export class RemoteLifecycleController {
   private accepting = true;
+  private readonly closing=new Set<()=>void>();
+  onShutdown(callback:()=>void):()=>void {this.closing.add(callback);return()=>this.closing.delete(callback);}
   private readonly executions = new Map<AbortController, { promise: Promise<LifecycleResult>; modelId: string | null }>();
   get acceptsSubmissions(): boolean { return this.accepting; }
   start(): void { this.accepting = true; }
@@ -26,7 +28,8 @@ export class RemoteLifecycleController {
   async shutdown(): Promise<void> {
     this.accepting = false;
     let failure: unknown;
-    try { this.recover(); } catch (error) { failure = error; }
+    for(const callback of [...this.closing]) {try {callback();}catch(error){failure??=error;}}
+    try { this.recover(); } catch (error) { failure ??= error; }
     for (const [controller, execution] of this.executions) {
       if (execution.modelId && this.admissions) {
         try { void this.admissions.stopAdmission(execution.modelId); } catch { /* unknown remains fail-closed */ }

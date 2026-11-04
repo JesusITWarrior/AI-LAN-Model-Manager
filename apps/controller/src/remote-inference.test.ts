@@ -111,8 +111,10 @@ test("migration16 preserves all fifteen historical checksums",()=>{
   const intent={requestId:"1".repeat(64),actorKind:"owner",actorId:OWNER,operation:"model-load",targetKind:"model",targetId:"model-1",hostId:"host-1",modelId:"model-1",observationFresh:true,hostRevoked:false,modelCompatible:true,publicExposure:false,availableMemoryBytes:90,availableVramBytes:0,availableStorageBytes:90,activeOperations:0,operationsLastMinute:0};
   assert.ok(oldPolicy.authorize(intent).ok);const approval=oldPolicy.approve(intent.requestId,guard);assert.ok(approval.ok);assert.ok(oldPolicy.consume(approval.value.approvalId,intent).ok);
   const before=db.prepare("SELECT * FROM schema_migrations ORDER BY version").all(),tables=["authorization_requests","approvals","decisions","audit_events"],rows=tables.map(t=>db.prepare(`SELECT * FROM ${t} ORDER BY rowid`).all());
-  migrateControllerDatabase(db);assert.deepEqual(db.prepare("SELECT * FROM schema_migrations WHERE version<=15 ORDER BY version").all(),before);assert.equal(db.prepare("PRAGMA user_version").get()!.user_version,17);
-  assert.deepEqual(tables.map(t=>db.prepare(`SELECT * FROM ${t} ORDER BY rowid`).all()),rows);assert.deepEqual(db.prepare("PRAGMA foreign_key_check").all(),[]);
+  migrateControllerDatabase(db);assert.deepEqual(db.prepare("SELECT * FROM schema_migrations WHERE version<=15 ORDER BY version").all(),before);assert.equal(db.prepare("PRAGMA user_version").get()!.user_version,18);
+  const upgraded=tables.map(t=>db.prepare(`SELECT * FROM ${t} ORDER BY rowid`).all());
+  for(const row of upgraded[1]!)for(const column of ["granting_session_binding","granting_credential_version","granted_command_digest"]){assert.equal(row[column],null);delete row[column];}
+  assert.deepEqual(upgraded,rows);assert.deepEqual(db.prepare("PRAGMA foreign_key_check").all(),[]);
   assert.ok(oldPolicy.install({...allowed,version:2},guard).ok);const inference=oldPolicy.authorize({...intent,requestId:"2".repeat(64),operation:"model-inference"});assert.ok(inference.ok);assert.equal(inference.value.allowed,true);
  }finally{db.close();}
 });

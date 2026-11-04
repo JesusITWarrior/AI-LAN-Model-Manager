@@ -26,3 +26,12 @@ test("active inference lease blocks drain and unload until released",async()=>{c
 test("newer inventory and lifecycle completion settle atomically as failed",async()=>{const x=setup();try{const value=command("load",5),promise=x.remote.execute(value,new AbortController().signal);await new Promise(resolve=>setImmediate(resolve));assert.ok(x.queue.poll("host-1").command);x.setNow("2026-09-29T10:00:02.000Z");x.repos.models.upsert({modelId:"model-1",providerId:"ollama-1",hostId:"host-1",canonicalName:"qwen:latest",state:"installed",type:"llm",digest:"",digestKnown:false,observedAt:"2026-09-29T10:00:02.000Z",snapshot:{runtimeState:"unloaded",activeRequests:0}});assert.ok(x.queue.complete("host-1",response(value.request,"load",T1)));assert.deepEqual(await promise,{ok:false,error:"ERR_LIFECYCLE_OBSERVATION"});assert.equal(x.jobs.jobs.get(value.request.jobId)?.state,"failed");assert.equal(x.repos.models.get("model-1")?.observedAt,"2026-09-29T10:00:02.000Z");}finally{x.db.close();}});
 
 test("wrong target, stale/late result and cancellation fail closed",async()=>{const x=setup();try{const value=command("load",4),controller=new AbortController(),promise=x.remote.execute(value,controller.signal);await new Promise(resolve=>setImmediate(resolve));assert.ok(x.queue.poll("host-1").command);assert.equal(x.queue.complete("host-1",response(value.request,"load","2027-09-29T10:00:00.000Z")),null);assert.equal(x.queue.complete("host-1",response(value.request,"load",T0)),null);assert.equal(x.queue.complete("other",response(value.request,"load")),null);assert.equal(x.remote.cancel(value.request.jobId).ok,true);controller.abort();assert.equal(x.queue.complete("host-1",response(value.request,"load")),null);assert.deepEqual(await promise,{ok:true,state:"cancelled",observation:null});}finally{x.db.close();}});
+
+test("a proposal cleanup failure cannot skip lifecycle admission closure, cancellation or joining its wait",async()=>{
+ const x=setup();try{
+  const value=command("load",6),pending=x.remote.execute(value,new AbortController().signal);await new Promise(r=>setImmediate(r));assert.ok(x.queue.poll("host-1").command);
+  x.remote.onShutdown(()=>{throw new Error("fixture cleanup failure");});
+  await assert.rejects(x.remote.shutdown(),/fixture cleanup failure/);
+  assert.equal(x.remote.acceptsSubmissions,false);assert.equal(x.jobs.jobs.get(value.request.jobId)?.state,"cancelled");assert.equal((await pending).ok,true);assert.equal(x.admissions.snapshot("model-1").draining,true);
+ }finally{x.db.close();}
+});

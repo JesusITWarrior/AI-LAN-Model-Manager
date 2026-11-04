@@ -470,6 +470,29 @@ ALTER TABLE transport_replay_state_v17 RENAME TO transport_replay_state;
 CREATE INDEX transport_replay_host_idx ON transport_replay_state(host_id,certificate_fingerprint);
 `;
 
+// Exact proposal authority is separate from legacy approval grants. Restart never
+// recreates a proposal from these records; they only restrict existing authority.
+const migration18Sql = `
+CREATE TABLE lifecycle_proposal_authorizations (
+ request_id TEXT PRIMARY KEY REFERENCES authorization_requests(request_id),
+ session_binding TEXT NOT NULL CHECK(length(session_binding)=64),
+ credential_version INTEGER NOT NULL CHECK(credential_version>0),
+ command_digest TEXT NOT NULL CHECK(length(command_digest)=64),
+ expires_at TEXT NOT NULL,
+ revoked_at TEXT
+) STRICT;
+ALTER TABLE approvals ADD COLUMN granting_session_binding TEXT;
+ALTER TABLE approvals ADD COLUMN granting_credential_version INTEGER;
+ALTER TABLE approvals ADD COLUMN granted_command_digest TEXT;
+CREATE TABLE lifecycle_proposal_jobs (
+ proposal_id TEXT PRIMARY KEY CHECK(length(proposal_id)=64),
+ job_id TEXT NOT NULL UNIQUE,
+ session_binding TEXT NOT NULL CHECK(length(session_binding)=64),
+ credential_version INTEGER NOT NULL CHECK(credential_version>0),
+ review_json TEXT NOT NULL CHECK(json_valid(review_json))
+) STRICT;
+`;
+
 export const CONTROLLER_MIGRATIONS: readonly Migration[] = Object.freeze([
   Object.freeze({ version: 1, name: "inventory-v1", sql: migration1Sql, checksum: migrationChecksum(migration1Sql) }),
   Object.freeze({ version: 2, name: "durable-jobs-v1", sql: migration2Sql, checksum: migrationChecksum(migration2Sql) }),
@@ -488,6 +511,7 @@ export const CONTROLLER_MIGRATIONS: readonly Migration[] = Object.freeze([
   Object.freeze({ version: 15, name: "approval-command-binding-v1", sql: migration15Sql, checksum: migrationChecksum(migration15Sql) }),
   Object.freeze({ version: 16, name: "redacted-inference-executions-v1", sql: migration16Sql, checksum: migrationChecksum(migration16Sql) }),
   Object.freeze({ version: 17, name: "numeric-certificate-serial-v1", sql: migration17Sql, checksum: migrationChecksum(migration17Sql) }),
+  Object.freeze({ version: 18, name: "owner-proposal-exact-session-v1", sql: migration18Sql, checksum: migrationChecksum(migration18Sql) }),
 ]);
 
 function validateMigrations(migrations: readonly Migration[]): void {

@@ -8,7 +8,7 @@ test("pending approvals expose exact public targets and disappear after grant",(
 test("expiry version drift and digest mismatch fail closed",()=>{const db=openControllerDatabase(":memory:");try{let now=NOW,random=6;const service=new PolicyService(db,{clock:()=>now,random:n=>Buffer.alloc(n,++random)});assert.ok(service.install(policy(),auth()).ok);const request=intent(),decision=service.authorize(request),grant=service.approve(request.requestId,auth(),1000);assert.ok(decision.ok&&grant.ok);assert.equal(service.consume(grant.value.approvalId,{...request,targetId:"model-2"}).ok,false);assert.ok(service.install(policy(2),auth()).ok);assert.equal(service.consume(grant.value.approvalId,request).ok,false);const request2=intent("2".repeat(64));service.authorize(request2);const grant2=service.approve(request2.requestId,auth(),1000);assert.ok(grant2.ok);now="2026-09-28T07:00:01.000Z";assert.equal(service.consume(grant2.value.approvalId,request2).ok,false);}finally{db.close();}});
 test("no-prompt convenience mode skips prompts but preserves hard denials and is audited",()=>{const db=openControllerDatabase(":memory:");try{const service=new PolicyService(db,{clock:()=>NOW});assert.ok(service.install(policy(),auth()).ok);let settings=service.settings(auth());assert.ok(settings.ok);assert.equal(settings.value.noPromptEnabled,false);assert.ok(service.setConvenience({enabled:true},auth()).ok);settings=service.settings(auth());assert.ok(settings.ok);assert.equal(settings.value.noPromptEnabled,true);const allowed=service.authorize(intent("3".repeat(64)));assert.ok(allowed.ok);assert.equal(allowed.value.requiresApproval,false);assert.equal(allowed.value.allowed,true);const denied=service.authorize({...intent("4".repeat(64)),observationFresh:false});assert.ok(denied.ok);assert.equal(denied.value.allowed,false);assert.ok(denied.value.reasons.includes("stale-host"));assert.ok(service.setConvenience({enabled:false},auth()).ok);const prompted=service.authorize(intent("5".repeat(64)));assert.ok(prompted.ok);assert.equal(prompted.value.requiresApproval,true);assert.equal(db.prepare("SELECT COUNT(*) count FROM audit_events WHERE json_extract(event_json,'$.action') LIKE 'policy-no-prompt-%'").get()!.count,2);}finally{db.close();}});
 test("concurrent approval consumption has one winner",async()=>{const db=openControllerDatabase(":memory:");try{const service=new PolicyService(db,{clock:()=>NOW,random:n=>Buffer.alloc(n,9)});service.install(policy(),auth());const request=intent();service.authorize(request);const grant=service.approve(request.requestId,auth());assert.ok(grant.ok);const results=await Promise.all([Promise.resolve().then(()=>service.consume(grant.value.approvalId,request)),Promise.resolve().then(()=>service.consume(grant.value.approvalId,request))]);assert.equal(results.filter(v=>v.ok).length,1);}finally{db.close();}});
-test("migration11 creates policy approval tables",()=>{assert.equal(CONTROLLER_MIGRATIONS.length,17);assert.equal(CONTROLLER_MIGRATIONS[10]!.name,"private-plan-authorization-v1");});
+test("migration11 creates policy approval tables",()=>{assert.equal(CONTROLLER_MIGRATIONS.length,18);assert.equal(CONTROLLER_MIGRATIONS[10]!.name,"private-plan-authorization-v1");});
 
 test("consumed approval validates only its durably bound canonical command",()=>{
  const db=openControllerDatabase(":memory:");
@@ -50,5 +50,34 @@ test("legacy consumed approvals stay unbound and fail closed after schema upgrad
   assert.equal(service.validateCapability(command.capability,input,decision.value,command),false);
   assert.equal(service.consume(grant.value.approvalId,input,command).ok,false);
   assert.equal((db.prepare("SELECT consumed_command_digest FROM approvals WHERE approval_id=?").get(grant.value.approvalId) as any).consumed_command_digest,null);
+ }finally{db.close();}
+});
+
+test("exact proposal grants bind immutable intent, full execution, unique session and credential version before consumption",()=>{
+ const db=openControllerDatabase(":memory:");try{
+  const service=new PolicyService(db,{clock:()=>NOW});assert.ok(service.install(policy(),auth()).ok);
+  const input={...intent(),actorKind:"owner" as const,actorId:"owner-1",operation:"model-load" as const,targetKind:"model" as const};
+  assert.ok(service.authorize(input).ok);
+  const command:CommandRequest={requestId:input.requestId,jobId:"exact-job",hostId:input.hostId,operation:"load",idempotencyKey:"exact-idem",sequence:1,deadline:"2026-09-28T07:04:00.000Z",capability:{operation:"model-load",targetKind:"model",targetId:"model-1",hostId:"host-1",modelId:"model-1",requestDigest:"0".repeat(64),expiresAt:"2026-09-28T07:04:00.000Z"},params:{providerId:"provider-1",model:"example:model"}};
+  (command.capability as {requestDigest:string}).requestDigest=commandAuthorizationDigest(command);
+  const binding={id:"a".repeat(64),credentialVersion:1,expiresAt:command.deadline};
+  assert.ok(service.bindProposal(input,command,binding));assert.equal(service.approve(input.requestId,auth()).ok,false);
+  assert.equal(service.approveExact({...input,availableMemoryBytes:2},command,auth(),binding).ok,false);
+  const grant=service.approveExact(input,command,auth(),binding);assert.ok(grant.ok);
+  assert.equal(service.consume(grant.value.approvalId,input,command).ok,false,"legacy consume cannot use exact grant");
+  assert.equal(service.consumeExact(grant.value.approvalId,input,command,{...binding,id:"b".repeat(64)}).ok,false,"another same-owner session cannot consume");
+  assert.equal(service.consumeExact(grant.value.approvalId,input,command,{...binding,credentialVersion:2}).ok,false);
+  assert.equal(service.consumeExact(grant.value.approvalId,{...input,availableMemoryBytes:2},command,binding).ok,false);
+  const changed={...command,jobId:"other-job",capability:{...command.capability}};changed.capability.requestDigest=commandAuthorizationDigest(changed);
+  assert.equal(service.consumeExact(grant.value.approvalId,input,changed,binding).ok,false);
+  assert.equal((db.prepare("SELECT consumed_at FROM approvals").get() as any).consumed_at,null);
+  assert.ok(service.consumeExact(grant.value.approvalId,input,command,binding).ok);assert.equal(service.consumeExact(grant.value.approvalId,input,command,binding).ok,false);
+ }finally{db.close();}
+});
+test("migration18 appends exact owner proposal authority without rewriting any of migrations1 through17",()=>{
+ const db=new DatabaseSync(":memory:");try{
+  migrateControllerDatabase(db,CONTROLLER_MIGRATIONS.slice(0,17));const before=db.prepare("SELECT * FROM schema_migrations ORDER BY version").all();
+  migrateControllerDatabase(db);assert.deepEqual(db.prepare("SELECT * FROM schema_migrations WHERE version<=17 ORDER BY version").all(),before);
+  assert.equal(db.prepare("PRAGMA user_version").get()!.user_version,18);assert.deepEqual(db.prepare("PRAGMA foreign_key_check").all(),[]);
  }finally{db.close();}
 });

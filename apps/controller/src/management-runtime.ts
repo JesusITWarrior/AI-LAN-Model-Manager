@@ -1,4 +1,5 @@
 /** Runtime-backed management composition; the read-only adapter remains available explicitly. */
+import { OwnerLifecycleProposals } from "./owner-lifecycle-proposals.js";
 import { ManagementLifecycleService } from "./management-lifecycle.js";
 import type { ControllerRuntimeHandle } from "./controller-runtime.js";
 import type { OriginPolicyOptions } from "./origin.js";
@@ -34,5 +35,6 @@ export function createManagementDependencies(
   operatorOptions: OperatorServiceOptions = {},
   clock: () => string = () => new Date().toISOString(),
 ): ManagementApiDependencies {
-  return { ...createReadManagementDependencies(runtime, allowedOrigins, originOptions, operatorOptions), lifecycle: new ManagementLifecycleService(runtime, clock) };
+  const lifecycle=new ManagementLifecycleService(runtime,clock);
+  return { ...createReadManagementDependencies(runtime, allowedOrigins, originOptions, operatorOptions), lifecycle, proposals:new OwnerLifecycleProposals(runtime,lifecycle,clock) };
 }

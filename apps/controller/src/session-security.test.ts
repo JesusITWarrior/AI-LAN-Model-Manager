@@ -38,3 +38,15 @@ test("origin policy is exact and loopback HTTP requires explicit development mod
 test("combined guard authenticates safe methods and enforces exact origin plus header-bound CSRF",async()=>{const{db,manager}=await setup();try{const session=await manager.create({username:"admin",password:"owner-password-123"});assert.ok(session);const origins=createAllowedOrigins(["https://manager.example"]),cookie=`__Host-lanmm_session=${session.sessionToken}`;assert.equal(guardManagementRequest(manager,origins,{method:"GET",cookieHeader:cookie,originHeader:null,csrfHeader:null}).ok,true);assert.deepEqual({...guardManagementRequest(manager,origins,{method:"POST",cookieHeader:"",originHeader:"https://manager.example",csrfHeader:session.csrfToken})},{ok:false,status:401,code:"UNAUTHORIZED"});assert.deepEqual({...guardManagementRequest(manager,origins,{method:"POST",cookieHeader:cookie,originHeader:"https://evil.example",csrfHeader:session.csrfToken})},{ok:false,status:403,code:"FORBIDDEN"});assert.equal(guardManagementRequest(manager,origins,{method:"POST",cookieHeader:cookie,originHeader:"https://manager.example",csrfHeader:null}).ok,false);assert.equal(guardManagementRequest(manager,origins,{method:"POST",cookieHeader:cookie,originHeader:"https://manager.example",csrfHeader:session.csrfToken}).ok,true);}finally{db.close();}});
 
 test("guard request DTO rejects getters, symbols, prototypes, and revoked proxies",async()=>{const{db,manager}=await setup();try{const origins=createAllowedOrigins(["https://manager.example"]);let calls=0;const accessor=Object.defineProperty({cookieHeader:"",originHeader:null,csrfHeader:null},"method",{enumerable:true,get(){calls++;return"GET";}});const revoked=Proxy.revocable({method:"GET",cookieHeader:"",originHeader:null,csrfHeader:null},{});revoked.revoke();for(const bad of [accessor,{method:"GET",cookieHeader:"",originHeader:null,csrfHeader:null,[Symbol("x")]:1},Object.assign(Object.create({}),{method:"GET",cookieHeader:"",originHeader:null,csrfHeader:null}),revoked.proxy])assert.equal(guardManagementRequest(manager,origins,bad).ok,false);assert.equal(calls,0);}finally{db.close();}});
+
+test("private lifecycle session binding is unique, unforgeable from metadata, revocable and expiry bounded",async()=>{
+ const {db,manager,setNow}=await setup();try{
+  const one=await manager.create({username:"admin",password:"owner-password-123"}),two=await manager.create({username:"admin",password:"owner-password-123"});assert.ok(one&&two);
+  assert.equal(one.metadata.sessionVersion,two.metadata.sessionVersion);
+  const a=manager.binding(one.metadata),b=manager.binding(two.metadata);assert.ok(a&&b);assert.notEqual(a.id,b.id);assert.equal(a.expiresAt,one.metadata.idleExpiresAt);
+  assert.equal(manager.binding({...one.metadata}),null);
+  assert.equal(JSON.stringify(one.metadata).includes(a.id),false);
+  assert.ok(manager.revoke(one.sessionToken));assert.equal(manager.binding(one.metadata),null);
+  setNow(two.metadata.idleExpiresAt);assert.equal(manager.binding(two.metadata),null);
+ }finally{db.close();}
+});

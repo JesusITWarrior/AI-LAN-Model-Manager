@@ -88,7 +88,7 @@ async function fixture(closeTimeoutMs = 5000) {
     now = `2026-09-29T10:00:${String(second).padStart(2, "0")}.000Z`;
     assert.ok(app.runtime.services.commands.complete("host-1", { requestId: request.requestId, jobId: request.jobId, hostId: request.hostId, sequence: request.sequence, status: "succeeded", progress: 100, observedAt: now, observation: { action: request.operation, providerId: "provider-1", canonicalModelName: "example/model:latest", outcome: "succeeded", runtimeState: request.operation === "unload" ? "unloaded" : "loaded", ...(request.operation === "drain" ? { activeRequests: 0 } : {}), observedAt: now }, errorCode: null }));
   }
-  return { app, repos, post, headers, cookie, command, poll, complete, heartbeat, certs, fp, reopen: () => createControllerApplication(options), setNow: (value: string) => now = value, async close() { await app.close(); rmSync(root, { recursive: true, force: true }); } };
+  return { app, repos, post, rawPost:(path:string,body:string,headers:Record<string,string>)=>fetch(base+path,{method:"POST",headers:{"content-type":"application/json",origin:base,connection:"close",...headers},body}), headers, cookie, command, poll, complete, heartbeat, certs, fp, reopen: () => createControllerApplication(options), setNow: (value: string) => now = value, async close() { await app.close(); rmSync(root, { recursive: true, force: true }); } };
 }
 
 // Real production application, real auth/CSRF/origin guard, real policy and
@@ -544,4 +544,152 @@ test("remote drain rejects unbound missing positive stale superseded or cancelle
       assert.equal(x.app.runtime.jobStores.audit.list().filter(row => row.action === "lifecycle-observation-applied").length, 1, mutation);
     } finally { await x.close(); }
   }
+});
+
+const proposalPath = (action: string) => `/api/v1/lifecycle/proposals/${action}`;
+async function proposal(x: Awaited<ReturnType<typeof fixture>>, operation: "load"|"drain"|"unload" = "load") {
+  const response=await x.post(proposalPath("prepare"),{operation,modelId:"model-1"},x.headers);
+  assert.equal(response.status,200);return (await response.json() as any).value;
+}
+async function proposalAction(x: Awaited<ReturnType<typeof fixture>>, action:string, p:any, headers=x.headers) {
+  return x.post(proposalPath(action),{proposalId:p.proposalId},headers);
+}
+test("opaque proposal HTTP enforces auth, origin, CSRF, bearer rejection and strict claim-free input",{timeout:15_000},async()=>{
+ const x=await fixture();try{
+  for(const action of ["prepare","approve","submit","cancel","status"]){
+   assert.equal((await x.post(proposalPath(action),{})).status,401);
+   assert.equal((await x.post(proposalPath(action),{},{cookie:x.cookie})).status,403);
+   assert.equal((await x.post(proposalPath(action),{},{...x.headers,origin:"https://evil.example"})).status,403);
+   assert.equal((await x.post(proposalPath(action),{},{...x.headers,authorization:"Bearer synthetic"})).status,401);
+   assert.equal((await x.post(proposalPath(action),{},x.headers)).status,400);
+  }
+  for(const extra of [{intent:{observationFresh:true}},{capability:{}},{approvalId:"a".repeat(64)},{request:{}},{operation:"install"},{operation:{toString:"load"}}])assert.equal((await x.post(proposalPath("prepare"),{operation:"load",modelId:"model-1",...extra},x.headers)).status,400);
+  const denied=await proposal(x);assert.ok(denied.reasons.includes("operation-disabled"));
+  assert.equal((await proposalAction(x,"submit",denied)).status,200);assert.equal(x.app.runtime.services.commands.poll("host-1").command,null);
+  assert.equal((await x.post(proposalPath("status"),{proposalId:denied.proposalId,jobId:"forged"},x.headers)).status,400);
+  const duplicate=await x.rawPost(proposalPath("prepare"),' {"operation":"load","operation":"unload","modelId":"model-1"}',x.headers);assert.equal(duplicate.status,400);
+  assert.equal((await x.rawPost(proposalPath("status"),`{"proposalId":"${denied.proposalId}","proposalId":"${denied.proposalId}"}`,x.headers)).status,400);
+ }finally{await x.close();}
+});
+test("server-owned approval is exact-session and exact-execution bound; approve never executes, concurrent submit executes once",{timeout:15_000},async()=>{
+ const x=await fixture();try{
+  assert.equal((await x.post("/api/v1/policy/install",{...policy,approvalOperations:["model-load"]},x.headers)).status,200);
+  const p=await proposal(x);assert.equal(p.state,"approval-required");assert.equal(p.jobId,null);
+  const wire=JSON.stringify(p);for(const secret of ["capability","requestDigest","approvalId","endpoint","session_binding","requestId","snapshot"])assert.equal(wire.includes(secret),false,secret);
+  const request=x.repos.db.prepare("SELECT request_id FROM lifecycle_proposal_authorizations").get() as any;
+  assert.equal((await x.post("/api/v1/policy/approve",{requestId:request.request_id},x.headers)).status,409);
+  const second=await x.post("/auth/v1/login",{username:"Owner",password:"synthetic-password-for-http-tests"});assert.equal(second.status,200);
+  const cookie=second.headers.get("set-cookie")!.split(";",1)[0]!,csrf=(await second.json() as any).value.csrfToken,other={cookie,"x-csrf-token":csrf};
+  assert.equal((await proposalAction(x,"approve",p,other)).status,409);
+  assert.equal((await proposalAction(x,"approve",p)).status,200);
+  assert.equal(x.app.runtime.services.commands.poll("host-1").command,null);
+  assert.equal((await proposalAction(x,"submit",p,other)).status,409);
+  const grant=x.repos.db.prepare("SELECT * FROM approvals WHERE request_id=?").get(request.request_id) as any;
+  const reserved=x.repos.db.prepare("SELECT * FROM lifecycle_proposal_authorizations").get() as any;
+  assert.equal(grant.granting_session_binding,reserved.session_binding);assert.equal(grant.granted_command_digest,reserved.command_digest);assert.equal(grant.consumed_at,null);
+  const [a,b]=await Promise.all([proposalAction(x,"submit",p),proposalAction(x,"submit",p)]);assert.equal(a.status,200);assert.equal(b.status,200);
+  const first=(await a.json() as any).value,again=(await b.json() as any).value;assert.equal(first.jobId,again.jobId);
+  const command=await x.poll();assert.equal(commandAuthorizationDigest(command),reserved.command_digest);
+  assert.equal((await x.post("/api/v1/lifecycle/operations",{request:command},other)).status,409,"legacy route cannot replay an exact proposal command from another session");
+  assert.equal((await x.post("/api/v1/lifecycle/operations",{request:command},x.headers)).status,409,"proposal dispatch has exactly one owner even for the same session");
+  assert.equal((x.repos.db.prepare("SELECT COUNT(*) n FROM jobs").get() as any).n,1);
+  await x.complete(command,1);
+  let finished:any;for(let i=0;i<100;i++){finished=(await (await proposalAction(x,"status",p)).json() as any).value;if(finished.state==="terminal")break;await new Promise(r=>setTimeout(r,5));}
+  assert.equal(finished.state,"terminal");assert.equal(finished.jobState,"succeeded");
+  assert.equal((await proposalAction(x,"submit",p)).status,200);assert.equal(x.app.runtime.services.commands.poll("host-1").command,null);
+  assert.equal((x.repos.db.prepare("SELECT COUNT(*) n FROM jobs").get() as any).n,1);
+ }finally{await x.close();}
+});
+test("proposal semantic policy, target, resource, trust, admission and global inference count drift require a new request",{timeout:30_000},async()=>{
+ for(const drift of ["policy","target","resource","trust","admission","inference","job"]){const x=await fixture();try{
+  assert.equal((await x.post("/api/v1/policy/install",policy,x.headers)).status,200);const p=await proposal(x);x.setNow("2026-09-29T10:00:01.000Z");
+  if(drift==="policy")assert.equal((await x.post("/api/v1/policy/install",{...policy,version:2},x.headers)).status,200);
+  if(drift==="target"){const m=x.repos.models.get("model-1")!;x.repos.models.upsert({...m,observedAt:"2026-09-29T10:00:01.000Z",canonicalName:"other:model"});}
+  if(drift==="resource"){const h=x.repos.hosts.get("host-1")!,s=h.snapshot as any;x.repos.hosts.upsert({...h,observedAt:"2026-09-29T10:00:01.000Z",snapshot:{...s,resource:{...s.resource,memory:{totalBytes:100,usedBytes:11,availableBytes:89}}}});}
+  if(drift==="trust")x.certs.revoke(x.fp,T0);
+  if(drift==="admission")x.app.runtime.services.admissions.register("model-1");
+  if(drift==="job")x.app.runtime.jobStores.withAuditTransaction(tx=>tx.jobs.create({operation:{jobId:"fixture-active-job",requestId:"fixture-active-request",action:"load",hostId:"host-1",submittedAt:T0,manifestRevision:null,idempotencyKey:"fixture-active-idem",idempotent:true},state:"submitted",updatedAt:T0,progressPercent:null,attempt:1,terminalCode:null,terminalMessage:null}));
+  if(drift==="inference")x.repos.db.prepare("INSERT INTO inference_executions VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?)").run("synthetic-inference","synthetic-job","synthetic-token","a".repeat(32),"host-1","provider-1","model-1","0".repeat(64),1,"0".repeat(64),"2026-09-29T10:04:00.000Z",T0,null,"running");
+  const response=await proposalAction(x,"submit",p);assert.equal(response.status,200,drift);assert.equal((await response.json() as any).value.state,"stale",drift);
+  assert.equal(x.app.runtime.services.commands.poll("host-1").command,null);
+  const first=(x.repos.db.prepare("SELECT request_id FROM lifecycle_proposal_authorizations").get() as any).request_id;
+  const next=await proposal(x);assert.notEqual(next.proposalId,p.proposalId);const rows=x.repos.db.prepare("SELECT request_id FROM lifecycle_proposal_authorizations").all() as any[];assert.equal(rows.length,2);assert.ok(rows.some(r=>r.request_id!==first));
+ }finally{await x.close();}}
+});
+test("proposal expiry, cancellation, credential revocation, shutdown and restart close unsubmitted authority",{timeout:30_000},async()=>{
+ const x=await fixture();let reopened:ReturnType<typeof x.reopen>|null=null;try{
+  assert.equal((await x.post("/api/v1/policy/install",{...policy,approvalOperations:["model-load"]},x.headers)).status,200);
+  const cancelled=await proposal(x);await proposalAction(x,"approve",cancelled);const c=await proposalAction(x,"cancel",cancelled);assert.equal((await c.json() as any).value.state,"cancelled");await proposalAction(x,"submit",cancelled);assert.equal(x.app.runtime.services.commands.poll("host-1").command,null);
+  const expired=await proposal(x);x.setNow("2026-09-29T10:05:00.000Z");assert.equal((await (await proposalAction(x,"submit",expired)).json() as any).value.state,"expired");x.setNow(T0);
+  const p=await proposal(x);await proposalAction(x,"approve",p);await x.app.stop();assert.equal((x.repos.db.prepare("SELECT COUNT(*) n FROM lifecycle_proposal_authorizations WHERE revoked_at IS NULL").get() as any).n,0);await x.app.start();assert.equal((await proposalAction(x,"submit",p)).status,409);
+  const revoked=await proposal(x);x.repos.db.exec("UPDATE owners SET credential_version=credential_version+1");assert.equal((await proposalAction(x,"submit",revoked)).status,401);
+  await x.app.close();reopened=x.reopen();await reopened.start();assert.equal(reopened.runtime.services.commands.poll("host-1").command,null);
+ }finally{await reopened?.close();await x.close();}
+});
+test("submitted proposal cancellation and graceful close settle the existing owned durable job without redispatch",{timeout:15_000},async()=>{
+ for(const finishFirst of [false,true]){const x=await fixture();try{
+  assert.equal((await x.post("/api/v1/policy/install",policy,x.headers)).status,200);const p=await proposal(x);await proposalAction(x,"submit",p);const command=await x.poll();
+  if(finishFirst)await x.complete(command,1);else assert.equal((await proposalAction(x,"cancel",p)).status,200);
+  await x.app.stop();assert.equal(x.app.runtime.jobStores.jobs.get(command.jobId)?.state,finishFirst?"succeeded":"cancelled");
+  assert.equal(x.app.runtime.services.lifecycle.acceptsSubmissions,false);
+  assert.equal((x.repos.db.prepare("SELECT COUNT(*) n FROM jobs").get() as any).n,1);
+ }finally{await x.close();}}
+});
+
+test("opaque proposal load, explicit drain and explicit unload page sequence uses only server commands",{timeout:15_000},async()=>{
+ const x=await fixture();try{
+  assert.equal((await x.post("/api/v1/policy/install",{...policy,approvalOperations:["model-load","model-drain","model-unload"]},x.headers)).status,200);
+  for(const [index,operation] of (["load","drain","unload"] as const).entries()){
+   const p=await proposal(x,operation);assert.equal(p.operation,operation);
+   const approved=(await (await proposalAction(x,"approve",p)).json() as any).value;assert.equal(approved.state,"approved");assert.equal(approved.jobId,null);
+   const submitted=(await (await proposalAction(x,"submit",p)).json() as any).value;assert.ok(submitted.jobId);
+   const command=await x.poll();assert.equal(command.operation,operation);assert.equal(command.params && (command.params as any).model,"example/model:latest");
+   await x.complete(command,index+1);
+   let terminal:any;for(let i=0;i<100;i++){terminal=(await (await proposalAction(x,"status",p)).json() as any).value;if(terminal.state==="terminal")break;await new Promise(r=>setTimeout(r,5));}
+   assert.equal(terminal.jobState,"succeeded");assert.equal(terminal.jobId,submitted.jobId);
+   if(operation==="drain"){assert.equal(x.app.runtime.services.admissions.snapshot("model-1").draining,true);assert.equal(x.repos.models.get("model-1")?.state,"running","drain must not unload");}
+  }
+  assert.equal(x.repos.models.get("model-1")?.state,"installed");
+ }finally{await x.close();}
+});
+test("unchanged fresh heartbeat facts preserve proposal intent while no mutation executes during preparation",{timeout:15_000},async()=>{
+ const x=await fixture();try{
+  assert.equal((await x.post("/api/v1/policy/install",policy,x.headers)).status,200);const p=await proposal(x);
+  assert.ok(x.heartbeat(1,"unloaded").ok);
+  const submitted=(await (await proposalAction(x,"submit",p)).json() as any).value;assert.equal(submitted.state,"submitting");
+  const command=await x.poll();await x.complete(command,2);
+ }finally{await x.close();}
+});
+test("restart recovers a submitted redacted job view but never resubmits its command",{timeout:15_000},async()=>{
+ const x=await fixture();let reopened:ReturnType<typeof x.reopen>|null=null;try{
+  assert.equal((await x.post("/api/v1/policy/install",policy,x.headers)).status,200);const p=await proposal(x);await proposalAction(x,"submit",p);const command=await x.poll();
+  await x.app.close();reopened=x.reopen();await reopened.start();
+  const {routeManagementRequest}=await import("./management-api.js");const deps=createManagementDependencies(reopened.runtime,["http://127.0.0.1"],{allowLoopbackHttpDevelopment:true},{},()=>T0);
+  for(const action of ["status","submit","approve","cancel"]){const response=await routeManagementRequest(deps,{method:"POST",url:proposalPath(action),headers:{cookie:x.cookie,"x-csrf-token":x.headers["x-csrf-token"],origin:"http://127.0.0.1","content-type":"application/json"},body:JSON.stringify({proposalId:p.proposalId})});assert.equal(response.status,200);const view=(response.body as any).value;assert.equal(view.state,"terminal");assert.equal(view.jobState,"cancelled");assert.equal(view.jobId,command.jobId);assert.equal(JSON.stringify(view).includes("digest"),false);}
+  assert.equal(reopened.runtime.services.commands.poll("host-1").command,null);assert.equal((reopened.runtime.repositories.db.prepare("SELECT COUNT(*) n FROM jobs").get() as any).n,1);
+ }finally{await reopened?.close();await x.close();}
+});
+
+test("proposal capacity is bounded and expiry releases slots without creating any job",{timeout:30_000},async()=>{
+ const x=await fixture();try{
+  const ids=new Set<string>();for(let i=0;i<256;i++){const p=await proposal(x);assert.ok(Date.parse(p.expiresAt)-Date.parse(T0)<=300_000);ids.add(p.proposalId);}assert.equal(ids.size,256);
+  assert.equal((await x.post(proposalPath("prepare"),{operation:"load",modelId:"model-1"},x.headers)).status,409);
+  assert.equal((x.repos.db.prepare("SELECT COUNT(*) n FROM jobs").get() as any).n,0);
+  x.setNow("2026-09-29T10:05:00.000Z");assert.ok(await proposal(x));
+  assert.equal((x.repos.db.prepare("SELECT COUNT(*) n FROM lifecycle_proposal_authorizations WHERE revoked_at IS NOT NULL").get() as any).n,256);
+ }finally{await x.close();}
+});
+test("proposal authority is capped by the authenticated session expiry and expires with credential revocation",{timeout:15_000},async()=>{
+ const x=await fixture();try{
+  x.repos.db.exec("UPDATE sessions SET idle_expires_at='2026-09-29T10:00:30.000Z'");const p=await proposal(x);assert.equal(p.expiresAt,"2026-09-29T10:00:30.000Z");
+  x.setNow(p.expiresAt);assert.equal((await proposalAction(x,"submit",p)).status,401);assert.equal(x.app.runtime.services.commands.poll("host-1").command,null);
+ }finally{await x.close();}
+});
+test("concurrent proposal cancellation and submit reduce authority without duplicate jobs or remote idle claims",{timeout:15_000},async()=>{
+ for(const actions of [["cancel","submit"],["submit","cancel"]]){const x=await fixture();try{
+  assert.equal((await x.post("/api/v1/policy/install",policy,x.headers)).status,200);const p=await proposal(x);
+  const replies=await Promise.all(actions.map(action=>proposalAction(x,action,p)));for(const response of replies)assert.equal(response.status,200);
+  await x.app.stop();const jobs=x.repos.db.prepare("SELECT state FROM jobs").all() as {state:string}[];assert.ok(jobs.length<=1);for(const job of jobs)assert.equal(job.state,"cancelled");
+  assert.equal(x.repos.models.get("model-1")?.state,"installed");
+ }finally{await x.close();}}
 });
