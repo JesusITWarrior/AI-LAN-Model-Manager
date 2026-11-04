@@ -60,11 +60,11 @@ async function fixture(closeTimeoutMs = 5000) {
   const transport = new ControllerTransport({ certificateRepository: certs, replayStore: new PersistentReplayStore(repos.db), verifier: () => verifier.value, clock: () => now });
   const fleet = new FleetService(repos.db, transport, certs, repos, { clock: () => now });
   let heartbeatSequence = 1;
-  function heartbeat(second: number, runtimeState = "loaded-idle", activeRequests: unknown = 0, overrides: Record<string, unknown> = {}, sourceAddress = "192.0.2.10") {
-    now = `2026-09-29T10:00:${String(second).padStart(2, "0")}.000Z`;
+  function heartbeat(second: number, runtimeState = "loaded-idle", activeRequests: unknown = 0, overrides: Record<string, unknown> = {}, sourceAddress = "192.0.2.10", resourceOverrides: Record<string, unknown> = {}) {
+    now = new Date(Date.parse(T0) + second * 1000).toISOString();
     const sequence = ++heartbeatSequence;
     const payload = { platform: "linux", protocolMinor: 0, idle: runtimeState === "loaded-idle", sequence, observedAt: now,
-      resource: { ...(repos.hosts.get("host-1")!.snapshot as any).resource, observedAt: now },
+      resource: { ...(repos.hosts.get("host-1")!.snapshot as any).resource, observedAt: now, ...resourceOverrides },
       providers: [{ providerId: "provider-1", kind: "ollama", displayName: "Synthetic Ollama", endpoint: "http://127.0.0.1:11434", health: "ready", version: null, observedAt: now }],
       models: [{ modelId: "model-1", providerId: "provider-1", displayName: "example/model:latest", artifactState: "installed", runtimeState, activeRequests, sizeBytes: 123, managedTemporary: false, pinned: false, capability: { tools: false, vision: false, reasoning: false, modalities: ["text"], contextWindow: 4096 }, observedAt: now, ...overrides }] };
     const signed = signTransportSignedEnvelope({ protocolVersion: { major: 1, minor: 0 }, messageType: "transport.heartbeat", hostId: "host-1", requestId: `heartbeat-${sequence}`, sequence, sentAt: now, nonce: `heartbeat-nonce-${sequence}`, bodyDigest: transportBodyDigest(payload as never), certFingerprint: fp, certSerial: "ABCD", signature: "0".repeat(16), payload } as never, heartbeatSigner);
@@ -85,7 +85,7 @@ async function fixture(closeTimeoutMs = 5000) {
     assert.fail("HTTP submission did not reach runtime-owned agent queue");
   }
   async function complete(request: CommandRequest, second: number) {
-    now = `2026-09-29T10:00:${String(second).padStart(2, "0")}.000Z`;
+    now = new Date(Date.parse(T0) + second * 1000).toISOString();
     assert.ok(app.runtime.services.commands.complete("host-1", { requestId: request.requestId, jobId: request.jobId, hostId: request.hostId, sequence: request.sequence, status: "succeeded", progress: 100, observedAt: now, observation: { action: request.operation, providerId: "provider-1", canonicalModelName: "example/model:latest", outcome: "succeeded", runtimeState: request.operation === "unload" ? "unloaded" : "loaded", ...(request.operation === "drain" ? { activeRequests: 0 } : {}), observedAt: now }, errorCode: null }));
   }
   return { app, repos, post, rawPost:(path:string,body:string,headers:Record<string,string>)=>fetch(base+path,{method:"POST",headers:{"content-type":"application/json",origin:base,connection:"close",...headers},body}), headers, cookie, command, poll, complete, heartbeat, certs, fp, reopen: () => createControllerApplication(options), setNow: (value: string) => now = value, async close() { await app.close(); rmSync(root, { recursive: true, force: true }); } };
@@ -600,12 +600,12 @@ test("server-owned approval is exact-session and exact-execution bound; approve 
   assert.equal((x.repos.db.prepare("SELECT COUNT(*) n FROM jobs").get() as any).n,1);
  }finally{await x.close();}
 });
-test("proposal semantic policy, target, resource, trust, admission and global inference count drift require a new request",{timeout:30_000},async()=>{
+test("proposal semantic policy, target, unsafe resource, trust, admission and global inference count drift require a new request",{timeout:30_000},async()=>{
  for(const drift of ["policy","target","resource","trust","admission","inference","job"]){const x=await fixture();try{
   assert.equal((await x.post("/api/v1/policy/install",policy,x.headers)).status,200);const p=await proposal(x);x.setNow("2026-09-29T10:00:01.000Z");
   if(drift==="policy")assert.equal((await x.post("/api/v1/policy/install",{...policy,version:2},x.headers)).status,200);
   if(drift==="target"){const m=x.repos.models.get("model-1")!;x.repos.models.upsert({...m,observedAt:"2026-09-29T10:00:01.000Z",canonicalName:"other:model"});}
-  if(drift==="resource"){const h=x.repos.hosts.get("host-1")!,s=h.snapshot as any;x.repos.hosts.upsert({...h,observedAt:"2026-09-29T10:00:01.000Z",snapshot:{...s,resource:{...s.resource,memory:{totalBytes:100,usedBytes:11,availableBytes:89}}}});}
+  if(drift==="resource"){const h=x.repos.hosts.get("host-1")!,s=h.snapshot as any;x.repos.hosts.upsert({...h,observedAt:"2026-09-29T10:00:01.000Z",snapshot:{...s,resource:{...s.resource,memory:{totalBytes:100,usedBytes:100,availableBytes:0}}}});}
   if(drift==="trust")x.certs.revoke(x.fp,T0);
   if(drift==="admission")x.app.runtime.services.admissions.register("model-1");
   if(drift==="job")x.app.runtime.jobStores.withAuditTransaction(tx=>tx.jobs.create({operation:{jobId:"fixture-active-job",requestId:"fixture-active-request",action:"load",hostId:"host-1",submittedAt:T0,manifestRevision:null,idempotencyKey:"fixture-active-idem",idempotent:true},state:"submitted",updatedAt:T0,progressPercent:null,attempt:1,terminalCode:null,terminalMessage:null}));
@@ -692,4 +692,95 @@ test("concurrent proposal cancellation and submit reduce authority without dupli
   await x.app.stop();const jobs=x.repos.db.prepare("SELECT state FROM jobs").all() as {state:string}[];assert.ok(jobs.length<=1);for(const job of jobs)assert.equal(job.state,"cancelled");
   assert.equal(x.repos.models.get("model-1")?.state,"installed");
  }finally{await x.close();}}
+});
+
+// Regression: ordinary signed heartbeats change resource readings, not reviewed
+// execution identity. Exercise both boundaries and retain the original digests.
+test("benign signed resource heartbeats preserve exact approval and execution identity", {timeout:15_000}, async()=>{
+ const x=await fixture();try{
+  assert.equal((await x.post("/api/v1/policy/install",{...policy,approvalOperations:["model-load"],minimumVramHeadroomBytes:1},x.headers)).status,200);
+  const resources=(available:number)=>({memory:{totalBytes:100,usedBytes:100-available,availableBytes:available},storage:{totalBytes:100,usedBytes:100-available,availableBytes:available},accelerators:[{id:"gpu-1",name:"Synthetic GPU",kind:"nvidia",memory:{totalBytes:100,usedBytes:100-available,availableBytes:available},utilizationPercent:0}]});
+  assert.ok(x.heartbeat(1,"unloaded",0,{},undefined,resources(90)).ok);
+  const p=await proposal(x);assert.equal(p.state,"approval-required");
+  const before=x.repos.db.prepare("SELECT ar.*,lp.command_digest,lp.expires_at FROM authorization_requests ar JOIN lifecycle_proposal_authorizations lp USING(request_id)").get() as any;
+  assert.ok(x.heartbeat(10,"unloaded",0,{},undefined,resources(89)).ok);
+  const approved=(await (await proposalAction(x,"approve",p)).json() as any).value;
+  assert.equal(approved.state,"approved");assert.equal(approved.jobId,null);
+  assert.equal((x.repos.db.prepare("SELECT COUNT(*) n FROM jobs").get() as any).n,0);
+  assert.ok(x.heartbeat(20,"unloaded",0,{},undefined,resources(88)).ok);
+  const submitted=(await (await proposalAction(x,"submit",p)).json() as any).value;
+  assert.equal(submitted.state,"submitting");
+  const command=await x.poll();assert.equal(commandAuthorizationDigest(command),before.command_digest);
+  assert.equal(command.requestId,before.request_id);assert.equal(command.deadline,before.expires_at);
+  const after=x.repos.db.prepare("SELECT * FROM authorization_requests WHERE request_id=?").get(before.request_id) as any;
+  assert.equal(after.request_digest,before.request_digest);assert.equal(after.policy_hash,before.policy_hash);
+  const approval=x.repos.db.prepare("SELECT * FROM approvals WHERE request_id=?").get(before.request_id) as any;
+  assert.equal(approval.request_digest,before.request_digest);assert.equal(approval.consumed_command_digest,before.command_digest);assert.ok(approval.consumed_at);
+  assert.equal((x.repos.db.prepare("SELECT COUNT(*) n FROM jobs").get() as any).n,1);
+  await x.complete(command,21);
+ }finally{await x.close();}
+});
+
+test("fresh safety gates revoke before approval or execution despite benign resource drift", {timeout:30_000}, async()=>{
+ for(const boundary of ["approve","submit"]){
+  for(const drift of ["memory","vram","storage","rate","policy","target","digest","provider","runtime","active-requests","trust","certificate","admission-active","admission-uncertain","inference","job","stale-observation"]){
+   const x=await fixture();try{
+    const configured={...policy,approvalOperations:["model-load"],minimumVramHeadroomBytes:1};
+    assert.equal((await x.post("/api/v1/policy/install",configured,x.headers)).status,200);
+    const resources={memory:{totalBytes:100,usedBytes:11,availableBytes:89},storage:{totalBytes:100,usedBytes:11,availableBytes:89},accelerators:[{id:"gpu-1",name:"Synthetic GPU",kind:"nvidia",memory:{totalBytes:100,usedBytes:11,availableBytes:89},utilizationPercent:0}]};
+    assert.ok(x.heartbeat(1,"unloaded",0,{},undefined,resources).ok);
+    x.app.runtime.services.admissions.register("model-1");
+    const p=await proposal(x);assert.equal(p.state,"approval-required");
+    if(boundary==="submit")assert.equal((await (await proposalAction(x,"approve",p)).json() as any).value.state,"approved");
+    assert.ok(x.heartbeat(2,"unloaded",0,{},undefined,{...resources,memory:{totalBytes:100,usedBytes:12,availableBytes:88}}).ok);
+    const changedAt="2026-09-29T10:00:03.000Z";x.setNow(changedAt);
+    const model={...x.repos.models.get("model-1")!,observedAt:changedAt},host={...x.repos.hosts.get("host-1")!,observedAt:changedAt},provider={...x.repos.providers.get("provider-1")!,observedAt:changedAt};
+    if(["memory","vram","storage"].includes(drift)){
+     const resource=(host.snapshot as any).resource;
+     const empty={totalBytes:100,usedBytes:100,availableBytes:0};
+     x.repos.hosts.upsert({...host,snapshot:{resource:{...resource,...(drift==="vram"?{accelerators:[{...resource.accelerators[0],memory:empty}]}:{[drift]:empty})}}});
+    }
+    if(drift==="policy")assert.equal((await x.post("/api/v1/policy/install",{...configured,version:2},x.headers)).status,200);
+    if(drift==="target")x.repos.models.upsert({...model,canonicalName:"other:model"});
+    if(drift==="digest")x.repos.models.upsert({...model,digest:"f".repeat(64),digestKnown:true});
+    if(drift==="provider")x.repos.providers.upsert({...provider,endpoint:"http://127.0.0.1:11435"});
+    if(drift==="runtime")x.repos.models.upsert({...model,snapshot:{...(model.snapshot as any),runtimeState:"loaded-idle"}});
+    if(drift==="active-requests")x.repos.models.upsert({...model,snapshot:{...(model.snapshot as any),activeRequests:1}});
+    if(drift==="trust")x.certs.revoke(x.fp,T0);
+    if(drift==="certificate")x.repos.db.prepare("UPDATE host_certificates SET not_after=? WHERE fingerprint=?").run("2026-09-29T10:00:02.000Z",x.fp);
+    if(drift==="admission-active")x.app.runtime.services.admissions.acquire("model-1");
+    if(drift==="admission-uncertain")x.app.runtime.services.admissions.markUncertain("model-1");
+    if(drift==="inference")x.repos.db.prepare("INSERT INTO inference_executions VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?)").run("synthetic-inference","synthetic-job","synthetic-token","a".repeat(32),"host-1","provider-1","model-1","0".repeat(64),1,"0".repeat(64),"2026-09-29T10:04:00.000Z",T0,null,"running");
+    if(drift==="job")x.app.runtime.jobStores.withAuditTransaction(tx=>tx.jobs.create({operation:{jobId:"fixture-active-job",requestId:"fixture-active-request",action:"load",hostId:"host-1",submittedAt:T0,manifestRevision:null,idempotencyKey:"fixture-active-idem",idempotent:true},state:"submitted",updatedAt:T0,progressPercent:null,attempt:1,terminalCode:null,terminalMessage:null}));
+    if(drift==="rate"){
+     // Counts change while still below concurrency ceiling: fresh rate gate
+     // must deny even though the reviewed digest remains unchanged.
+     for(let i=0;i<100;i++)x.repos.db.prepare("INSERT INTO inference_executions VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?)").run(`finished-${i}`,`finished-job-${i}`,"synthetic-token","a".repeat(32),"host-1","provider-1","model-1","0".repeat(64),1,"0".repeat(64),"2026-09-29T10:04:00.000Z",T0,T0,"succeeded");
+    }
+    if(drift==="stale-observation")x.setNow("2026-09-29T10:01:02.000Z");
+    const before=(x.repos.db.prepare("SELECT COUNT(*) n FROM jobs").get() as any).n;
+    const response=await proposalAction(x,boundary,p);assert.equal(response.status,200,`${boundary}/${drift}`);
+    assert.equal((await response.json() as any).value.state,"stale",`${boundary}/${drift}`);
+    assert.equal(x.app.runtime.services.commands.poll("host-1").command,null,`${boundary}/${drift}`);
+    assert.equal((x.repos.db.prepare("SELECT COUNT(*) n FROM jobs").get() as any).n,before);
+    const binding=x.repos.db.prepare("SELECT * FROM lifecycle_proposal_authorizations").get() as any;assert.ok(binding.revoked_at);
+    assert.equal((x.repos.db.prepare("SELECT COUNT(*) n FROM approvals WHERE revoked_at IS NULL").get() as any).n,0);
+   }finally{await x.close();}
+  }
+ }
+});
+
+test("rolling recent-work count may decay without rebinding a safe reviewed digest", {timeout:15_000}, async()=>{
+ const x=await fixture();try{
+  assert.equal((await x.post("/api/v1/policy/install",{...policy,approvalOperations:["model-load"]},x.headers)).status,200);
+  x.repos.db.prepare("INSERT INTO inference_executions VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?)").run("finished","finished-job","synthetic-token","a".repeat(32),"host-1","provider-1","model-1","0".repeat(64),1,"0".repeat(64),"2026-09-29T10:04:00.000Z",T0,T0,"succeeded");
+  const p=await proposal(x);
+  const before=x.repos.db.prepare("SELECT * FROM authorization_requests").get() as any;
+  assert.ok(x.heartbeat(70,"unloaded").ok);
+  assert.equal((await (await proposalAction(x,"approve",p)).json() as any).value.state,"approved");
+  assert.ok(x.heartbeat(130,"unloaded").ok);
+  assert.equal((await (await proposalAction(x,"submit",p)).json() as any).value.state,"submitting");
+  const command=await x.poll();await x.complete(command,131);
+  const after=x.repos.db.prepare("SELECT * FROM authorization_requests").get() as any;assert.equal(after.request_digest,before.request_digest);
+ }finally{await x.close();}
 });

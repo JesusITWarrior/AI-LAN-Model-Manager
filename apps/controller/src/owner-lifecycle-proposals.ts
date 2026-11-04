@@ -1,5 +1,5 @@
 import { randomBytes } from "node:crypto";
-import { commandAuthorizationDigest, commandPolicyOperation, parseCommandRequest, type CommandRequest, type AuthorizationIntent, type PolicyDecision, type OperationPolicy } from "@lan-model-manager/core";
+import { commandAuthorizationDigest, commandPolicyOperation, evaluateOperationPolicy, parseCommandRequest, type CommandRequest, type AuthorizationIntent, type PolicyDecision, type OperationPolicy } from "@lan-model-manager/core";
 import type { ControllerRuntimeHandle } from "./controller-runtime.js";
 import type { GuardResult } from "./guard.js";
 import type { ManagementLifecycleService } from "./management-lifecycle.js";
@@ -21,6 +21,14 @@ interface Proposal {
 }
 const consequences:Record<ProposalOperation,string>={load:"Load this exact model into the provider. This may allocate host memory and accelerator resources.",drain:"Stop new local admissions and request an explicit remote idle observation. This does not unload the model.",unload:"Unload this exact model only after authoritative idle and draining checks. This does not remove its artifact."};
 const fail=(error: "ERR_LIFECYCLE_INPUT"|"ERR_LIFECYCLE_STATE"|"ERR_LIFECYCLE_DENIED"):Result=>({ok:false,error});
+// Reviewed identity excludes only ambient resource samples and the rolling rate
+// count. Active work, actor/target, trust/freshness/compatibility and exposure
+// remain exact bindings. Resource/rate safety is independently evaluated fresh.
+function reviewedIdentity(intent:AuthorizationIntent):string {
+  const {availableMemoryBytes,availableVramBytes,availableStorageBytes,operationsLastMinute,...identity}=intent;
+  return JSON.stringify(identity);
+}
+const admissible=(decision:PolicyDecision):boolean=>decision.allowed||decision.requiresApproval&&decision.reasons.every(r=>r==="approval-required");
 function strict(input:unknown,keys:readonly string[]):Record<string,unknown>|null {
   try {if(typeof input!=="object"||input===null||Array.isArray(input))return null;const p=Object.getPrototypeOf(input),own=Reflect.ownKeys(input),d=Object.getOwnPropertyDescriptors(input);if(p!==Object.prototype&&p!==null||own.length!==keys.length||own.some(k=>typeof k!=="string"||!keys.includes(k)||!d[k]||!("value" in d[k]!)))return null;return Object.fromEntries(keys.map(k=>[k,d[k]!.value]));}catch{return null;}
 }
@@ -81,10 +89,17 @@ export class OwnerLifecycleProposals {
   }
   private revalidate(p:Proposal,guard:GuardResult):boolean {
     const facts=this.lifecycle.facts(p.request,guard),binding=this.context(guard);
-    if(!binding||binding.id!==p.binding.id||binding.credentialVersion!==p.binding.credentialVersion||!facts||facts.semantic!==p.semantic||JSON.stringify(facts.target)!==JSON.stringify(p.target)||JSON.stringify(facts.intent)!==JSON.stringify(p.intent)){this.revoke(p,"stale");return false;}
-    const decision=this.runtime.services.policy.authorize(facts.intent);
-    if(!decision.ok||decision.value.requestDigest!==p.decision.requestDigest||decision.value.policyHash!==p.decision.policyHash||decision.value.policyVersion!==p.decision.policyVersion){this.revoke(p,"stale");return false;}
-    return decision.value.allowed||decision.value.requiresApproval&&decision.value.reasons.every(r=>r==="approval-required");
+    if(!binding||binding.id!==p.binding.id||binding.credentialVersion!==p.binding.credentialVersion||!facts||facts.semantic!==p.semantic||JSON.stringify(facts.target)!==JSON.stringify(p.target)||reviewedIdentity(facts.intent)!==reviewedIdentity(p.intent)){this.revoke(p,"stale");return false;}
+    // Never rebind a request ID/digest to changed observations. The stored intent
+    // is immutable reviewed evidence; its exact approval/command/session bindings
+    // are still checked by PolicyService and the synchronous lifecycle executor.
+    // Fresh facts must also pass the pinned policy; authorize below independently
+    // verifies that this exact policy is still current. Both gates run at approve
+    // AND submit; submit reaches execution without an await or event turn.
+    const fresh=evaluateOperationPolicy(p.policy,facts.intent);
+    const decision=this.runtime.services.policy.authorize(p.intent);
+    if(!decision.ok||decision.value.requestDigest!==p.decision.requestDigest||decision.value.policyHash!==p.decision.policyHash||decision.value.policyVersion!==p.decision.policyVersion||fresh.policyHash!==p.decision.policyHash||fresh.policyVersion!==p.decision.policyVersion||!admissible(fresh)||!admissible(decision.value)){this.revoke(p,"stale");return false;}
+    return true;
   }
   approve(input:unknown,guard:GuardResult):Result {
     const p=this.lookup(input,guard);if("ok" in p)return p;
