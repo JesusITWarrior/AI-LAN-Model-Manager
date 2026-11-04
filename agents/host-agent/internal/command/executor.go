@@ -8,7 +8,6 @@ import (
 	"encoding/json"
 	"errors"
 	"io"
-	"log/slog"
 	"os"
 	"path/filepath"
 	"regexp"
@@ -18,6 +17,11 @@ import (
 )
 
 var ErrCommand = errors.New("command rejected")
+
+// ErrReplayPersistence means replay storage is uncertain, not that execution
+// was rejected before the adapter ran. A non-empty returned Response retains
+// the known outcome, but must not be interpreted as durably persisted.
+var ErrReplayPersistence = errors.New("command replay persistence uncertain")
 var identifier = regexp.MustCompile(`^[A-Za-z0-9][A-Za-z0-9._:-]{0,127}$`)
 var digestPattern = regexp.MustCompile(`^[a-f0-9]{64}$`)
 
@@ -70,6 +74,10 @@ type Executor struct {
 	now     func() time.Time
 	seen    map[string]entry
 	store   string
+	// persistenceErr is sticky for this executor: no adapter may run again
+	// after a replay write fails, even when the retained outcome is running.
+	persistenceErr error
+	writeReplay    func(string, []byte) (bool, error)
 }
 
 func New(hostID string, adapter Adapter, now func() time.Time) *Executor {
@@ -243,6 +251,9 @@ func (e *Executor) execute(ctx context.Context, r Request, emit StreamEmitter) (
 		if prior.Digest != digest {
 			return Response{}, ErrCommand
 		}
+		if e.persistenceErr != nil {
+			return prior.Response, e.persistenceErr
+		}
 		if prior.Response.Status != "running" {
 			return prior.Response, nil
 		}
@@ -250,23 +261,25 @@ func (e *Executor) execute(ctx context.Context, r Request, emit StreamEmitter) (
 			code := "INDETERMINATE"
 			failed := Response{RequestID: r.RequestID, JobID: r.JobID, HostID: r.HostID, Sequence: r.Sequence, Status: "failed", ObservedAt: e.now().UTC().Format("2006-01-02T15:04:05.000Z"), ErrorCode: &code}
 			e.seen[r.IdempotencyKey] = entry{Digest: digest, Response: failed}
-			if e.persist() != nil {
-				e.seen[r.IdempotencyKey] = prior
-				return Response{}, ErrCommand
+			if err := e.persist(); err != nil {
+				return failed, err
 			}
 			return failed, nil
 		}
 	}
+	if e.persistenceErr != nil {
+		return Response{}, e.persistenceErr
+	}
+	if _, exists := e.seen[r.IdempotencyKey]; !exists && len(e.seen) >= maxReplayEntries {
+		return Response{}, ErrCommand
+	}
 	if r.Operation == StreamOperation || (r.Operation == "inference.chat" && e.store != "") {
-		if len(e.seen) >= maxReplayEntries {
-			return Response{}, ErrCommand
-		}
 		progress := uint8(1)
 		running := Response{RequestID: r.RequestID, JobID: r.JobID, HostID: r.HostID, Sequence: r.Sequence, Status: "running", Progress: &progress, ObservedAt: e.now().UTC().Format("2006-01-02T15:04:05.000Z")}
 		e.seen[r.IdempotencyKey] = entry{Digest: digest, Response: running}
-		if e.persist() != nil {
-			delete(e.seen, r.IdempotencyKey)
-			return Response{}, ErrCommand
+		if err := e.persist(); err != nil {
+			// No adapter ran. Keep the marker in case replacement published it.
+			return Response{}, err
 		}
 	}
 	duration := deadline.Sub(e.now())
@@ -345,66 +358,11 @@ func (e *Executor) execute(ctx context.Context, r Request, emit StreamEmitter) (
 		code = &v
 	}
 	response := Response{RequestID: r.RequestID, JobID: r.JobID, HostID: r.HostID, Sequence: r.Sequence, Status: status, Progress: progress, ObservedAt: e.now().UTC().Format("2006-01-02T15:04:05.000Z"), Observation: observation, ErrorCode: code}
-	prior, existed := e.seen[r.IdempotencyKey]
-	if !existed && len(e.seen) >= maxReplayEntries {
-		return Response{}, ErrCommand
-	}
 	e.seen[r.IdempotencyKey] = entry{Digest: digest, Response: response}
-	if e.persist() != nil {
-		if existed {
-			e.seen[r.IdempotencyKey] = prior
-		} else {
-			delete(e.seen, r.IdempotencyKey)
-		}
-		return Response{}, ErrCommand
+	if err := e.persist(); err != nil {
+		// The adapter already ran. Never erase its outcome or restore a
+		// running entry: either could permit a second mutation in this process.
+		return response, err
 	}
 	return response, nil
-}
-func (e *Executor) persist() (result error) {
-	defer func() {
-		if result != nil {
-			slog.Info("command-stage", "code", "REPLAY_PERSIST_FAILED", "httpStatus", 0)
-		}
-	}()
-	if e.store == "" {
-		return nil
-	}
-	if os.MkdirAll(filepath.Dir(e.store), 0o700) != nil {
-		return ErrCommand
-	}
-	raw, err := json.Marshal(e.seen)
-	if err != nil || len(raw) > maxReplayStoreBytes {
-		return ErrCommand
-	}
-	tmp, err := os.CreateTemp(filepath.Dir(e.store), ".command-replay-")
-	if err != nil {
-		return ErrCommand
-	}
-	name := tmp.Name()
-	ok := false
-	defer func() {
-		_ = tmp.Close()
-		if !ok {
-			_ = os.Remove(name)
-		}
-	}()
-	if tmp.Chmod(0o600) != nil {
-		return ErrCommand
-	}
-	if _, err = tmp.Write(append(raw, '\n')); err != nil || tmp.Sync() != nil || tmp.Close() != nil {
-		return ErrCommand
-	}
-	if os.Rename(name, e.store) != nil {
-		return ErrCommand
-	}
-	dir, err := os.Open(filepath.Dir(e.store))
-	if err != nil {
-		return ErrCommand
-	}
-	defer dir.Close()
-	if dir.Sync() != nil {
-		return ErrCommand
-	}
-	ok = true
-	return nil
 }

@@ -158,7 +158,7 @@ func TestExecutionTimeoutAndCancellationAreReported(t *testing.T) {
 		})
 	}
 }
-func TestReplayStoreIsBoundedAndFailedPersistenceDoesNotCreateFalseReplay(t *testing.T) {
+func TestReplayStoreIsBoundedAndFailedPersistenceRetainsExecutedOutcome(t *testing.T) {
 	path := filepath.Join(t.TempDir(), "too-many.json")
 	entries := map[string]entry{}
 	for i := 0; i < maxReplayEntries+1; i++ {
@@ -175,13 +175,13 @@ func TestReplayStoreIsBoundedAndFailedPersistenceDoesNotCreateFalseReplay(t *tes
 	a := &adapter{}
 	executor := New("host-1", a, func() time.Time { return time.Date(2026, 9, 28, 8, 0, 0, 0, time.UTC) })
 	executor.store = bad
-	if _, err := executor.Execute(context.Background(), req()); err == nil {
-		t.Fatal("persistence unexpectedly succeeded")
+	for range 2 {
+		result, err := executor.Execute(context.Background(), req())
+		if !errors.Is(err, ErrReplayPersistence) || result.Status != "succeeded" {
+			t.Fatalf("known outcome/uncertainty lost: %#v, %v", result, err)
+		}
 	}
-	if _, err := executor.Execute(context.Background(), req()); err == nil {
-		t.Fatal("persistence unexpectedly succeeded")
-	}
-	if a.calls != 2 {
-		t.Fatalf("failed result was falsely replayed: calls=%d", a.calls)
+	if a.calls != 1 {
+		t.Fatalf("executed outcome was repeated: calls=%d", a.calls)
 	}
 }
