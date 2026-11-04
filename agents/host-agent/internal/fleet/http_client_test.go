@@ -137,7 +137,7 @@ func TestCrossLanguageFleetHelper(t *testing.T) {
 			if registry == nil {
 				t.Fatal("lifecycle registry unavailable")
 			}
-			for _, expected := range []string{"load", "drain", "unload"} {
+			for index, expected := range []string{"load", "drain", "unload", "load"} {
 				value, _, pollErr := restarted.PollCommand(context.Background(), time.Second)
 				if pollErr != nil || value == nil || value.Operation != expected {
 					t.Fatalf("lifecycle poll %s = %#v, %v", expected, value, pollErr)
@@ -159,10 +159,21 @@ func TestCrossLanguageFleetHelper(t *testing.T) {
 					fmt.Println("LANMM_CROSS_LIFECYCLE_BLOCKED=drain")
 				}
 				completed, executeErr := executor.Execute(context.Background(), *value)
-				if executeErr != nil || completed.Status != "succeeded" || restarted.SendCommandResult(context.Background(), completed) != nil {
+				want := "succeeded"
+				if index == 3 {
+					want = "failed"
+					if completed.ErrorCode == nil || *completed.ErrorCode != "ADAPTER_FAILED" {
+						t.Fatal("missing fixed adapter failure")
+					}
+				}
+				if executeErr != nil || completed.Status != want || restarted.SendCommandResult(context.Background(), completed) != nil {
 					t.Fatalf("lifecycle %s = %#v, %v", expected, completed, executeErr)
 				}
-				fmt.Printf("LANMM_CROSS_LIFECYCLE=%s:%s\n", expected, completed.Status)
+				fmt.Printf("LANMM_CROSS_LIFECYCLE=%s:%s", expected, completed.Status)
+				if index == 3 {
+					fmt.Print(":ADAPTER_FAILED")
+				}
+				fmt.Println()
 			}
 		}
 	}

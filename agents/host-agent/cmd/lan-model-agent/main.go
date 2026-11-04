@@ -238,6 +238,8 @@ func maintainFleetSessions(ctx context.Context, certDir, stateDir string, host *
 			if executor, e := command.NewPersistent(host.HostID(), registry, time.Now, filepath.Join(stateDir, "command-replay.json")); e == nil {
 				workers.Add(1)
 				go func() { defer workers.Done(); _ = client.RunCommands(sessionCtx, executor) }()
+			} else {
+				slog.Info("command-stage", "code", "EXECUTOR_UNAVAILABLE", "httpStatus", 0)
 			}
 		}
 		timer := time.NewTimer(12 * time.Hour)

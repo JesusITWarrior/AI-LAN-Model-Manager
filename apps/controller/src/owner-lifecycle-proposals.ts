@@ -49,7 +49,7 @@ export class OwnerLifecycleProposals {
   private dto(p:Proposal):Result {
     this.expire(p);
     const job=p.submitted?this.runtime.jobStores.jobs.get(p.request.jobId):null;
-    return {ok:true,value:Object.freeze({proposalId:p.id,operation:p.request.operation as ProposalOperation,target:p.target,consequence:consequences[p.request.operation as ProposalOperation],expiresAt:p.request.deadline,requiresApproval:p.decision.requiresApproval,reasons:Object.freeze([...p.decision.reasons]),state:p.state,jobId:p.submitted&&job?p.request.jobId:null,jobState:job?.state??null})};
+    return {ok:true,value:Object.freeze({proposalId:p.id,operation:p.request.operation as ProposalOperation,target:p.target,consequence:consequences[p.request.operation as ProposalOperation]+(p.request.operation==="load"&&(p.request.params as Record<string,unknown>).keepAlive==="5m"?" Request 5 minutes of provider keep-alive after load. This is a retention request, not a guarantee of unloading at expiry.":""),expiresAt:p.request.deadline,requiresApproval:p.decision.requiresApproval,reasons:Object.freeze([...p.decision.reasons]),state:p.state,jobId:p.submitted&&job?p.request.jobId:null,jobState:job?.state??null})};
   }
   private lookup(input:unknown,guard:GuardResult,cancelSubmitted=false):Proposal|Result {
     const body=strict(input,["proposalId"]);if(!body||typeof body.proposalId!=="string"||! /^[a-f0-9]{64}$/.test(body.proposalId))return fail("ERR_LIFECYCLE_INPUT");
@@ -77,7 +77,8 @@ export class OwnerLifecycleProposals {
     if(this.proposals.size>=256)return fail("ERR_LIFECYCLE_STATE");
     const model=this.runtime.repositories.models.get(body.modelId);if(!model)return fail("ERR_LIFECYCLE_STATE");
     const id=()=>randomBytes(32).toString("hex"),expiresAt=new Date(Math.min(Date.parse(this.clock())+300_000,Date.parse(binding.expiresAt))).toISOString();
-    const request:CommandRequest={requestId:id(),jobId:id(),hostId:model.hostId,operation:body.operation as ProposalOperation,idempotencyKey:id(),sequence:1,deadline:expiresAt,params:Object.freeze({providerId:model.providerId,model:model.canonicalName}),capability:{operation:commandPolicyOperation(body.operation as ProposalOperation),targetKind:"model",targetId:model.modelId,hostId:model.hostId,modelId:model.modelId,requestDigest:"0".repeat(64),expiresAt}};
+    const provider=this.runtime.repositories.providers.get(model.providerId);if(!provider)return fail("ERR_LIFECYCLE_STATE");
+    const request:CommandRequest={requestId:id(),jobId:id(),hostId:model.hostId,operation:body.operation as ProposalOperation,idempotencyKey:id(),sequence:1,deadline:expiresAt,params:Object.freeze({providerId:model.providerId,model:model.canonicalName,...(body.operation==="load"?{keepAlive:provider.kind==="lmstudio"?0:"5m"}:{})}),capability:{operation:commandPolicyOperation(body.operation as ProposalOperation),targetKind:"model",targetId:model.modelId,hostId:model.hostId,modelId:model.modelId,requestDigest:"0".repeat(64),expiresAt}};
     (request as {capability:CommandRequest["capability"]}).capability=Object.freeze({...request.capability,requestDigest:commandAuthorizationDigest(request)});
     const parsed=parseCommandRequest(Object.freeze(request));if(!parsed.ok)return fail("ERR_LIFECYCLE_STATE");
     const facts=this.lifecycle.facts(parsed.value,guard);if(!facts)return fail("ERR_LIFECYCLE_STATE");

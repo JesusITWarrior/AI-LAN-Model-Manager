@@ -8,6 +8,7 @@ import (
 	"encoding/hex"
 	"encoding/json"
 	"io"
+	"log/slog"
 	"net/http"
 	"os"
 	"path/filepath"
@@ -22,6 +23,20 @@ const commandPollPath = "/agent/v1/commands/poll"
 const commandResultPath = "/agent/v1/commands/result"
 const maxCommandPollBody = 768 << 10
 const maxCommandEnvelopeBody = 768 << 10
+
+// commandStage emits only allowlisted stage codes and bounded HTTP statuses to
+// the normal host logger. Never pass wire data, identifiers or error text here.
+func commandStage(code string, status int) {
+	switch code {
+	case "POLL_TRANSPORT", "POLL_HTTP", "POLL_CODEC", "POLL_CERTIFICATE", "POLL_SIGNATURE", "POLL_CLOCK", "POLL_PAYLOAD", "POLL_SEQUENCE", "PENDING_RESULT_EXPIRED", "EXECUTION_ENTERED", "EXECUTION_RETURNED", "EXECUTION_ADAPTER_FAILED", "EXECUTION_REJECTED", "RESULT_TRANSPORT", "RESULT_REJECTED", "RESULT_DELIVERED":
+	default:
+		code = "UNKNOWN_STAGE"
+	}
+	if status < 100 || status > 599 {
+		status = 0
+	}
+	slog.Info("command-stage", "code", code, "httpStatus", status)
+}
 
 type commandPollPayload struct {
 	WaitMS int64 `json:"waitMs"`
@@ -63,6 +78,7 @@ func (c *HTTPSClient) pollCommandWork(ctx context.Context, wait time.Duration) (
 	defer cancel()
 	response, err := c.doEnvelope(pollCtx, commandPollPath, env)
 	if err != nil {
+		commandStage("POLL_TRANSPORT", 0)
 		return commandPollResult{}, err
 	}
 	controller, err := verifyControllerEnvelope(response, env, c.hostID, seq)
@@ -73,6 +89,7 @@ func (c *HTTPSClient) pollCommandWork(ctx context.Context, wait time.Duration) (
 	decoder := json.NewDecoder(bytes.NewReader(controller.Payload))
 	decoder.DisallowUnknownFields()
 	if decoder.Decode(&result) != nil || decoder.Decode(&struct{}{}) != io.EOF || len(result.CancelledJobIDs) > 64 || result.Command != nil && result.PeerTransfer != nil {
+		commandStage("POLL_PAYLOAD", 0)
 		return commandPollResult{}, ErrHTTPClient
 	}
 	if result.Command != nil && (result.Command.HostID != c.hostID || result.Command.Sequence == 0 || result.Command.Operation == command.StreamOperation) {
@@ -92,6 +109,7 @@ func (c *HTTPSClient) pollCommandWork(ctx context.Context, wait time.Duration) (
 		result.stream = &r
 	}
 	if c.reserveControllerSequence(controller.Sequence) != nil {
+		commandStage("POLL_SEQUENCE", 0)
 		return commandPollResult{}, ErrHTTPClient
 	}
 	return result, nil
@@ -110,13 +128,16 @@ func (c *HTTPSClient) sendCommandPayload(ctx context.Context, result any) error 
 	}
 	response, err := c.doEnvelope(ctx, commandResultPath, env)
 	if err != nil {
+		commandStage("RESULT_TRANSPORT", 0)
 		return err
 	}
 	defer response.Body.Close()
 	raw, e := io.ReadAll(io.LimitReader(response.Body, maxResponseBody+1))
 	if e != nil || len(raw) > maxResponseBody || response.StatusCode != http.StatusOK || strings.ToLower(strings.TrimSpace(strings.Split(response.Header.Get("Content-Type"), ";")[0])) != "application/json" || string(raw) != "{\"ok\":true}" {
+		commandStage("RESULT_REJECTED", response.StatusCode)
 		return ErrHTTPClient
 	}
+	commandStage("RESULT_DELIVERED", response.StatusCode)
 	return nil
 }
 func (c *HTTPSClient) agentEnvelope(message string, sequence uint64, payload any) (agenttransport.Envelope, error) {
@@ -155,25 +176,30 @@ func verifyControllerEnvelope(response *http.Response, request agenttransport.En
 	defer response.Body.Close()
 	raw, err := io.ReadAll(io.LimitReader(response.Body, maxCommandPollBody+1))
 	if err != nil || len(raw) > maxCommandPollBody || response.StatusCode != http.StatusOK || response.TLS == nil || len(response.TLS.PeerCertificates) == 0 {
+		commandStage("POLL_HTTP", response.StatusCode)
 		return agenttransport.Envelope{}, ErrHTTPClient
 	}
 	var env agenttransport.Envelope
 	decoder := json.NewDecoder(bytes.NewReader(raw))
 	decoder.DisallowUnknownFields()
 	if command.DecodeStreamWireJSON(raw, &env) != nil || decoder.Decode(&env) != nil || decoder.Decode(&struct{}{}) != io.EOF || env.MessageType != "controller.command.poll" || env.HostID != hostID || env.RequestID != request.RequestID || env.Sequence != sequence {
+		commandStage("POLL_CODEC", response.StatusCode)
 		return agenttransport.Envelope{}, ErrHTTPClient
 	}
 	leaf := response.TLS.PeerCertificates[0]
 	fingerprint := sha256.Sum256(leaf.Raw)
 	if env.CertFingerprint != hex.EncodeToString(fingerprint[:]) || !agenttransport.SameCertificateSerial(env.CertSerial, strings.ToUpper(leaf.SerialNumber.Text(16))) {
+		commandStage("POLL_CERTIFICATE", response.StatusCode)
 		return agenttransport.Envelope{}, ErrHTTPClient
 	}
 	public, ok := leaf.PublicKey.(*ecdsa.PublicKey)
 	if !ok || agenttransport.Verify(env, public) != nil {
+		commandStage("POLL_SIGNATURE", response.StatusCode)
 		return agenttransport.Envelope{}, ErrHTTPClient
 	}
 	sent, err := time.Parse(time.RFC3339Nano, env.SentAt)
 	if err != nil || time.Since(sent) > 2*time.Minute || time.Until(sent) > 2*time.Minute {
+		commandStage("POLL_CLOCK", response.StatusCode)
 		return agenttransport.Envelope{}, ErrHTTPClient
 	}
 	return env, nil
@@ -258,6 +284,8 @@ func (c *HTTPSClient) RunCommands(ctx context.Context, executor *command.Executo
 	}
 	type completion struct{ response command.Response }
 	var activeJob string
+	var activeDeadline time.Time
+	var reportedExpiredPending bool
 	var cancelActive context.CancelFunc
 	var done chan completion
 	var pending *command.Response
@@ -272,6 +300,10 @@ func (c *HTTPSClient) RunCommands(ctx context.Context, executor *command.Executo
 			}
 		}
 		if pending != nil {
+			if !reportedExpiredPending && !activeDeadline.IsZero() && !time.Now().Before(activeDeadline) {
+				commandStage("PENDING_RESULT_EXPIRED", 0)
+				reportedExpiredPending = true
+			}
 			send := c.SendCommandResult
 			if activeStream {
 				send = func(ctx context.Context, result command.Response) error {
@@ -283,6 +315,7 @@ func (c *HTTPSClient) RunCommands(ctx context.Context, executor *command.Executo
 					cancelActive()
 				}
 				activeJob, cancelActive, done, pending = "", nil, nil, nil
+				activeDeadline, reportedExpiredPending = time.Time{}, false
 			} else if ctx.Err() != nil {
 				return nil
 			}
@@ -318,10 +351,13 @@ func (c *HTTPSClient) RunCommands(ctx context.Context, executor *command.Executo
 		}
 		if request != nil && done == nil && pending == nil {
 			runCtx, cancel := context.WithCancel(ctx)
+			activeDeadline, _ = time.Parse(time.RFC3339Nano, request.Deadline)
+			reportedExpiredPending = false
 			activeStream = work.stream != nil
 			activeDigest = request.Capability.RequestDigest
 			activeJob, cancelActive, done = request.JobID, cancel, make(chan completion, 1)
 			go func(value command.Request, output chan<- completion) {
+				commandStage("EXECUTION_ENTERED", 0)
 				var result command.Response
 				var runErr error
 				if value.Operation == command.StreamOperation {
@@ -329,7 +365,12 @@ func (c *HTTPSClient) RunCommands(ctx context.Context, executor *command.Executo
 				} else {
 					result, runErr = executor.Execute(runCtx, value)
 				}
+				commandStage("EXECUTION_RETURNED", 0)
+				if result.ErrorCode != nil && *result.ErrorCode == "ADAPTER_FAILED" {
+					commandStage("EXECUTION_ADAPTER_FAILED", 0)
+				}
 				if runErr != nil {
+					commandStage("EXECUTION_REJECTED", 0)
 					code := "COMMAND_REJECTED"
 					result = command.Response{RequestID: value.RequestID, JobID: value.JobID, HostID: value.HostID, Sequence: value.Sequence, Status: "failed", ObservedAt: time.Now().UTC().Format("2006-01-02T15:04:05.000Z"), ErrorCode: &code}
 				}

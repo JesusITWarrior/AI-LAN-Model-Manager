@@ -8,6 +8,7 @@ import (
 	"encoding/json"
 	"errors"
 	"io"
+	"log/slog"
 	"os"
 	"path/filepath"
 	"regexp"
@@ -359,7 +360,12 @@ func (e *Executor) execute(ctx context.Context, r Request, emit StreamEmitter) (
 	}
 	return response, nil
 }
-func (e *Executor) persist() error {
+func (e *Executor) persist() (result error) {
+	defer func() {
+		if result != nil {
+			slog.Info("command-stage", "code", "REPLAY_PERSIST_FAILED", "httpStatus", 0)
+		}
+	}()
 	if e.store == "" {
 		return nil
 	}
