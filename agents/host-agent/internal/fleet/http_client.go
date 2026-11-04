@@ -123,6 +123,7 @@ func (s SequenceStore) Reserve(next uint64) error {
 // HTTPSClient is an outbound-only TLS 1.3 mTLS fleet client. It uses only the
 // enrolled CA, never ambient roots, proxy variables, redirects, or credentials.
 type HTTPSClient struct {
+	commandSink    CommandSink
 	mu             sync.Mutex
 	http           *http.Client
 	artifactHTTP   *http.Client

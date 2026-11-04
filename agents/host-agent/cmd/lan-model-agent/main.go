@@ -200,11 +200,13 @@ func runHost(ctx context.Context) int {
 
 func maintainFleetSessions(ctx context.Context, certDir, stateDir string, host *service.Service, ollamaClient *ollama.Client) {
 	reporter := &inventoryReporter{stateDir: stateDir}
+	commandReport := newCommandReporter(stateDir)
 	registry := command.NewHostRegistry(host.HostID(), time.Now)
 	if ollamaClient != nil {
 		registry.RegisterOllama("ollama-local", ollamaClient)
 	}
 	maintainFleetSessionLoop(ctx, fleetSessionHooks{
+		commandSink: commandReport.record,
 		rotate: func(ctx context.Context) error {
 			// Durable pending CSR recovery remains inside the rotation operation;
 			// failed rotation never runs a possibly revoked predecessor session.
@@ -235,6 +237,7 @@ func maintainFleetSessions(ctx context.Context, certDir, stateDir string, host *
 // Private offline seam: production supplies the same enrollment/client operations
 // and twelve-hour duration; tests can force rotation without touching live state.
 type fleetSessionHooks struct {
+	commandSink  fleet.CommandSink
 	rotate       func(context.Context) error
 	newClient    func() (*fleet.HTTPSClient, error)
 	newRunner    func() (*fleet.CommandRunner, error)
@@ -252,6 +255,10 @@ func maintainFleetSessionLoop(ctx context.Context, hooks fleetSessionHooks) {
 	// Accept a single owner for this service lifetime. Retry construction failures,
 	// never a successfully accepted executor (including one subsequently poisoned).
 	var runner *fleet.CommandRunner
+	emit := func(stage fleet.CommandStage) {
+		fleet.EmitCommandEvent(hooks.commandSink, fleet.CommandEvent{Domain: fleet.DomainSession, Stage: stage})
+	}
+	defer emit(fleet.StagePaused)
 	retry := func() bool {
 		timer := time.NewTimer(hooks.retryDelay)
 		defer timer.Stop()
@@ -281,13 +288,19 @@ func maintainFleetSessionLoop(ctx context.Context, hooks fleetSessionHooks) {
 			}
 			continue
 		}
+		client.SetCommandSink(hooks.commandSink)
 		if hooks.commandsEnabled && runner == nil {
 			runner, err = hooks.newRunner()
 			if err != nil {
 				runner = nil
 				slog.Info("command-stage", "code", "EXECUTOR_UNAVAILABLE", "httpStatus", 0)
+				fleet.EmitCommandEvent(hooks.commandSink, fleet.CommandEvent{Domain: fleet.DomainExecution, Stage: fleet.StageUnavailable})
 			}
 		}
+		if runner != nil {
+			runner.SetCommandSink(hooks.commandSink)
+		}
+		emit(fleet.StageStarted)
 		sessionCtx, cancel := context.WithCancel(ctx)
 		var workers sync.WaitGroup
 		workers.Add(1)
@@ -315,6 +328,7 @@ func maintainFleetSessionLoop(ctx context.Context, hooks fleetSessionHooks) {
 			// Cancellation alone does not join an adapter or its old-client stream
 			// emitter. Wait fail-closed, retaining any late full completion unchanged.
 			slog.Info("command-stage", "code", "SESSION_HANDOFF_WAITING", "httpStatus", 0)
+			emit(fleet.StageHandoffWaiting)
 			quiesce := hooks.quiesce
 			if quiesce == nil {
 				quiesce = func(ctx context.Context, owner *fleet.CommandRunner) error { return owner.Quiesce(ctx) }

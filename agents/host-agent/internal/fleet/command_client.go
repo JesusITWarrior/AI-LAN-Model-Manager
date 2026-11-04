@@ -68,10 +68,12 @@ func (c *HTTPSClient) pollCommandWork(ctx context.Context, wait time.Duration) (
 	}
 	seq, err := c.next()
 	if err != nil {
+		c.commandEvent(DomainPoll, StageSequence, 0)
 		return commandPollResult{}, err
 	}
 	env, err := c.agentEnvelope("agent.command.poll", seq, commandPollPayload{WaitMS: wait.Milliseconds()})
 	if err != nil {
+		c.commandEvent(DomainPoll, StageEnvelope, 0)
 		return commandPollResult{}, err
 	}
 	pollCtx, cancel := context.WithTimeout(ctx, wait+5*time.Second)
@@ -79,9 +81,10 @@ func (c *HTTPSClient) pollCommandWork(ctx context.Context, wait time.Duration) (
 	response, err := c.doEnvelope(pollCtx, commandPollPath, env)
 	if err != nil {
 		commandStage("POLL_TRANSPORT", 0)
+		c.commandEvent(DomainPoll, StageTransport, 0)
 		return commandPollResult{}, err
 	}
-	controller, err := verifyControllerEnvelope(response, env, c.hostID, seq)
+	controller, err := verifyControllerEnvelopeWithSink(response, env, c.hostID, seq, c.commandSink)
 	if err != nil {
 		return commandPollResult{}, ErrHTTPClient
 	}
@@ -90,54 +93,73 @@ func (c *HTTPSClient) pollCommandWork(ctx context.Context, wait time.Duration) (
 	decoder.DisallowUnknownFields()
 	if decoder.Decode(&result) != nil || decoder.Decode(&struct{}{}) != io.EOF || len(result.CancelledJobIDs) > 64 || result.Command != nil && result.PeerTransfer != nil {
 		commandStage("POLL_PAYLOAD", 0)
+		c.commandEvent(DomainPoll, StagePayload, 0)
 		return commandPollResult{}, ErrHTTPClient
 	}
 	if result.Command != nil && (result.Command.HostID != c.hostID || result.Command.Sequence == 0 || result.Command.Operation == command.StreamOperation) {
+		c.commandEvent(DomainPoll, StagePayload, 0)
 		return commandPollResult{}, ErrHTTPClient
 	}
 	if result.PeerTransfer != nil && (len(*result.PeerTransfer) == 0 || len(*result.PeerTransfer) > maxCommandEnvelopeBody) {
+		c.commandEvent(DomainPoll, StagePayload, 0)
 		return commandPollResult{}, ErrHTTPClient
 	}
 	if result.StreamCommand != nil && string(*result.StreamCommand) != "null" {
 		if result.Command != nil || result.PeerTransfer != nil && string(*result.PeerTransfer) != "null" {
+			c.commandEvent(DomainPoll, StagePayload, 0)
 			return commandPollResult{}, ErrHTTPClient
 		}
 		r, err := command.ParseStreamCommand(*result.StreamCommand)
 		if err != nil || r.HostID != c.hostID {
+			c.commandEvent(DomainPoll, StagePayload, 0)
 			return commandPollResult{}, ErrHTTPClient
 		}
 		result.stream = &r
 	}
 	if c.reserveControllerSequence(controller.Sequence) != nil {
 		commandStage("POLL_SEQUENCE", 0)
+		c.commandEvent(DomainPoll, StageControllerSequence, 0)
 		return commandPollResult{}, ErrHTTPClient
 	}
+	c.commandEvent(DomainPoll, StageVerified, 0)
 	return result, nil
 }
 func (c *HTTPSClient) SendCommandResult(ctx context.Context, result command.Response) error {
 	return c.sendCommandPayload(ctx, result)
 }
 func (c *HTTPSClient) sendCommandPayload(ctx context.Context, result any) error {
+	c.commandEvent(DomainDelivery, StageSendStarted, 0)
 	seq, err := c.next()
 	if err != nil {
+		c.commandEvent(DomainDelivery, StageSequence, 0)
 		return err
 	}
 	env, err := c.agentEnvelope("agent.command.result", seq, result)
 	if err != nil {
+		c.commandEvent(DomainDelivery, StageEnvelope, 0)
 		return err
 	}
 	response, err := c.doEnvelope(ctx, commandResultPath, env)
 	if err != nil {
 		commandStage("RESULT_TRANSPORT", 0)
+		c.commandEvent(DomainDelivery, StageTransport, 0)
 		return err
 	}
 	defer response.Body.Close()
 	raw, e := io.ReadAll(io.LimitReader(response.Body, maxResponseBody+1))
 	if e != nil || len(raw) > maxResponseBody || response.StatusCode != http.StatusOK || strings.ToLower(strings.TrimSpace(strings.Split(response.Header.Get("Content-Type"), ";")[0])) != "application/json" || string(raw) != "{\"ok\":true}" {
 		commandStage("RESULT_REJECTED", response.StatusCode)
+		stage := StageACKInvalid
+		if response.StatusCode != http.StatusOK {
+			stage = StageHTTP
+		} else if e != nil || len(raw) > maxResponseBody {
+			stage = StageCodec
+		}
+		c.commandEvent(DomainDelivery, stage, response.StatusCode)
 		return ErrHTTPClient
 	}
 	commandStage("RESULT_DELIVERED", response.StatusCode)
+	c.commandEvent(DomainDelivery, StageACKValidated, response.StatusCode)
 	return nil
 }
 func (c *HTTPSClient) agentEnvelope(message string, sequence uint64, payload any) (agenttransport.Envelope, error) {
@@ -173,10 +195,14 @@ func (c *HTTPSClient) doEnvelope(ctx context.Context, path string, env agenttran
 	return response, nil
 }
 func verifyControllerEnvelope(response *http.Response, request agenttransport.Envelope, hostID string, sequence uint64) (agenttransport.Envelope, error) {
+	return verifyControllerEnvelopeWithSink(response, request, hostID, sequence, nil)
+}
+func verifyControllerEnvelopeWithSink(response *http.Response, request agenttransport.Envelope, hostID string, sequence uint64, sink CommandSink) (agenttransport.Envelope, error) {
 	defer response.Body.Close()
 	raw, err := io.ReadAll(io.LimitReader(response.Body, maxCommandPollBody+1))
 	if err != nil || len(raw) > maxCommandPollBody || response.StatusCode != http.StatusOK || response.TLS == nil || len(response.TLS.PeerCertificates) == 0 {
 		commandStage("POLL_HTTP", response.StatusCode)
+		EmitCommandEvent(sink, CommandEvent{Domain: DomainPoll, Stage: StageHTTP, HTTPStatus: response.StatusCode})
 		return agenttransport.Envelope{}, ErrHTTPClient
 	}
 	var env agenttransport.Envelope
@@ -184,22 +210,26 @@ func verifyControllerEnvelope(response *http.Response, request agenttransport.En
 	decoder.DisallowUnknownFields()
 	if command.DecodeStreamWireJSON(raw, &env) != nil || decoder.Decode(&env) != nil || decoder.Decode(&struct{}{}) != io.EOF || env.MessageType != "controller.command.poll" || env.HostID != hostID || env.RequestID != request.RequestID || env.Sequence != sequence {
 		commandStage("POLL_CODEC", response.StatusCode)
+		EmitCommandEvent(sink, CommandEvent{Domain: DomainPoll, Stage: StageCodec, HTTPStatus: response.StatusCode})
 		return agenttransport.Envelope{}, ErrHTTPClient
 	}
 	leaf := response.TLS.PeerCertificates[0]
 	fingerprint := sha256.Sum256(leaf.Raw)
 	if env.CertFingerprint != hex.EncodeToString(fingerprint[:]) || !agenttransport.SameCertificateSerial(env.CertSerial, strings.ToUpper(leaf.SerialNumber.Text(16))) {
 		commandStage("POLL_CERTIFICATE", response.StatusCode)
+		EmitCommandEvent(sink, CommandEvent{Domain: DomainPoll, Stage: StageCertificate, HTTPStatus: response.StatusCode})
 		return agenttransport.Envelope{}, ErrHTTPClient
 	}
 	public, ok := leaf.PublicKey.(*ecdsa.PublicKey)
 	if !ok || agenttransport.Verify(env, public) != nil {
 		commandStage("POLL_SIGNATURE", response.StatusCode)
+		EmitCommandEvent(sink, CommandEvent{Domain: DomainPoll, Stage: StageSignature, HTTPStatus: response.StatusCode})
 		return agenttransport.Envelope{}, ErrHTTPClient
 	}
 	sent, err := time.Parse(time.RFC3339Nano, env.SentAt)
 	if err != nil || time.Since(sent) > 2*time.Minute || time.Until(sent) > 2*time.Minute {
 		commandStage("POLL_CLOCK", response.StatusCode)
+		EmitCommandEvent(sink, CommandEvent{Domain: DomainPoll, Stage: StageClock, HTTPStatus: response.StatusCode})
 		return agenttransport.Envelope{}, ErrHTTPClient
 	}
 	return env, nil
@@ -280,5 +310,6 @@ func (c *HTTPSClient) RunCommands(ctx context.Context, executor *command.Executo
 	if err != nil {
 		return err
 	}
+	runner.SetCommandSink(c.commandSink)
 	return runner.Run(ctx, c)
 }
