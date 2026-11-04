@@ -30,7 +30,7 @@ const (
 )
 
 var (
-	serialPattern         = regexp.MustCompile(`^[A-F0-9]{2,40}$`)
+	serialPattern         = regexp.MustCompile(`^[A-F0-9]{1,40}$`)
 	controllerTimePattern = regexp.MustCompile(`^\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}\.\d{3}Z$`)
 )
 
@@ -137,7 +137,7 @@ func (t *HTTPTransport) Complete(ctx context.Context, challenge Challenge, proof
 	leaf, errLeaf := singleCertificate(value.CertificatePEM)
 	serial := new(big.Int)
 	_, serialOK := serial.SetString(value.CertificateSerial, 16)
-	if errBefore != nil || errAfter != nil || !notAfter.After(notBefore) || errLeaf != nil || !serialOK || FingerprintSHA256(leaf.Raw) != value.CertificateFingerprint || leaf.SerialNumber.Cmp(serial) != 0 {
+	if errBefore != nil || errAfter != nil || !notAfter.After(notBefore) || errLeaf != nil || !serialOK || serial.Sign() <= 0 || FingerprintSHA256(leaf.Raw) != value.CertificateFingerprint || leaf.SerialNumber.Cmp(serial) != 0 {
 		return Result{}, remoteError(ctx)
 	}
 	return Result{

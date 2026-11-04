@@ -38,6 +38,29 @@ type Envelope struct {
 	Payload         json.RawMessage `json:"payload"`
 }
 
+// CanonicalCertificateSerial accepts legacy uppercase byte padding, but never
+// rewrites a received signed envelope: verification still covers original bytes.
+func CanonicalCertificateSerial(value string) (string, error) {
+	if len(value) < 1 || len(value) > 40 {
+		return "", ErrTransport
+	}
+	for _, c := range value {
+		if !(c >= '0' && c <= '9' || c >= 'A' && c <= 'F') {
+			return "", ErrTransport
+		}
+	}
+	result := strings.TrimLeft(value, "0")
+	if result == "" {
+		return "", ErrTransport
+	}
+	return result, nil
+}
+func SameCertificateSerial(left, right string) bool {
+	a, errA := CanonicalCertificateSerial(left)
+	b, errB := CanonicalCertificateSerial(right)
+	return errA == nil && errB == nil && a == b
+}
+
 func SignedFields(e Envelope) string {
 	return strings.Join([]string{"lanmm-transport-signed-v1", "ecdsa-p256-sha256", e.HostID, e.RequestID, strconv.FormatUint(e.Sequence, 10), e.SentAt, e.Nonce, e.CertFingerprint, e.CertSerial, e.BodyDigest}, "\x1f")
 }
@@ -161,6 +184,10 @@ type Sequencer struct {
 func NewSequencer(start uint64) *Sequencer { return &Sequencer{next: start} }
 func (s *Sequencer) Next() uint64          { s.mu.Lock(); defer s.mu.Unlock(); s.next++; return s.next }
 func NewEnvelope(hostID, requestID, messageType, nonce, fingerprint, serial string, sequence uint64, now time.Time, payload any) (Envelope, error) {
+	canonical, serialErr := CanonicalCertificateSerial(serial)
+	if serialErr != nil {
+		return Envelope{}, serialErr
+	}
 	body, err := json.Marshal(payload)
 	limit := 32768
 	if messageType == "agent.command.result" || messageType == "agent.stream.event" || messageType == "agent.stream.result" {
@@ -169,5 +196,5 @@ func NewEnvelope(hostID, requestID, messageType, nonce, fingerprint, serial stri
 	if err != nil || len(body) > limit {
 		return Envelope{}, ErrTransport
 	}
-	return Envelope{ProtocolVersion: ProtocolVersion{Major: 1}, MessageType: messageType, HostID: hostID, RequestID: requestID, Sequence: sequence, SentAt: now.UTC().Format("2006-01-02T15:04:05.000Z"), Nonce: nonce, CertFingerprint: fingerprint, CertSerial: serial, Payload: body}, nil
+	return Envelope{ProtocolVersion: ProtocolVersion{Major: 1}, MessageType: messageType, HostID: hostID, RequestID: requestID, Sequence: sequence, SentAt: now.UTC().Format("2006-01-02T15:04:05.000Z"), Nonce: nonce, CertFingerprint: fingerprint, CertSerial: canonical, Payload: body}, nil
 }

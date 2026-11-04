@@ -9,6 +9,12 @@ assert.equal(HOST_CERTIFICATE_BACKDATE_MS,60_000);
 assert.equal(Date.parse(issued.notBefore),Math.floor((issuedAt-60_000)/1000)*1000);
 assert.equal(Date.parse(issued.notAfter),Math.floor((issuedAt+30*24*60*60*1000)/1000)*1000);
 assert.equal(issued.serial,"ABCDEF");
+for(const serial of ["1","01111111111111111111111111111111","0ABCDEF123456789"]){
+ const explicit=engine.issueHost({directory:dir,csrPem:csr,binding,serial,now});
+ assert.equal(explicit.serial,serial.replace(/^0+/,""));
+ assert.equal(engine.verifyHost({caCertificatePem:explicit.caCertificatePem,certificatePem:explicit.certificatePem,binding,now}),true);
+}
+assert.throws(()=>engine.issueHost({directory:dir,csrPem:csr,binding,serial:"00",now}),(e:any)=>e.code==="ERR_CERTIFICATE_INPUT");
 const verifyAt=(time:number)=>engine.verifyHost({caCertificatePem:issued.caCertificatePem,certificatePem:issued.certificatePem,binding,now:new Date(time).toISOString()});
 assert.equal(verifyAt(issuedAt-15_000),true);
 assert.equal(verifyAt(issuedAt-60_000),true);

@@ -52,7 +52,28 @@ export function createControllerApplication(options:ControllerApplicationOptions
  const signal=()=>{void close();};
  function bind(){if(!signals||signalsBound)return;signals.on("SIGINT",signal);signals.on("SIGTERM",signal);signalsBound=true;}
  function unbind(){if(!signals||!signalsBound)return;signals.off("SIGINT",signal);signals.off("SIGTERM",signal);signalsBound=false;}
- async function start(){if(closed)throw new ControllerApplicationError("ERR_APP_CLOSED");if(started)return;let next:ApplicationServer|null=null;try{runtime.start();if(!options.serverFactory&&options.config.discoveryEnabled)discovery.start?.();next=makeServer();await new Promise<void>((resolve,reject)=>{let settled=false;const fail=()=>{if(settled)return;settled=true;next?.off?.("error",fail);reject(new ControllerApplicationError("ERR_APP_LISTEN"));};next!.once?.("error",fail);try{next!.listen(options.config.port,options.config.bindHost,()=>{if(settled)return;settled=true;next?.off?.("error",fail);resolve();});}catch{fail();}});if(options.config.agentPlaneEnabled){runtime.services.certificates.initialize();const material=ensureAgentPlaneMaterial(options.plan.certificateDir,options.config.agentPlaneAdvertisedAddress!);const enrollment={begin:async(binding:{candidateId:string;address:string;port:number;protocolMajor:number;protocolMinor:number})=>{const candidate=discovery.list().find(value=>value.id===binding.candidateId&&value.address===binding.address&&value.agentPort===binding.port&&value.protocolVersion.major===binding.protocolMajor&&value.protocolVersion.minor===binding.protocolMinor);if(!candidate)return null;const created=runtime.services.pairing.createAuthorized(candidate);if(!created||!runtime.services.pairing.present(created.challengeId))return null;return created;},pairing:runtime.services.pairing,certificates:runtime.services.certificates};const enrollmentHandler=createEnrollmentHttpHandler(enrollment,options.runtimeDependencies?.now?{clock:()=>Date.parse(options.runtimeDependencies!.now!())}:{});const plane=createProductionAgentPlane(runtime,material,enrollmentHandler,options.runtimeDependencies?.now);agentServer=plane;await new Promise<void>((resolve,reject)=>{plane.once("error",reject);plane.listen(options.config.agentPlanePort!,options.config.agentPlaneHost!,()=>resolve());});stopAgentRotation=scheduleAgentPlaneRotation(plane,options.plan.certificateDir,options.config.agentPlaneAdvertisedAddress!);}server=next;started=true;bind();}catch(error){stopAgentRotation?.();stopAgentRotation=null;if(agentServer)try{await closeServer(agentServer,timeout);}catch{}agentServer=null;if(next)try{await closeServer(next,timeout);}catch{}try{discovery.stop?.();}catch{}runtime.close();closed=true;throw error instanceof ControllerApplicationError?error:new ControllerApplicationError("ERR_APP_START");}}
+ async function start(){if(stopping)await stopping;if(closed)throw new ControllerApplicationError("ERR_APP_CLOSED");if(started)return;let next:ApplicationServer|null=null;try{runtime.start();if(!options.serverFactory&&options.config.discoveryEnabled)discovery.start?.();next=makeServer();await new Promise<void>((resolve,reject)=>{let settled=false;const fail=()=>{if(settled)return;settled=true;next?.off?.("error",fail);reject(new ControllerApplicationError("ERR_APP_LISTEN"));};next!.once?.("error",fail);try{next!.listen(options.config.port,options.config.bindHost,()=>{if(settled)return;settled=true;next?.off?.("error",fail);resolve();});}catch{fail();}});if(options.config.agentPlaneEnabled){runtime.services.certificates.initialize();const material=ensureAgentPlaneMaterial(options.plan.certificateDir,options.config.agentPlaneAdvertisedAddress!);const enrollment={begin:async(binding:{candidateId:string;address:string;port:number;protocolMajor:number;protocolMinor:number})=>{const candidate=discovery.list().find(value=>value.id===binding.candidateId&&value.address===binding.address&&value.agentPort===binding.port&&value.protocolVersion.major===binding.protocolMajor&&value.protocolVersion.minor===binding.protocolMinor);if(!candidate)return null;const created=runtime.services.pairing.createAuthorized(candidate);if(!created||!runtime.services.pairing.present(created.challengeId))return null;return created;},pairing:runtime.services.pairing,certificates:runtime.services.certificates};const enrollmentHandler=createEnrollmentHttpHandler(enrollment,options.runtimeDependencies?.now?{clock:()=>Date.parse(options.runtimeDependencies!.now!())}:{});const plane=createProductionAgentPlane(runtime,material,enrollmentHandler,options.runtimeDependencies?.now);agentServer=plane;await new Promise<void>((resolve,reject)=>{plane.once("error",reject);plane.listen(options.config.agentPlanePort!,options.config.agentPlaneHost!,()=>resolve());});stopAgentRotation=scheduleAgentPlaneRotation(plane,options.plan.certificateDir,options.config.agentPlaneAdvertisedAddress!);}server=next;started=true;bind();}catch(error){
+   // start() may already have closed the runtime. Never dereference services
+   // after that transition, and never let failed owner cleanup skip listeners.
+   try{await shutdownOwners();}catch{/* preserve the original startup error */}finally{
+    unbind();stopAgentRotation?.();stopAgentRotation=null;
+    await Promise.allSettled([...(agentServer?[closeServer(agentServer,timeout)]:[]),...(next?[closeServer(next,timeout)]:[])]);
+    agentServer=null;server=null;try{discovery.stop?.();}catch{}
+    try{runtime.close();}catch{/* startup error remains authoritative */}finally{closed=true;started=false;}
+   }
+   throw error instanceof ControllerApplicationError?error:new ControllerApplicationError("ERR_APP_START");
+  }}
+ async function shutdownOwners():Promise<void>{
+  if(runtime.isClosed)return;
+  const services=runtime.services;
+  // Invoke both owners in this stack: lifecycle must close admission before
+  // stop() returns its promise, not in a later microtask. Still join both when
+  // either owner throws synchronously.
+  const invoke=(close:()=>Promise<void>)=>{try{return close();}catch(error){return Promise.reject(error);}};
+  const results=await Promise.allSettled([invoke(()=>services.inference.shutdown()),invoke(()=>services.lifecycle.shutdown())]);
+  if(results.some(result=>result.status==="rejected"))throw new Error("ERR_APP_STOP");
+ }
+
  async function stop():Promise<void>{
   if(stopping)return stopping;
   if(closed)return;
@@ -63,10 +84,15 @@ export function createControllerApplication(options:ControllerApplicationOptions
    try{
     // Reject new lifecycle submissions and release owned HTTP waits while all
     // repositories and listeners are still alive. Never close DB under a waiter.
-    await Promise.all([runtime.services.inference.shutdown(),runtime.services.lifecycle.shutdown()]);
+    await shutdownOwners();
     await Promise.all([...(currentAgent?[closeServer(currentAgent,remaining())]:[]),...(current?[closeServer(current,remaining())]:[])]);
     try{discovery.stop?.();}catch{}runtime.stop();
-   }catch{runtime.close();closed=true;throw new ControllerApplicationError("ERR_APP_STOP");}
+   }catch{
+    // Cleanup every listener even if an owner rejects its shutdown contract.
+    await Promise.allSettled([...(currentAgent?[closeServer(currentAgent,remaining())]:[]),...(current?[closeServer(current,remaining())]:[])]);
+    try{discovery.stop?.();}catch{}try{runtime.close();}catch{/* stable application stop error */}finally{closed=true;}
+    throw new ControllerApplicationError("ERR_APP_STOP");
+   }
   })();
   try{await stopping;}finally{stopping=null;}
  }

@@ -13,6 +13,7 @@ import {CertificateRepository} from "./certificate-repository.js";
 import {FleetService} from "./fleet-service.js";
 import {createFleetAgentHttpHandler} from "./fleet-agent-http.js";
 import {AgentCommandService} from "./agent-command-channel.js";
+import {createAgentStreamHttpHandler} from "./agent-stream-http.js";
 import type {ControllerRuntimeHandle} from "./controller-runtime.js";
 
 export interface AgentPlaneMaterial{readonly key:string;readonly certificate:string;readonly ca:string;readonly generation:string}
@@ -58,9 +59,12 @@ export function createProductionAgentPlane(runtime:ControllerRuntimeHandle,mater
  const transport=new ControllerTransport({certificateRepository:certificates,replayStore:runtime.services.replay,clock,verifier:pem=>{const parsed=parseTransportParsedLeaf(pem,material.ca);if(!parsed.ok)return null;const built=buildTransportNativeVerifier(createPublicKey(pem).export({type:"spki",format:"pem"}) as string,parsed.value);return built.ok?built.value:null;}});
  const fleet=new FleetService(runtime.repositories.db,transport,certificates,runtime.repositories,{clock});
  const parsed=parseTransportParsedLeaf(material.certificate,material.ca);if(!parsed.ok)throw new Error("ERR_AGENT_PLANE_CERTIFICATE");const signer=buildTransportNativeSigner(material.key,parsed.value);if(!signer.ok)throw new Error("ERR_AGENT_PLANE_CERTIFICATE");const signers=new Map<string,TransportSigner>([[parsed.value.fingerprint,signer.value]]);
- const commands=new AgentCommandService(transport,certificates,runtime.services.commands,runtime.jobStores,signer.value,{clock});
+ const commands=new AgentCommandService(transport,certificates,runtime.services.commands,runtime.jobStores,signer.value,{clock,streams:runtime.services.inference.streams});
+ runtime.services.inference.ownHttp(()=>commands.close());
  const commandSigner=(request:Parameters<RequestListener>[0])=>{const socket=request.socket as TLSSocket,local=(typeof socket.getCertificate==="function"?socket.getCertificate():null) as {raw?:Buffer}|null;if(!local?.raw)return null;return signers.get(createHash("sha256").update(local.raw).digest("hex"))??null};
- const fleetHandler=createFleetAgentHttpHandler({fleet,certificates,commands,rotation:runtime.services.certificates,commandSigner});
+ const streams=createAgentStreamHttpHandler({relay:runtime.services.inference.streams,transport,certificates},()=>Date.parse(clock()));runtime.services.inference.ownHttp(streams.shutdown);
+ const fleetHandler=createFleetAgentHttpHandler({fleet,certificates,commands,streams,rotation:runtime.services.certificates,commandSigner});
+ runtime.services.inference.ownHttp(fleetHandler.shutdown);
  const handler:RequestListener=(request,response)=>{const path=request.url?.split("?",1)[0]??"";if(path.startsWith("/agent/v1/enrollment/")){enrollment(request,response);return;}fleetHandler(request,response);};
  const server=createServer({key:material.key,cert:material.certificate,ca:material.ca,minVersion:"TLSv1.3",maxVersion:"TLSv1.3",requestCert:true,rejectUnauthorized:false,honorCipherOrder:true,maxHeaderSize:8192,requestTimeout:35_000,headersTimeout:5_000},handler);
  serverRotators.set(server,next=>{const nextParsed=parseTransportParsedLeaf(next.certificate,next.ca);if(!nextParsed.ok)throw new Error("ERR_AGENT_PLANE_CERTIFICATE");const nextSigner=buildTransportNativeSigner(next.key,nextParsed.value);if(!nextSigner.ok)throw new Error("ERR_AGENT_PLANE_CERTIFICATE");signers.set(nextParsed.value.fingerprint,nextSigner.value);server.setSecureContext({key:next.key,cert:next.certificate,ca:next.ca,minVersion:"TLSv1.3",maxVersion:"TLSv1.3"});});return server;

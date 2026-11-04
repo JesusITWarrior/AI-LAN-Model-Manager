@@ -3,6 +3,7 @@ import {parseCommandResponse, parseStreamCommand, parseStreamWireJSON, StreamEve
 export type StreamRelayOutcome="succeeded"|"failed"|"cancelled"|"interrupted"|"deadline";
 type Slot={event:StreamEvent;bytes:number;authorized:()=>boolean;resolve:()=>void;reject:(error:Error)=>void};
 type Entry={request:StreamCommandRequest;validator:StreamEventValidator;leased:boolean;slot:Slot|null;wake:(()=>void)|null;reading:boolean;terminal:StreamEvent["kind"]|null;outcome:StreamRelayOutcome|null;timer:ReturnType<typeof setTimeout>;resolve:(value:StreamRelayOutcome)=>void};
+export type AgentStreamAdapter = Pick<AgentStreamRelay,"busy"|"poll"|"publish"|"complete">;
 export interface StreamRelayHandle {
  /** Transfer of one bounded event to the sole consumer is its acceptance point. */
  next(signal:AbortSignal):Promise<StreamEvent|null>;
@@ -20,9 +21,10 @@ const failure=()=>new Error("ERR_STREAM_RELAY");
  */
 export class AgentStreamRelay {
  private readonly entries=new Map<string,Entry>();
+ private readonly settled=new Map<string,{hostId:string;requestId:string;sequence:number;digest:string;outcome:StreamRelayOutcome;expires:number}>();
  private readonly used=new Set<string>();
  private readonly cancellations=new Map<string,{hostId:string;expires:number}>();
- private pruneCancellations():void{for(const [id,value] of this.cancellations)if(this.clock()>=value.expires)this.cancellations.delete(id);}
+ private pruneCancellations():void{for(const [id,value] of this.settled)if(this.clock()>=value.expires)this.settled.delete(id);for(const [id,value] of this.cancellations)if(this.clock()>=value.expires)this.cancellations.delete(id);}
  private stopped=false;
  constructor(private readonly clock:()=>number=Date.now,private readonly globalLimit=16,private readonly hostLimit=1){
   if(!Number.isSafeInteger(globalLimit)||globalLimit<1||globalLimit>16||!Number.isSafeInteger(hostLimit)||hostLimit<1||hostLimit>1)throw failure();
@@ -69,6 +71,7 @@ export class AgentStreamRelay {
   if(typeof input!=="object"||input===null||Array.isArray(input)||Object.keys(input).length!==2||!("commandDigest" in input)||!("result" in input))return false;
   const parsed=parseCommandResponse(input.result);if(!parsed.ok)return false;
   const r=parsed.value,e=this.entries.get(r.jobId);
+  if(!e){this.pruneCancellations();const settled=this.settled.get(r.jobId);return !!settled&&settled.hostId===hostId&&r.hostId===hostId&&r.requestId===settled.requestId&&r.sequence===settled.sequence&&input.commandDigest===settled.digest&&r.status===settled.outcome&&r.observation===null;}
   if(!e||input.commandDigest!==e.request.capability.requestDigest||hostId!==e.request.hostId||r.hostId!==hostId||r.requestId!==e.request.requestId||r.sequence!==e.request.sequence||!e.leased)return false;
   this.check(e);
   // Buffered result observations can never substitute for stream events.
@@ -85,7 +88,7 @@ export class AgentStreamRelay {
   try{for(;;){
    this.check(e);
    if(signal.aborted){this.end(jobId,"cancelled");throw failure();}
-   if(e.slot){const slot=e.slot;if(!slot.authorized()){this.end(jobId,"failed");throw failure();}e.slot=null;if(slot.event.kind!=="chunk"){e.terminal=slot.event.kind;this.end(jobId,slot.event.kind);}slot.resolve();return slot.event;}
+   if(e.slot){const slot=e.slot;if(!slot.authorized()||e.outcome!==null){this.end(jobId,"failed");throw failure();}e.slot=null;if(slot.event.kind!=="chunk"){e.terminal=slot.event.kind;this.end(jobId,slot.event.kind);}slot.resolve();return slot.event;}
    if(e.outcome!==null)return null;
    await new Promise<void>(resolve=>{const wake=()=>{signal.removeEventListener("abort",wake);e.wake=null;resolve();};e.wake=wake;signal.addEventListener("abort",wake,{once:true});});
   }}finally{e.reading=false;}
@@ -94,9 +97,10 @@ export class AgentStreamRelay {
  private end(jobId:string,outcome:StreamRelayOutcome):void{
   const e=this.entries.get(jobId);if(!e||e.outcome!==null)return;
   if(e.leased&&outcome!=="succeeded")this.cancellations.set(jobId,{hostId:e.request.hostId,expires:Date.parse(e.request.deadline)+30_000});
+  if(this.settled.size<4096)this.settled.set(jobId,{hostId:e.request.hostId,requestId:e.request.requestId,sequence:e.request.sequence,digest:e.request.capability.requestDigest,outcome,expires:Date.parse(e.request.deadline)+30000});
   e.outcome=outcome;clearTimeout(e.timer);const slot=e.slot;e.slot=null;slot?.reject(failure());e.wake?.();e.resolve(outcome);
  }
  /** Runtime owner must call before teardown/restart. New instances restore no work. */
- stop():void{this.stopped=true;for(const id of this.entries.keys())this.end(id,"interrupted");this.entries.clear();}
+ stop():void{this.stopped=true;for(const id of this.entries.keys())this.end(id,"interrupted");this.entries.clear();this.settled.clear();}
  stats():{streams:number;events:number;bytes:number}{return {streams:this.entries.size,events:[...this.entries.values()].filter(e=>e.slot!==null).length,bytes:[...this.entries.values()].reduce((n,e)=>n+(e.slot?.bytes??0),0)};}
 }

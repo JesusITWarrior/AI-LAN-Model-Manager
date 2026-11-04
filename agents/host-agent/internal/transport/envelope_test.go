@@ -7,6 +7,7 @@ import (
 	"crypto/x509"
 	"encoding/json"
 	"encoding/pem"
+	"strings"
 	"sync"
 	"testing"
 	"time"
@@ -55,4 +56,18 @@ func TestSequencerConcurrent(t *testing.T) {
 		}()
 	}
 	wg.Wait()
+}
+
+func TestCanonicalCertificateSerialCompatibility(t *testing.T) {
+	for _, value := range []string{"01", "0ABCDEF123456789", "01111111111111111111111111111111", "ABCD", "1"} {
+		canonical, err := CanonicalCertificateSerial(value)
+		if err != nil || canonical == "" || canonical[0] == '0' || !SameCertificateSerial(value, canonical) {
+			t.Fatalf("canonical %q: %q %v", value, canonical, err)
+		}
+	}
+	for _, value := range []string{"", "0", "00", "abc", "-1", "0x01", "1 ", strings.Repeat("A", 41)} {
+		if _, err := CanonicalCertificateSerial(value); err == nil || SameCertificateSerial(value, value) {
+			t.Fatalf("invalid serial %q", value)
+		}
+	}
 }

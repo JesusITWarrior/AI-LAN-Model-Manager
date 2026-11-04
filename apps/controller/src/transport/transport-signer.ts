@@ -7,6 +7,7 @@ import {
   type KeyObject,
 } from "node:crypto";
 
+import {canonicalCertificateSerial} from "@lan-model-manager/core";
 import type { TransportParsedCertificate } from "@lan-model-manager/core";
 
 /**
@@ -57,6 +58,9 @@ export function buildTransportNativeSigner(
   pemKey: string,
   certificate: TransportParsedCertificate,
 ): { readonly ok: true; readonly value: TransportNativeSigner } | { readonly ok: false; readonly detail: string } {
+  const serial=canonicalCertificateSerial(certificate.serial);
+  if(serial===null)return {ok:false,detail:"bad_certificate_serial"};
+  const canonicalCertificate=Object.freeze({...certificate,serial});
   let key: KeyObject;
   try {
     key = createPrivateKey({ key: pemKey, format: "pem" });
@@ -73,7 +77,7 @@ export function buildTransportNativeSigner(
     ok: true,
     value: {
       algorithm: "ecdsa-p256-sha256",
-      certificate,
+      certificate:canonicalCertificate,
       sign(message: string): string {
         const raw = sign("sha256", Buffer.from(message), key);
         return toHex(Buffer.from(raw));

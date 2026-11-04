@@ -23,6 +23,7 @@ import (
 	agentcert "github.com/JesusITWarrior/AI-LAN-Model-Manager/agents/host-agent/internal/certificate"
 	"github.com/JesusITWarrior/AI-LAN-Model-Manager/agents/host-agent/internal/enrollment"
 	"github.com/JesusITWarrior/AI-LAN-Model-Manager/agents/host-agent/internal/privatefile"
+	agenttransport "github.com/JesusITWarrior/AI-LAN-Model-Manager/agents/host-agent/internal/transport"
 )
 
 const identityPointerName = "fleet-identity-current"
@@ -217,7 +218,7 @@ func RotateIdentityIfNeeded(ctx context.Context, certDir string, renewBefore tim
 		return false, ErrHTTPClient
 	}
 	newDigest := sha256.Sum256(newLeaf.Raw)
-	if hex.EncodeToString(newDigest[:]) != decoded.Result.Fingerprint || strings.ToUpper(newLeaf.SerialNumber.Text(16)) != decoded.Result.Serial {
+	if hex.EncodeToString(newDigest[:]) != decoded.Result.Fingerprint || !agenttransport.SameCertificateSerial(strings.ToUpper(newLeaf.SerialNumber.Text(16)), decoded.Result.Serial) {
 		return false, ErrHTTPClient
 	}
 	if err = publishIdentityGeneration(certDir, pending, next); err != nil {

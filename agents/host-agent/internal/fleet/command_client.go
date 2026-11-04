@@ -165,7 +165,7 @@ func verifyControllerEnvelope(response *http.Response, request agenttransport.En
 	}
 	leaf := response.TLS.PeerCertificates[0]
 	fingerprint := sha256.Sum256(leaf.Raw)
-	if env.CertFingerprint != hex.EncodeToString(fingerprint[:]) || env.CertSerial != strings.ToUpper(leaf.SerialNumber.Text(16)) {
+	if env.CertFingerprint != hex.EncodeToString(fingerprint[:]) || !agenttransport.SameCertificateSerial(env.CertSerial, strings.ToUpper(leaf.SerialNumber.Text(16))) {
 		return agenttransport.Envelope{}, ErrHTTPClient
 	}
 	public, ok := leaf.PublicKey.(*ecdsa.PublicKey)

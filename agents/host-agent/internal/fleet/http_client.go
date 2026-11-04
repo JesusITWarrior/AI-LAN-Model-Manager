@@ -183,7 +183,10 @@ func NewHTTPSClient(certDir string) (*HTTPSClient, error) {
 		return nil, err
 	}
 	digest := sha256.Sum256(leaf.Raw)
-	serial := strings.ToUpper(leaf.SerialNumber.Text(16))
+	serial, serialErr := agenttransport.CanonicalCertificateSerial(strings.ToUpper(leaf.SerialNumber.Text(16)))
+	if serialErr != nil {
+		return nil, ErrHTTPClient
+	}
 	transport := &http.Transport{Proxy: nil, TLSClientConfig: tlsConfig, DisableCompression: true, ForceAttemptHTTP2: false, MaxIdleConns: 1, MaxIdleConnsPerHost: 1, IdleConnTimeout: 90 * time.Second, TLSHandshakeTimeout: 5 * time.Second, ResponseHeaderTimeout: 8 * time.Second}
 	noRedirect := func(*http.Request, []*http.Request) error { return http.ErrUseLastResponse }
 	client := &http.Client{Transport: transport, Timeout: 10 * time.Second, CheckRedirect: noRedirect}

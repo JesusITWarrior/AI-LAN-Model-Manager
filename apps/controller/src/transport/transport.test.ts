@@ -1,3 +1,5 @@
+import {DatabaseSync} from "node:sqlite";
+import {migrateControllerDatabase as migrateForSerialTest} from "../database.js";
 import assert from "node:assert/strict";import test from "node:test";import { execFileSync } from "node:child_process";import { mkdtempSync,readFileSync,rmSync } from "node:fs";import { tmpdir } from "node:os";import { join } from "node:path";import { openControllerDatabase,CONTROLLER_MIGRATIONS } from "../database.js";import { CertificateRepository } from "../certificate-repository.js";import { PersistentReplayStore } from "./replay-store.js";import { ControllerTransport } from "./controller-transport.js";import { createMutualTlsServer } from "./https-server.js";import { OpenSslCertificateEngine } from "../certificate-adapter.js";import { resolveMtlsTrust } from "./trust-resolver.js";import { buildTransportNativeSigner,buildTransportNativeVerifier,generateTransportNativeKeyPair } from "./transport-signer.js";import { parseTransportParsedCertificate,signTransportSignedEnvelope,transportBodyDigest,type TransportParsedCertificate } from "@lan-model-manager/core";
 const NOW="2026-09-27T20:00:00.000Z",pem="-----BEGIN CERTIFICATE-----\nQQ==\n-----END CERTIFICATE-----\n",fingerprint="a".repeat(64),serial="ABCD";function cert():TransportParsedCertificate{const p=parseTransportParsedCertificate({fingerprint,serial,commonName:"agent-1",address:"192.168.1.20",spiffe:"spiffe://lanmodelmanager/host/agent-1",notBefore:"2026-01-01T00:00:00.000Z",notAfter:"2027-01-01T00:00:00.000Z",issuerFingerprint:"b".repeat(64),isCa:false});assert.ok(p.ok);return p.value;}
 function setup(){const db=openControllerDatabase(":memory:"),repo=new CertificateRepository(db);repo.insertCa({caId:"b".repeat(64),version:1,serial:"10",fingerprint:"b".repeat(64),certificatePem:pem,notBefore:"2026-01-01T00:00:00.000Z",notAfter:"2036-01-01T00:00:00.000Z",createdAt:"2026-01-01T00:00:00.000Z"});repo.insertHost({certificateId:fingerprint,serial,fingerprint,certificatePem:pem,caId:"b".repeat(64),caVersion:1,binding:{candidateId:"agent-1",address:"192.168.1.20",port:7443,protocolMajor:1,protocolMinor:0},spiffeUri:"spiffe://lanmodelmanager/host/agent-1",challengeId:"c".repeat(64),transcriptDigest:"d".repeat(64),notBefore:"2026-01-01T00:00:00.000Z",notAfter:"2027-01-01T00:00:00.000Z",status:"active",version:1,issuedAt:NOW,revokedAt:null});const pair=generateTransportNativeKeyPair(),signer=buildTransportNativeSigner(pair.keyPem,cert()),verifier=buildTransportNativeVerifier(pair.publicPem,cert());assert.ok(signer.ok&&verifier.ok);const transport=new ControllerTransport({certificateRepository:repo,replayStore:new PersistentReplayStore(db),verifier:()=>verifier.value,clock:()=>NOW});return{db,repo,transport,signer:signer.value};}
@@ -9,3 +11,38 @@ test("transport lifecycle is explicit and idempotently stopped",()=>{let listens
 test("HTTPS factory enforces TLS1.3 and verified client certificates without listening",()=>{let captured:any=null,listens=0;const fake:any={listen(){listens++},close(){}};createMutualTlsServer({key:"key",cert:"cert",ca:"ca",listener:()=>{},create:(options:any)=>{captured=options;return fake;}});assert.equal(listens,0);assert.equal(captured.minVersion,"TLSv1.3");assert.equal(captured.requestCert,true);assert.equal(captured.rejectUnauthorized,true);assert.equal(captured.maxHeaderSize,8192);});
 test("real certificate trust rejects wrong CA and revocation",()=>{try{execFileSync("openssl",["version"],{stdio:"ignore"});}catch{return;}const root=mkdtempSync(join(tmpdir(),"lanmm-mtls-trust-")),caDir=join(root,"ca");try{const engine=new OpenSslCertificateEngine();engine.initializeCa({directory:caDir,now:NOW});execFileSync("openssl",["ecparam","-name","prime256v1","-genkey","-noout","-out",join(root,"key.pem")]);execFileSync("openssl",["req","-new","-sha256","-key",join(root,"key.pem"),"-subj","/CN=agent-1","-addext","subjectAltName=IP:192.168.1.20,URI:spiffe://lanmodelmanager/host/agent-1","-out",join(root,"request.pem")]);const issued=engine.issueHost({directory:caDir,csrPem:readFileSync(join(root,"request.pem"),"utf8"),binding:{candidateId:"agent-1",address:"192.168.1.20",port:7443,protocolMajor:1,protocolMinor:0},serial:"1234ABCD",now:new Date().toISOString()});assert.equal(resolveMtlsTrust(issued.certificatePem,issued.caCertificatePem,{now:new Date(),authorityStatus:()=>"active"}).ok,true);assert.equal(resolveMtlsTrust(issued.certificatePem,issued.caCertificatePem,{now:new Date(),authorityStatus:()=>"revoked"}).status,"trusted_revoked");const other=engine.initializeCa({directory:join(root,"other"),now:NOW});assert.equal(resolveMtlsTrust(issued.certificatePem,other.certificatePem,{now:new Date(),authorityStatus:()=>"active"}).status,"wrong_ca");}finally{rmSync(root,{recursive:true,force:true});}});
 test("migration8 persists replay state",()=>{assert.ok(CONTROLLER_MIGRATIONS.length>=8);assert.equal(CONTROLLER_MIGRATIONS[7]!.name,"private-plan-transport-replay-v1");});
+
+test("legacy padded serial rows and signed bytes share replay state without loosening certificate binding",()=>{
+ const{db,repo,signer}=setup();
+ try{
+  db.prepare("UPDATE host_certificates SET serial='0ABCD' WHERE fingerprint=?").run(fingerprint);
+  assert.equal(repo.getBySerial("ABCD",fingerprint)?.serial,"ABCD");assert.equal(repo.getBySerial("0ABCD",fingerprint)?.serial,"ABCD");
+  assert.equal(repo.getBySerial("ABCE",fingerprint),null);assert.equal(repo.getBySerial("ABCD","e".repeat(64)),null);
+  const verifier=buildTransportNativeVerifier(generateTransportNativeKeyPair().publicPem,cert());assert.ok(verifier.ok);
+  // Use the real matching key for both padded and numeric signed envelopes.
+  const pair=generateTransportNativeKeyPair(),realSigner=buildTransportNativeSigner(pair.keyPem,cert()),realVerifier=buildTransportNativeVerifier(pair.publicPem,cert());assert.ok(realSigner.ok&&realVerifier.ok);
+  const replay=new PersistentReplayStore(db),transport=new ControllerTransport({certificateRepository:repo,replayStore:replay,verifier:()=>realVerifier.value,clock:()=>NOW});
+  const make=(padding:boolean,sequence:number)=>{const base=envelope(signer,sequence,`request-${sequence}`,`nonce-${sequence}`);assert.ok(base.ok);const value=signTransportSignedEnvelope({...base.value,certSerial:padding?"0ABCD":"ABCD"},realSigner.value);assert.ok(value.ok);return value.value;};
+  const padded=make(true,1);assert.equal(transport.accept(padded).ok,true);
+  assert.equal(db.prepare("SELECT certificate_serial FROM transport_replay_state").get()!.certificate_serial,"ABCD");
+  db.prepare("UPDATE transport_replay_state SET certificate_serial='0ABCD'").run();
+  assert.equal(transport.accept({...make(true,2),certSerial:"ABCD"}).ok,false,"never normalize signed bytes before verification");
+  assert.equal(transport.accept(make(false,2)).ok,true);
+  assert.match((transport.accept(make(true,1)) as {error:string}).error,/OUT_OF_ORDER/);
+  assert.match((transport.accept(make(true,2)) as {error:string}).error,/DUPLICATE/);
+  const foreign=signTransportSignedEnvelope({...make(false,3),certSerial:"ABCE"},realSigner.value);assert.ok(foreign.ok);assert.equal(transport.accept(foreign.value).ok,false);
+ }finally{db.close();}
+});
+
+test("serial migration preserves historical ledger and replay bytes, and permits numeric one-digit serials",()=>{
+ const db=new DatabaseSync(":memory:");
+ try{
+  const old=CONTROLLER_MIGRATIONS.slice(0,16);migrateForSerialTest(db,old);
+  db.prepare("INSERT INTO transport_replay_state VALUES(?,?,?,?,?,?,?,?)").run(fingerprint,"01","agent-1",31,"old-request","old-nonce",NOW,NOW);
+  const ledger=db.prepare("SELECT * FROM schema_migrations ORDER BY version").all(),before=db.prepare("SELECT * FROM transport_replay_state").all();
+  migrateForSerialTest(db);assert.deepEqual(db.prepare("SELECT * FROM schema_migrations WHERE version<=16 ORDER BY version").all(),ledger);assert.deepEqual(db.prepare("SELECT * FROM transport_replay_state").all(),before);
+  const replay=new PersistentReplayStore(db),base=envelope({sign:()=>"a".repeat(16)},32,"new-request","new-nonce");assert.ok(base.ok);
+  assert.equal(replay.check({...base.value,certSerial:"1"},NOW),"accepted");
+  db.prepare("DELETE FROM transport_replay_state").run();assert.equal(replay.check({...base.value,certSerial:"1"},NOW),"accepted");assert.equal(db.prepare("SELECT certificate_serial FROM transport_replay_state").get()!.certificate_serial,"1");
+ }finally{db.close();}
+});

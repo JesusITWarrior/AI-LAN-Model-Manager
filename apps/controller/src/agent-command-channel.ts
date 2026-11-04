@@ -1,4 +1,4 @@
-import type { AgentStreamRelay } from "./agent-stream-relay.js";
+import type { AgentStreamAdapter } from "./agent-stream-relay.js";
 import { createHash, randomBytes } from "node:crypto";
 import type { DatabaseSync } from "node:sqlite";
 import { parseCommandRequest, parseCommandResponse, parsePeerRelayResult, responseMatches, signTransportSignedEnvelope, type CommandRequest, type CommandResponse, type JsonValue, type PeerRelayDirective, type TransportSigner } from "@lan-model-manager/core";
@@ -43,12 +43,36 @@ export class AgentCommandStore implements CommandWire {
   private accepted(request:CommandRequest,observedAt:string):CommandResponse { const at=new Date(Date.parse(observedAt)+4).toISOString();return{requestId:request.requestId,jobId:request.jobId,hostId:request.hostId,sequence:request.sequence,status:"accepted",progress:0,observedAt:at,observation:null,errorCode:null}; }
 }
 
-export interface AgentCommandServiceOptions{readonly clock?:()=>string;readonly random?:()=>string;readonly pollIntervalMs?:number;readonly peerRelay?:AgentPeerRelay;readonly streams?:AgentStreamRelay}
+export interface AgentCommandServiceOptions{readonly clock?:()=>string;readonly random?:()=>string;readonly pollIntervalMs?:number;readonly peerRelay?:AgentPeerRelay;readonly streams?:AgentStreamAdapter}
 export class AgentCommandService {
-  private readonly clock:()=>string;private readonly nonce:()=>string;private readonly dispatcher:CommandDispatcher;private readonly pollIntervalMs:number;private readonly peerRelay:AgentPeerRelay|undefined;private readonly streams:AgentStreamRelay|undefined;
+  private closed=false;
+  private readonly waits=new Map<AbortController,Promise<AgentCommandPoll>>();
+  private readonly clock:()=>string;private readonly nonce:()=>string;private readonly dispatcher:CommandDispatcher;private readonly pollIntervalMs:number;private readonly peerRelay:AgentPeerRelay|undefined;private readonly streams:AgentStreamAdapter|undefined;
   constructor(private readonly transport:ControllerTransport,private readonly certificates:CertificateRepository,private readonly store:AgentCommandStore,stores:JobStores,private readonly signer:TransportSigner,options:AgentCommandServiceOptions={}){this.clock=options.clock??(()=>new Date().toISOString());this.nonce=options.random??(()=>randomBytes(16).toString("hex"));this.pollIntervalMs=options.pollIntervalMs??25;this.peerRelay=options.peerRelay;this.streams=options.streams;if(!Number.isSafeInteger(this.pollIntervalMs)||this.pollIntervalMs<5||this.pollIntervalMs>1000)throw new Error("ERR_COMMAND_SERVICE");this.dispatcher=new CommandDispatcher(stores,{send:()=>{throw new Error("unused");}},this.clock);}
-  ingest(input:unknown,sourceAddress:string):AgentCommandOutcome { const accepted=this.transport.accept(input);if(!accepted.ok)return{ok:false,error:"ERR_COMMAND_AUTH"};const env=accepted.envelope,cert=this.certificates.getBySerial(env.certSerial,env.certFingerprint);if(!cert||cert.status!=="active"||cert.binding.candidateId!==env.hostId||cert.binding.address!==sourceAddress)return{ok:false,error:"ERR_COMMAND_BINDING"};if(env.messageType==="agent.command.poll"){if(!this.pollPayload(env.payload))return{ok:false,error:"ERR_COMMAND_INPUT"};return{ok:true,result:this.poll(env.hostId)};}if(env.messageType==="agent.command.result"){if(this.peerRelay&&parsePeerRelayResult(env.payload).ok)return this.peerRelay.complete(env.hostId,env.payload)?{ok:true,result:Object.freeze({command:null,cancelledJobIds:Object.freeze([])})}:{ok:false,error:"ERR_COMMAND_RESULT"};const settled=this.store.complete(env.hostId,env.payload);if(!settled)return{ok:false,error:"ERR_COMMAND_RESULT"};const result=settled.authoritative?{ok:true as const}:this.dispatcher.settle(settled.request,settled.response);return result.ok?{ok:true,result:Object.freeze({command:null,cancelledJobIds:Object.freeze([])})}:{ok:false,error:"ERR_COMMAND_RESULT"};}return{ok:false,error:"ERR_COMMAND_INPUT"}; }
-  async wait(hostId:string,initial:AgentCommandPoll,waitMs:number):Promise<AgentCommandPoll>{if(initial.command||initial.streamCommand||initial.cancelledJobIds.length||waitMs===0)return initial;const end=Date.now()+waitMs;let value=initial;while(Date.now()<end){await new Promise(resolve=>setTimeout(resolve,Math.min(this.pollIntervalMs,end-Date.now())));value=this.poll(hostId);if(value.command||value.streamCommand||value.cancelledJobIds.length||value.peerTransfer)return value;}return value;}
+  ingest(input:unknown,sourceAddress:string):AgentCommandOutcome { if(this.closed)return{ok:false,error:"ERR_COMMAND_CLOSED"};const accepted=this.transport.accept(input);if(!accepted.ok)return{ok:false,error:"ERR_COMMAND_AUTH"};const env=accepted.envelope,cert=this.certificates.getBySerial(env.certSerial,env.certFingerprint);if(!cert||cert.status!=="active"||cert.binding.candidateId!==env.hostId||cert.binding.address!==sourceAddress)return{ok:false,error:"ERR_COMMAND_BINDING"};if(env.messageType==="agent.command.poll"){if(!this.pollPayload(env.payload))return{ok:false,error:"ERR_COMMAND_INPUT"};return{ok:true,result:this.poll(env.hostId)};}if(env.messageType==="agent.command.result"){if(this.peerRelay&&parsePeerRelayResult(env.payload).ok)return this.peerRelay.complete(env.hostId,env.payload)?{ok:true,result:Object.freeze({command:null,cancelledJobIds:Object.freeze([])})}:{ok:false,error:"ERR_COMMAND_RESULT"};const settled=this.store.complete(env.hostId,env.payload);if(!settled)return{ok:false,error:"ERR_COMMAND_RESULT"};const result=settled.authoritative?{ok:true as const}:this.dispatcher.settle(settled.request,settled.response);return result.ok?{ok:true,result:Object.freeze({command:null,cancelledJobIds:Object.freeze([])})}:{ok:false,error:"ERR_COMMAND_RESULT"};}return{ok:false,error:"ERR_COMMAND_INPUT"}; }
+  wait(hostId:string,initial:AgentCommandPoll,waitMs:number,signal?:AbortSignal):Promise<AgentCommandPoll>{
+    if(this.closed||signal?.aborted)return Promise.reject(new Error("ERR_COMMAND_CLOSED"));
+    if(!Number.isSafeInteger(waitMs)||waitMs<0||waitMs>30_000||this.waits.size>=128)return Promise.reject(new Error("ERR_COMMAND_WAIT"));
+    const controller=new AbortController(),abort=()=>controller.abort();signal?.addEventListener("abort",abort,{once:true});
+    const pending=this.waitOwned(hostId,initial,waitMs,controller.signal).finally(()=>{signal?.removeEventListener("abort",abort);this.waits.delete(controller);});
+    this.waits.set(controller,pending);return pending;
+  }
+  /** Permanently fence this listener generation, synchronously cancel timers,
+   * and join all accepted continuations before its database owner closes. */
+  async close():Promise<void>{this.closed=true;const pending=[...this.waits.values()];for(const controller of this.waits.keys())controller.abort();await Promise.allSettled(pending);}
+  private async waitOwned(hostId:string,initial:AgentCommandPoll,waitMs:number,signal:AbortSignal):Promise<AgentCommandPoll>{
+    if(initial.command||initial.streamCommand||initial.cancelledJobIds.length||initial.peerTransfer||waitMs===0)return initial;
+    const end=Date.now()+waitMs;let value=initial;
+    while(Date.now()<end){
+      await new Promise<void>((resolve,reject)=>{
+        const done=()=>{signal.removeEventListener("abort",abort);resolve();},abort=()=>{clearTimeout(timer);signal.removeEventListener("abort",abort);reject(new Error("ERR_COMMAND_CLOSED"));};
+        const timer=setTimeout(done,Math.max(1,Math.min(this.pollIntervalMs,end-Date.now())));
+        signal.addEventListener("abort",abort,{once:true});if(signal.aborted)abort();
+      });
+      if(this.closed||signal.aborted)throw new Error("ERR_COMMAND_CLOSED");
+      value=this.poll(hostId);if(value.command||value.streamCommand||value.cancelledJobIds.length||value.peerTransfer)return value;
+    }return value;
+  }
   private poll(hostId:string):AgentCommandPoll{const busy=this.streams?.busy(hostId)??false,value=busy?{command:null,cancelledJobIds:[]}:this.store.poll(hostId),peerTransfer=!busy?this.peerRelay?.poll(hostId)??null:null;const stream=this.streams?.poll(hostId,!value.command&&!peerTransfer&&!this.store.hasOutstanding(hostId));return Object.freeze({...value,...(this.peerRelay?{peerTransfer}:{}),...(this.streams?{streamCommand:stream?.streamCommand??null,cancelledJobIds:Object.freeze([...(stream?.cancelledJobIds??[]),...value.cancelledJobIds].slice(0,64))}:{})});}
   signed(hostId:string,requestId:string,sequence:number,payload:AgentCommandPoll,signer:TransportSigner=this.signer):unknown { const raw={protocolVersion:{major:1,minor:0},messageType:"controller.command.poll",hostId,requestId,sequence,sentAt:this.clock(),nonce:this.nonce(),bodyDigest:"0".repeat(64),certFingerprint:signer.certificate.fingerprint,certSerial:signer.certificate.serial,signature:"0".repeat(70),payload:payload as unknown as JsonValue};const signed=signTransportSignedEnvelope(raw,signer);if(!signed.ok)throw new Error("ERR_COMMAND_SIGN");return signed.value; }
   private pollPayload(value:unknown):boolean{return typeof value==="object"&&value!==null&&!Array.isArray(value)&&Reflect.ownKeys(value).length===1&&Number.isSafeInteger((value as any).waitMs)&&(value as any).waitMs>=0&&(value as any).waitMs<=30_000;}

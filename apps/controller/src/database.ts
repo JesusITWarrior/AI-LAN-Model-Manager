@@ -456,6 +456,20 @@ CREATE TABLE inference_executions (
 CREATE INDEX inference_executions_active_idx ON inference_executions(outcome,started_at);
 `;
 
+const migration17Sql = `
+CREATE TABLE transport_replay_state_v17 (
+ certificate_fingerprint TEXT PRIMARY KEY CHECK(length(certificate_fingerprint)=64),
+ certificate_serial TEXT NOT NULL CHECK(length(certificate_serial) BETWEEN 1 AND 40),
+ host_id TEXT NOT NULL CHECK(length(host_id) BETWEEN 1 AND 128),
+ high_water INTEGER NOT NULL CHECK(high_water>=0),
+ request_id TEXT NOT NULL, nonce TEXT NOT NULL, sent_at TEXT NOT NULL, updated_at TEXT NOT NULL
+) STRICT;
+INSERT INTO transport_replay_state_v17 SELECT * FROM transport_replay_state;
+DROP TABLE transport_replay_state;
+ALTER TABLE transport_replay_state_v17 RENAME TO transport_replay_state;
+CREATE INDEX transport_replay_host_idx ON transport_replay_state(host_id,certificate_fingerprint);
+`;
+
 export const CONTROLLER_MIGRATIONS: readonly Migration[] = Object.freeze([
   Object.freeze({ version: 1, name: "inventory-v1", sql: migration1Sql, checksum: migrationChecksum(migration1Sql) }),
   Object.freeze({ version: 2, name: "durable-jobs-v1", sql: migration2Sql, checksum: migrationChecksum(migration2Sql) }),
@@ -473,6 +487,7 @@ export const CONTROLLER_MIGRATIONS: readonly Migration[] = Object.freeze([
   Object.freeze({ version: 14, name: "peer-transfer-checkpoints-v1", sql: migration14Sql, checksum: migrationChecksum(migration14Sql) }),
   Object.freeze({ version: 15, name: "approval-command-binding-v1", sql: migration15Sql, checksum: migrationChecksum(migration15Sql) }),
   Object.freeze({ version: 16, name: "redacted-inference-executions-v1", sql: migration16Sql, checksum: migrationChecksum(migration16Sql) }),
+  Object.freeze({ version: 17, name: "numeric-certificate-serial-v1", sql: migration17Sql, checksum: migrationChecksum(migration17Sql) }),
 ]);
 
 function validateMigrations(migrations: readonly Migration[]): void {

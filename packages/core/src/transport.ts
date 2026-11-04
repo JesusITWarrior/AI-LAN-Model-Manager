@@ -15,6 +15,7 @@
  * the interop contract with the Go agent transport package.
  */
 
+import { canonicalCertificateSerial } from "./certificates.js";
 import { isIPv4, isIPv6 } from "node:net";
 import { createHash } from "node:crypto";
 import type { HostId, ProtocolMessageType, ProtocolVersion, ParseResult, RequestId, UtcTimestamp, JsonValue } from "./protocol.js";
@@ -72,7 +73,7 @@ declare const transportBodyDigestBrand: unique symbol;
 export type TransportBodyDigest = string & { readonly __brand: typeof transportBodyDigestBrand };
 
 const SEQUENCE_PATTERN = /^[A-Za-z0-9][A-Za-z0-9._:-]{0,127}$/;
-const HEX64 = /^[a-f0-9]{64}$/, SERIAL = /^[A-F0-9]{2,40}$/, TIME = /^\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}\.\d{3}Z$/;
+const HEX64 = /^[a-f0-9]{64}$/, SERIAL = /^[A-F0-9]{1,40}$/, TIME = /^\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}\.\d{3}Z$/;
 const B64URL_NO_PAD = /^[A-Za-z0-9_-]{1,256}$/;
 
 function validTime(v: unknown): v is string {
@@ -168,7 +169,7 @@ export function parseTransportParsedCertificate(input: unknown): ParseResult<Tra
   const isCa = g("isCa");
   if (
     typeof fingerprint !== "string" || !HEX64.test(fingerprint) ||
-    typeof serial !== "string" || !SERIAL.test(serial) ||
+    typeof serial !== "string" || (!SERIAL.test(serial)||canonicalCertificateSerial(serial)===null) ||
     typeof commonName !== "string" || !SEQUENCE_PATTERN.test(commonName) ||
     !ip(address) || typeof spiffe !== "string" || spiffe.length > 256 ||
     !validTime(notBefore) || !validTime(notAfter) ||
@@ -177,7 +178,7 @@ export function parseTransportParsedCertificate(input: unknown): ParseResult<Tra
   ) {
     return { ok: false, error: "ERR_CERTIFICATE_PARSE" };
   }
-  return { ok: true, value: Object.freeze(Object.assign(Object.create(null), { fingerprint, serial, commonName, address, spiffe, notBefore, notAfter, issuerFingerprint, isCa })) as TransportParsedCertificate };
+  return { ok: true, value: Object.freeze(Object.assign(Object.create(null), { fingerprint, serial:canonicalCertificateSerial(serial)!, commonName, address, spiffe, notBefore, notAfter, issuerFingerprint, isCa })) as TransportParsedCertificate };
 }
 
 // ---------------------------------------------------------------------------
@@ -367,7 +368,7 @@ export function parseTransportSignedEnvelope<T extends JsonValue>(input: unknown
     if (typeof nonce !== "string" || !B64URL_NO_PAD.test(nonce)) return { ok: false, error: "ERR_ENVELOPE" };
     if (typeof bodyDigest !== "string" || !HEX64.test(bodyDigest)) return { ok: false, error: "ERR_ENVELOPE" };
     if (typeof certFingerprint !== "string" || !HEX64.test(certFingerprint)) return { ok: false, error: "ERR_ENVELOPE" };
-    if (typeof certSerial !== "string" || !SERIAL.test(certSerial)) return { ok: false, error: "ERR_ENVELOPE" };
+    if (typeof certSerial !== "string" || (!SERIAL.test(certSerial)||canonicalCertificateSerial(certSerial)===null)) return { ok: false, error: "ERR_ENVELOPE" };
     if (typeof signature !== "string" || signature.length < 16 || signature.length > 256) return { ok: false, error: "ERR_ENVELOPE" };
 
     const output = Object.create(null) as Record<string, unknown>;

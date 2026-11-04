@@ -1,87 +1,71 @@
-# Policy-bound remote inference foundation
+# Policy-bound remote inference composition
 
-This component is **not production route enablement**. The default public chat
-route remains closed. Neither the production agent plane nor its command poll
-and stream HTTP adapters receive the inference owner's relay in this slice.
-The existing non-streaming `createAgentChatTransport` remains uncomposed: it
-manufactures capabilities without policy and its ordinary `AgentCommandStore`
-would persist encoded prompts and responses.
+The default application chat route composes `RemoteInferenceService` through
+`createRemoteInferenceChat`. The production agent plane gives the **same runtime
+owner's generation-fenced relay view** to signed command polling and TLS stream
+HTTP ingestion. No ordinary `AgentChatTransport` or persistent `AgentCommandStore`
+is used for prompt/result bytes. Existing listener exposure configuration is
+unchanged.
 
-## Ownership and authority
+## Authority and admission
 
-`ControllerCoreServices.inference` owns `RemoteInferenceService`, constructed
-with the runtime's exact `services.admissions`, token manager, policy service,
-repositories and job stores. It never registers a model or creates idle
-accounting. Unknown admission after a process restart is closed.
+Bearer `inference:invoke` is required. Only exact durable running Ollama models
+with agreeing installed, non-temporary serving/loaded-idle snapshots qualify.
+The runtime never registers admission from inventory, loads models, substitutes,
+or acquires unmanaged cache entries. Unknown restart accounting remains closed.
+Policy defaults to deny; approval-required inference is denied, not queued.
 
-The chat dependency seam supplies `ChatAuthenticatedContext` containing token
-metadata to resolution, lease acquisition and transport, not the bearer header.
-The foundation's separate component API requires this context explicitly:
+Selection conveys no authority. Dispatch reselects and binds exact model,
+provider, host, active certificate, fresh resources, authenticated token owner,
+policy version/hash and actual operation counts before issuing the command-bound
+capability. `RemoteInferenceService.open` acquires the only authoritative lease;
+the generic public adapter has no second admissions controller or queue/cache.
+Active acceptance rechecks token/trust, inventory, resource freshness, policy and
+admission uncertainty. Stopping admission blocks new work while existing valid
+leases may finish; it is not cancellation. A 250ms owner watchdog also interrupts work when no consumer is reading.
 
-1. `select(context, canonicalModel)` selects only an exact, durable model and
-   returns an immutable, instance-owned binding. It is not a capability.
-2. `open(context, selection, chatInput, signal)` revalidates the token, policy,
-   host/provider/model identity, fresh resources, current active certificate
-   binding, liveness and admission before issuing work. It checks again after
-   constructing the command. No asynchronous queue is composed; capacity is
-   fail-fast. A future queue must call this method **after** its wait.
-3. Policy uses the authenticated token owner's actor identity and real durable
-   operation counts plus parsed resources. Default deny and approval-required
-   both deny. A full command digest and strict `parseStreamCommand` validation
-   bind the execution capability; no capability is issued at selection time.
+## Ephemeral bounded delivery
 
-Only ready Ollama providers and a running model whose installed snapshot is
-`serving` or `loaded-idle` qualify. The snapshot's model/provider/name/timestamp
-must agree with the durable record. Managed-temporary models are excluded until
-there is a shared runtime cache owner. There is no model substitution, auto-load,
-client-selected provider endpoint, or new network listener.
+The owner supports at most 16 live executions, one per host, with 120-second
+execution deadlines. Commands allow 64 messages, 262144 input content bytes,
+524288 request bytes, 4096 events, 131072 bytes/event and 1048576 total event
+bytes. Agent ingestion caps bodies at 180224 bytes, 16 concurrent waits globally,
+two per certificate, and a 10-second upload deadline. There is one retained relay
+slot per execution. Errors are redacted.
 
-## Content and recovery boundaries
+Streaming bridges call relay `next` only on downstream demand. There is no detached
+pump. A never-consumed iterator `return` and request abort close the execution
+owner. Strict validated success with usage is required before public terminal
+chunk/`[DONE]`; failure or ordinary EOF cannot produce success. Nonstream requests
+aggregate only validated chunks in memory up to 262144 content bytes and return
+JSON only after strict success. HTTP/socket buffers add their normal bounded
+transport buffering; relay acceptance is **not** a public-delivery attestation.
 
-Migration 16 retains migrations 1–15 unchanged, extends the three constrained
-policy history tables to accept `model-inference`, preserves approval and decision
-history, and adds `inference_executions`. The ledger contains only execution IDs,
-token/owner/host/provider/model IDs, command digest, policy version/hash, deadline,
-timestamps and a terminal outcome. Prompts, encoded messages, completions,
-bearers, cookies and command JSON do not enter this ledger or the ordinary queue.
-The accepted relay owns command and event bytes ephemerally with bounded limits.
+The metadata-only execution ledger records remote execution ownership outcomes,
+never successful public delivery. It contains no prompts, encoded messages,
+completions, bearers or command JSON. A successful relay terminal settles execution
+even if later downstream delivery fails. No delivery-success ledger is claimed.
 
-Startup marks unfinished ledger entries `interrupted`, without command replay or
-synthetic success. Legacy ordinary inference commands are scrubbed and expired,
-and nonterminal jobs are cancelled with `INTERRUPTED` before listeners can poll.
-This logical scrub is not a secure-erasure claim for historical SQLite pages,
-WAL files or backups that predate this boundary.
+## Cancellation, recovery and shutdown
 
-## Cancellation is not remote settlement
+Local cancellation, timeout, failure, stale/revoked trust or owner interruption
+mark shared admission uncertain and draining before releasing local accounting.
+Only independently trusted remote drain observation can clear uncertainty. Valid
+success proof is immutable across same-stack cancellation/close.
 
-A validated relay success terminal can finish a successful execution. Local
-cancel, deadline, relay failure, consumer closure or shutdown is **not** proof
-that the provider stopped. Those paths first mark admission as remote-work-uncertain and drain the
-model, then release local accounting exactly once. Uncertainty independently
-blocks acquire, resume, forget, load and unload, even when local leases are zero.
-Only a fresh, verified remote drain observation can confirm idle and clear that
-gate; this service never confirms idle or resumes admission. Ledger non-success outcomes describe the local
-execution owner, not a remote provider-stop attestation. The relay exposes synchronous first-terminal proof so same-stack consumer
-cancellation or owner close after accepted success cannot rewrite that successful
-ledger outcome before promise continuations run.
+Startup marks unfinished ledger entries interrupted and scrubs legacy ordinary
+chat commands without replay. Logical scrub is not secure erasure of old pages,
+WAL files or backups. Stop/start replaces the relay; old adapter views cannot lease
+new-generation work and unresolved target drains remain closed.
 
-Application stop synchronously rejects submissions to both lifecycle and
-inference owners, then awaits their shutdown together before SQLite close.
-Runtime synchronous close and startup-failure cleanup terminalize inference
-ownership before database teardown; later outcome continuations are no-ops.
-Stop/start creates a fresh relay without replay and retains unresolved target
-drains. All live execution controllers have bounded relay deadlines and a global
-limit of 16, with one active execution per host enforced by the relay.
+Application stop rejects new owner work, closes and joins registered public HTTP
+and agent stream and signed command long-poll waits plus lifecycle work before SQLite close. Synchronous
+runtime close aborts waits and terminalizes execution before DB teardown; later
+execution settlement is DB-free. Startup failure closes owners before listeners.
 
-## Gates before route composition
+## Known conservative boundary
 
-A separate reviewed composition must connect the **same** owned relay to
-command polling, authenticated stream ingestion, fleet interruption and the
-public consumer adapter. It must preserve lazy backpressure and accepted strict
-terminal semantics, revalidate after all queue/cache waits, handle downstream
-delivery separately from remote execution settlement, and prove shutdown races.
-It must also reconcile actual inventory state: current fleet ingestion records
-`loaded-idle` as `installed`, while this conservative foundation requires a
-`running` durable record. No serving-model accounting may be inferred from that
-mapping. Nonstream inference must stay closed unless replaced by a coherent
-policy-bound ephemeral transport that cannot persist content or replay work.
+Fleet inventory maps loaded-idle, serving and draining snapshots to durable
+running state. Inventory does **not** create admission accounting: a separately
+trusted lifecycle/accounting owner must establish admission before execution. Therefore enabling routes is not a promise that an arbitrary
+paired/inventoried model is eligible to serve.

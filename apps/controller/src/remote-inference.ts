@@ -6,18 +6,20 @@ import type { JobStores } from "./jobs-store.js";
 import type { PolicyService } from "./policy-service.js";
 import type { AdmissionController, AdmissionLease } from "./admission-accounting.js";
 import type { ChatAuthenticatedContext, ChatUpstreamRequest } from "./inference-chat.js";
-import { AgentStreamRelay, type StreamRelayHandle, type StreamRelayOutcome } from "./agent-stream-relay.js";
+import { AgentStreamRelay, type StreamRelayHandle, type StreamRelayOutcome, type AgentStreamAdapter } from "./agent-stream-relay.js";
 
 export interface InferenceSelection {readonly modelId:string;readonly providerId:string;readonly hostId:string;readonly model:string;readonly policyVersion:number;readonly policyHash:string;readonly certificate:string;readonly observation:string}
 const fail=():never=>{throw new Error("ERR_REMOTE_INFERENCE");};
 const object=(v:unknown):Record<string,unknown>|null=>typeof v==="object"&&v!==null&&!Array.isArray(v)?v as Record<string,unknown>:null;
-type Execution={handle:StreamRelayHandle;lease:AdmissionLease;modelId:string;finish:(outcome:StreamRelayOutcome)=>void;done:Promise<void>};
+type Execution={handle:StreamRelayHandle;lease:AdmissionLease;modelId:string;finish:(outcome:StreamRelayOutcome)=>void;done:Promise<void>;valid:()=>boolean;stopWatch:()=>void};
 /** Runtime-owned, component-only stream authority. Not an HTTP adapter. No ordinary
  * command store, replay, endpoint input, auto-load or substitution is permitted.
  * Selection carries no execution authority: dispatch revalidates all facts.
  */
 export class RemoteInferenceService {
  private accepting=true;
+ private readonly httpOwners=new Set<()=>Promise<void>>();
+ ownHttp(close:()=>Promise<void>):void{if(!this.accepting)throw new Error("ERR_REMOTE_INFERENCE");this.httpOwners.add(close);}
  private readonly live=new Map<string,Execution>();
  private selections=new WeakSet<InferenceSelection>();
  private relay:AgentStreamRelay;
@@ -39,17 +41,29 @@ export class RemoteInferenceService {
   repositories.db.prepare("UPDATE inference_executions SET outcome='interrupted',finished_at=? WHERE outcome='running'").run(clock());
  }
  start():void{if(this.accepting)return;this.relay=new AgentStreamRelay(()=>Date.parse(this.clock()));this.selections=new WeakSet();this.accepting=true;}
+ /** Generation-fenced narrow view: stale HTTP owners cannot lease replacement work. */
+ get streams():AgentStreamAdapter{
+  const relay=this.relay;
+  const current=()=>{if(relay!==this.relay||!this.accepting)throw new Error("ERR_REMOTE_INFERENCE");this.revalidateLive();};
+  return {
+   busy:host=>{if(relay!==this.relay||!this.accepting)return false;current();return relay.busy(host);},
+   poll:(host,lease)=>{if(relay!==this.relay||!this.accepting)return {streamCommand:null,cancelledJobIds:[]};current();return relay.poll(host,lease);},
+   publish:(host,raw,signal,authorized)=>{current();return relay.publish(host,raw,signal,()=>{try{current();return this.accepting&&relay===this.relay&&(authorized?.()??true);}catch{return false;}});},
+   complete:(host,input)=>{current();return relay.complete(host,input);},
+  };
+ }
+ private revalidateLive():void{for(const e of [...this.live.values()])if(e.handle.settledOutcome===null&&!e.valid()){e.handle.cancel();e.finish("interrupted");}}
  get activeCount():number{return this.live.size;}
- private facts(context:ChatAuthenticatedContext,modelId:string,requestId:string){
+ private facts(context:ChatAuthenticatedContext,modelId:string,requestId:string,existing=false){
   if(!this.accepting||!this.tokens.revalidateMetadata(context.token))return fail();
   const now=Date.parse(this.clock()),fresh=(at:string)=>{const age=now-Date.parse(at);return Number.isFinite(age)&&age>=0&&age<60_000;};
   const model=this.repositories.models.get(modelId),host=model&&this.repositories.hosts.get(model.hostId),provider=model&&this.repositories.providers.get(model.providerId),snapshot=object(model?.snapshot);
-  if(!model||!host||!provider||provider.hostId!==host.hostId||model.hostId!==host.hostId||provider.kind!=="ollama"||provider.health!=="ready"||!host.online||host.freshness!=="fresh"||model.state!=="running"||!snapshot||!["serving","loaded-idle"].includes(String(snapshot.runtimeState))||!Number.isSafeInteger(snapshot.activeRequests)||Number(snapshot.activeRequests)<0||(snapshot.runtimeState==="loaded-idle"&&snapshot.activeRequests!==0)||snapshot.managedTemporary!==false||snapshot.artifactState!=="installed"||snapshot.modelId!==model.modelId||snapshot.providerId!==model.providerId||snapshot.displayName!==model.canonicalName||snapshot.observedAt!==model.observedAt)return fail();
+  if(!model||!host||!provider||provider.hostId!==host.hostId||model.hostId!==host.hostId||provider.kind!=="ollama"||provider.health!=="ready"||!host.online||host.freshness!=="fresh"||model.state!=="running"||!snapshot||!(existing?["serving","loaded-idle","draining"]:["serving","loaded-idle"]).includes(String(snapshot.runtimeState))||!Number.isSafeInteger(snapshot.activeRequests)||Number(snapshot.activeRequests)<0||(snapshot.runtimeState==="loaded-idle"&&snapshot.activeRequests!==0)||snapshot.managedTemporary!==false||snapshot.artifactState!=="installed"||snapshot.modelId!==model.modelId||snapshot.providerId!==model.providerId||snapshot.displayName!==model.canonicalName||snapshot.observedAt!==model.observedAt)return fail();
   const resource=parseHostResourceObservation(object(host.snapshot)?.resource);
   const binding=this.repositories.db.prepare("SELECT l.certificate_fingerprint,l.last_observed_at,l.health,l.revoked_at,c.status,c.revoked_at cert_revoked,c.not_before,c.not_after FROM fleet_liveness l JOIN host_certificates c ON c.fingerprint=l.certificate_fingerprint AND c.candidate_id=l.host_id WHERE l.host_id=?").get(host.hostId) as {certificate_fingerprint:string;last_observed_at:string;health:string;revoked_at:string|null;status:string;cert_revoked:string|null;not_before:string;not_after:string}|undefined;
   if(!resource.ok||resource.value.hostId!==host.hostId||resource.value.platform!==host.platform||![host.observedAt,provider.observedAt,model.observedAt,resource.value.observedAt].every(fresh)||!binding||binding.health!=="active"||binding.revoked_at!==null||binding.status!=="active"||binding.cert_revoked!==null||!fresh(binding.last_observed_at)||!(Date.parse(binding.not_before)<=now&&Date.parse(binding.not_after)>now))return fail();
   const admission=this.admissions.snapshot(model.modelId); // unknown is CLOSED
-  if(admission.draining||admission.uncertain)return fail();
+  if((admission.draining&&!existing)||admission.uncertain)return fail();
   const counts=this.repositories.db.prepare("SELECT (SELECT COUNT(*) FROM jobs WHERE state NOT IN ('succeeded','failed','timed-out','cancelled'))+(SELECT COUNT(*) FROM inference_executions WHERE outcome='running' AND request_id<>?) active,(SELECT COUNT(*) FROM jobs WHERE submitted_at>?)+(SELECT COUNT(*) FROM inference_executions WHERE started_at>? AND request_id<>?) recent").get(requestId,new Date(now-60_000).toISOString(),new Date(now-60_000).toISOString(),requestId) as {active:number;recent:number};
   const intent:AuthorizationIntent={requestId,actorKind:"owner",actorId:context.token.ownerId,operation:"model-inference",targetKind:"model",targetId:model.modelId,hostId:host.hostId,modelId:model.modelId,observationFresh:true,hostRevoked:false,modelCompatible:true,publicExposure:false,availableMemoryBytes:resource.value.memory.availableBytes,availableVramBytes:resource.value.accelerators.reduce((max,gpu)=>Math.max(max,gpu.memory.availableBytes),0),availableStorageBytes:resource.value.storage.availableBytes,activeOperations:counts.active,operationsLastMinute:counts.recent};
   return {model,provider,host,binding,intent};
@@ -95,6 +109,7 @@ export class RemoteInferenceService {
   const finish=(outcome:StreamRelayOutcome)=>{
    if(finished)return;finished=true;
    signal.removeEventListener("abort",cancel);
+   this.live.get(jobId)?.stopWatch();
    // Local cancellation is NOT proof the remote provider stopped. Keep target
    // draining until independently trusted lifecycle/reconciliation restores it.
    if(outcome!=="succeeded")try{this.admissions.markUncertain(selected.modelId);void this.admissions.stopAdmission(selected.modelId);}catch{/* unknown remains closed */}
@@ -102,14 +117,16 @@ export class RemoteInferenceService {
    catch{this.accepting=false;try{this.admissions.markUncertain(selected.modelId);void this.admissions.stopAdmission(selected.modelId);}catch{/* closed */}}
    finally{lease.release();handle.close();this.live.delete(jobId);}
   };
-  const done=handle.outcome.then(outcome=>finish(outcome));
-  this.live.set(jobId,{handle,lease,modelId:selected.modelId,finish,done});
+  const valid=()=>{try{const current=this.facts(context,selected.modelId,requestId,true),policy=this.policy.current(),decision=evaluateOperationPolicy(policy,current.intent);return current.binding.certificate_fingerprint===selected.certificate&&current.model.canonicalName===selected.model&&current.provider.providerId===selected.providerId&&policy.version===selected.policyVersion&&policyHash(policy)===selected.policyHash&&decision.allowed&&!decision.requiresApproval;}catch{return false;}};
+  const watch=setInterval(()=>this.revalidateLive(),250);watch.unref();
+  const done=handle.outcome.then(outcome=>{clearInterval(watch);finish(outcome);});
+  this.live.set(jobId,{handle,lease,modelId:selected.modelId,finish,done,valid,stopWatch:()=>clearInterval(watch)});
   signal.addEventListener("abort",cancel,{once:true});lease.onCancel(cancel);
   if(signal.aborted)cancel();
-  return {get settledOutcome(){return handle.settledOutcome;},next:s=>handle.next(s),outcome:handle.outcome,cancel,close:cancel};
+  return {get settledOutcome(){return handle.settledOutcome;},next:s=>{this.revalidateLive();return handle.settledOutcome===null?handle.next(s):Promise.resolve(null);},outcome:handle.outcome,cancel,close:cancel};
  }
  /** Reject, abort, settle ledger and await every owned continuation before DB close. */
- async shutdown():Promise<void>{const pending=[...this.live.values()].map(e=>e.done);this.close();await Promise.allSettled(pending);}
+ async shutdown():Promise<void>{const pending=[...this.live.values()].map(e=>e.done),http=[...this.httpOwners].map(close=>close());this.httpOwners.clear();this.close();await Promise.allSettled([...pending,...http]);}
  /** Synchronous close fallback also makes later promise continuations DB-free. */
- close():void{this.accepting=false;for(const e of [...this.live.values()]){const outcome=e.handle.settledOutcome;e.handle.cancel();e.finish(outcome??"interrupted");}this.relay.stop();}
+ close():void{this.accepting=false;for(const close of this.httpOwners)void close();this.httpOwners.clear();for(const e of [...this.live.values()]){const outcome=e.handle.settledOutcome;e.handle.cancel();e.finish(outcome??"interrupted");}this.relay.stop();}
 }

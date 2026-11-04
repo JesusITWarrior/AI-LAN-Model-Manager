@@ -51,6 +51,20 @@ func TestCrossLanguageFleetHelper(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
+	if os.Getenv("LANMM_CROSS_FLEET_PROBE") == "1" {
+		if _, err = client.SendHello(context.Background(), "linux", "", 30*time.Second, 2*time.Second, 60*time.Second); err != nil {
+			t.Fatal(err)
+		}
+		time.Sleep(2 * time.Millisecond)
+		if _, err = client.Send(context.Background(), Snapshot{Platform: "linux", Idle: true}); err != nil {
+			t.Fatal(err)
+		}
+		if _, _, err = client.PollCommand(context.Background(), 0); err != nil {
+			t.Fatal(err)
+		}
+		fmt.Println("LANMM_CROSS_FLEET_PROBED=true")
+		return
+	}
 	if os.Getenv("LANMM_CROSS_FLEET_EXPECT_REJECT") == "1" {
 		if os.Getenv("LANMM_CROSS_FLEET_STALE") == "1" {
 			calls := 0

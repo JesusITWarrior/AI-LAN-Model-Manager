@@ -23,6 +23,16 @@ import {createJobStores} from "./jobs-store.js";
 import {AgentStreamRelay} from "./agent-stream-relay.js";
 import {createAgentStreamHttpHandler} from "./agent-stream-http.js";
 
+import {createServer as createPublicServer} from "node:http";
+import {createOwnerBootstrapService} from "./owner-service.js";
+import {InferenceTokenManager} from "./inference-manager.js";
+import {PolicyService} from "./policy-service.js";
+import {createAdmissionController} from "./admission-accounting.js";
+import {RemoteInferenceService} from "./remote-inference.js";
+import {createRemoteInferenceChat} from "./remote-inference-chat.js";
+import {createChatCompletionsHandler} from "./inference-chat.js";
+import {createInferenceHttpHandler} from "./inference-http.js";
+
 const fixture=JSON.parse(readFileSync(new URL("../../../agents/host-agent/internal/command/testdata/stream-v1.json",import.meta.url),"utf8"));
 function leaf(root:string,caDir:string){const d=join(root,"server");mkdirSync(d);const run=(args:string[])=>execFileSync("openssl",args,{cwd:d,stdio:"ignore"});run(["genpkey","-algorithm","EC","-pkeyopt","ec_paramgen_curve:P-256","-out","key.pem"]);run(["req","-new","-key","key.pem","-subj","/CN=127.0.0.1","-out","request.pem"]);writeFileSync(join(d,"ext"),"basicConstraints=critical,CA:FALSE\nkeyUsage=critical,digitalSignature\nextendedKeyUsage=serverAuth\nsubjectAltName=IP:127.0.0.1\n");run(["x509","-req","-in","request.pem","-CA",join(caDir,"ca-cert.pem"),"-CAkey",join(caDir,"ca-key.pem"),"-set_serial","0x2001","-days","1","-extfile","ext","-out","cert.pem"]);return {key:readFileSync(join(d,"key.pem")),cert:readFileSync(join(d,"cert.pem"))};}
 const delay=(ms:number)=>new Promise<void>(r=>setTimeout(r,ms));
@@ -40,7 +50,7 @@ test("real TLS1.3 Go ExecuteStream ↔ authenticated TS bounded relay; control r
   const verifier=buildTransportNativeVerifier(agentLeaf.publicKey.export({type:"spki",format:"pem"}).toString(),parsed);assert.ok(verifier.ok);if(!verifier.ok)return;
   const transport=new ControllerTransport({certificateRepository:certificates,replayStore:new PersistentReplayStore(db),verifier:()=>verifier.value}),fleet=new FleetService(db,transport,certificates,createControllerRepositories(db));
   const tls=leaf(root,caDir),serverLeaf=new X509Certificate(tls.cert),serverParsed:any={...parsed,fingerprint:createHash("sha256").update(serverLeaf.raw).digest("hex"),serial:serverLeaf.serialNumber.replace(/^0+/,"")||"0",commonName:"controller",spiffe:"spiffe://lanmodelmanager/controller",notBefore:new Date(serverLeaf.validFrom).toISOString(),notAfter:new Date(serverLeaf.validTo).toISOString()},signer=buildTransportNativeSigner(tls.key.toString(),serverParsed);assert.ok(signer.ok);if(!signer.ok)return;
-  let handler:ReturnType<typeof createFleetAgentHttpHandler>=()=>{};const statuses:number[]=[];const uploads:IncomingMessage[]=[];
+  let handler:(req:IncomingMessage,res:import("node:http").ServerResponse)=>void=()=>{};const statuses:number[]=[];const uploads:IncomingMessage[]=[];
   server=createServer({key:tls.key,cert:tls.cert,ca:ca.certificatePem,minVersion:"TLSv1.3",maxVersion:"TLSv1.3",requestCert:true,rejectUnauthorized:true},(req,res)=>{if(req.headers["x-partial-upload"]==="fixture"){uploads.push(req);}res.on("finish",()=>statuses.push(res.statusCode));handler(req,res);});server.listen(0,"127.0.0.1");await once(server,"listening");const address=server.address();assert.ok(address&&typeof address==="object");
   writeFileSync(join(agentDir,"enrollment.json"),JSON.stringify({controllerUrl:`https://127.0.0.1:${address.port}`,pinnedCaFingerprintSha256:ca.fingerprint,challengeId:"c".repeat(64),binding,certificatePem:issued.certificatePem,caPem:ca.certificatePem,enrolledAt:now})+"\n",{mode:0o600});
   const run=(mode:string)=>new Promise<string>((resolveChild,reject)=>{const child=spawn("go",["test",...(process.env.LANMM_STREAM_GO_RACE==="1"?["-race"]:[]),"./internal/fleet","-run","^TestCrossLanguageStreamHelper$","-count=1","-v"],{cwd:join(resolve(import.meta.dirname,"../../.."),"agents/host-agent"),env:{...process.env,LANMM_STREAM_CERT_DIR:agentDir,LANMM_STREAM_MODE:mode}});let output="";child.stdout.on("data",v=>output+=v);child.stderr.on("data",v=>output+=v);child.once("error",reject);child.once("close",code=>code===0?resolveChild(output):reject(new Error(output)));});
@@ -86,6 +96,25 @@ test("real TLS1.3 Go ExecuteStream ↔ authenticated TS bounded relay; control r
    if(mode==="deadline")assert.ok(["deadline","cancelled"].includes(await handle.outcome),"deadline/cancel race must not succeed");
    handle.close();relay.stop();assert.deepEqual(relay.stats(),{streams:0,events:0,bytes:0});
   }
+  // Actual public bearer HTTP -> same owner -> signed command poll -> Go
+  // ExecuteStream -> authenticated TLS POST -> bounded JSON and ordered SSE.
+  db.exec("UPDATE host_certificates SET status='active',revoked_at=NULL");
+  const repos=createControllerRepositories(db),jobs=createJobStores(db),ownerId="a".repeat(32);
+  const owner=createOwnerBootstrapService(db,{ownerId:()=>ownerId});await owner.bootstrapOwner({username:"Owner",password:"synthetic-integration-password"});
+  let random=10;const tokens=new InferenceTokenManager(db,async()=>true,{random:n=>Buffer.alloc(n,++random)}),token=await tokens.issue("management",{label:"synthetic"});assert.ok(token);
+  const policy=new PolicyService(db,{stores:jobs}),admissions=createAdmissionController();
+  assert.ok(policy.install({version:1,allowedOperations:["model-inference"],approvalOperations:[],allowArtifactAcquisition:false,allowArtifactRemoval:false,allowSubstitution:false,allowPublicExposure:false,minimumMemoryHeadroomBytes:1,minimumVramHeadroomBytes:0,minimumStorageHeadroomBytes:1,maxConcurrentOperations:10,maxOperationsPerMinute:100},{ok:true,session:{ownerId,sessionVersion:1,revokedAt:null}}).ok);
+  const model=fixture.request.params.chat.model,modelId=fixture.request.params.chat.modelId,providerId=fixture.request.params.chat.providerId;
+  const seed=()=>{const observedAt=new Date().toISOString();repos.hosts.upsert({hostId:"agent-1",displayName:"Synthetic",platform:"linux",observedAt,online:true,freshness:"fresh",snapshot:{resource:{hostId:"agent-1",platform:"linux",observedAt,cpuLogicalCores:4,cpuUtilizationPercent:0,memory:{totalBytes:100,usedBytes:10,availableBytes:90},storage:{totalBytes:100,usedBytes:10,availableBytes:90},accelerators:[]}}});repos.providers.upsert({providerId,hostId:"agent-1",kind:"ollama",endpoint:"http://127.0.0.1:11434",health:"ready",version:"",versionKnown:false,observedAt,snapshot:{}});repos.models.upsert({modelId,providerId,hostId:"agent-1",canonicalName:model,state:"running",type:"llm",digest:"",digestKnown:false,observedAt,snapshot:{modelId,providerId,displayName:model,artifactState:"installed",runtimeState:"loaded-idle",activeRequests:0,managedTemporary:false,observedAt}});db.prepare("INSERT INTO fleet_liveness(host_id,certificate_fingerprint,protocol_minor,last_sequence,last_observed_at,last_request_id,idle,updated_at) VALUES(?,?,0,1,?,'synthetic-live',1,?) ON CONFLICT(host_id) DO UPDATE SET last_observed_at=excluded.last_observed_at,health='active',revoked_at=NULL").run("agent-1",issued.fingerprint,observedAt,observedAt);};
+  seed();admissions.register(modelId);const inference=new RemoteInferenceService(repos,tokens,policy,admissions,jobs),streams=createAgentStreamHttpHandler({relay:inference.streams,transport,certificates});inference.ownHttp(streams.shutdown);
+  const commands=new AgentCommandService(transport,certificates,new AgentCommandStore(db),jobs,signer.value,{streams:inference.streams});handler=createFleetAgentHttpHandler({fleet,certificates,commands,streams});
+  const publicServer=createPublicServer(createInferenceHttpHandler(async()=>({status:404,headers:{},body:{}}),createChatCompletionsHandler({...createRemoteInferenceChat(inference),tokens}),close=>inference.ownHttp(close)));publicServer.listen(0,"127.0.0.1");await once(publicServer,"listening");const publicAddress=publicServer.address();assert.ok(publicAddress&&typeof publicAddress==="object");const url=`http://127.0.0.1:${publicAddress.port}/v1/chat/completions`;
+  try{assert.equal((await fetch(url,{method:"POST",headers:{"content-type":"application/json"},body:"{}"})).status,401);
+   for(const stream of [false,true]){seed();const pending:Promise<Response>=fetch(url,{method:"POST",headers:{authorization:`Bearer ${token.token}`,"content-type":"application/json",connection:"close"},body:JSON.stringify({model,messages:[{role:"user",content:"synthetic-private-http-prompt"}],stream})});
+    const running=run("normal");void running.catch(()=>{});const response:Response=await pending;assert.equal(response.status,200);const text=await response.text();if(stream){assert.match(text,/data: /);assert.match(text,/usage/);assert.ok(text.indexOf('"usage"')<text.indexOf("[DONE]"));assert.equal(text.split("[DONE]").length,2);}else{const body=JSON.parse(text);assert.equal(body.object,"chat.completion");assert.ok(body.usage);assert.equal(body.model,model);}assert.match(await running,/STREAM_OUTCOME=succeeded/);assert.equal(admissions.snapshot(modelId).active,0);assert.equal(admissions.snapshot(modelId).draining,false);
+   }
+   const dump=JSON.stringify(db.prepare("SELECT * FROM inference_executions").all())+JSON.stringify(db.prepare("SELECT * FROM agent_commands").all())+JSON.stringify(jobs.audit.list());for(const secret of ["synthetic-private-http-prompt",Buffer.from("synthetic-private-http-prompt").toString("base64"),token.token])assert.equal(dump.includes(secret),false);
+  }finally{await inference.shutdown();publicServer.closeAllConnections();await new Promise<void>(r=>publicServer.close(()=>r()));}
   assert.ok(statuses.includes(401));assert.ok(statuses.includes(400));
  }finally{if(server){server.closeAllConnections();await new Promise<void>(r=>server!.close(()=>r()));}db.close();rmSync(root,{recursive:true,force:true});}
 });
