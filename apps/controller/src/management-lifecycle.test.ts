@@ -5,7 +5,7 @@ import { mkdtempSync, rmSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { createServer } from "node:net";
-import { commandAuthorizationDigest, commandPolicyOperation, signTransportSignedEnvelope, transportBodyDigest, parseTransportParsedCertificate, type CommandRequest, type OperationPolicy } from "@lan-model-manager/core";
+import { commandAuthorizationDigest, commandPolicyOperation, evaluateOperationPolicy, signTransportSignedEnvelope, transportBodyDigest, parseTransportParsedCertificate, type CommandRequest, type OperationPolicy } from "@lan-model-manager/core";
 import { createRuntimeInferenceHandler } from "./inference-runtime.js";
 import { createAdmissionController } from "./admission-accounting.js";
 import { CommandDispatcher } from "./command-dispatch.js";
@@ -784,3 +784,158 @@ test("rolling recent-work count may decay without rebinding a safe reviewed dige
   const after=x.repos.db.prepare("SELECT * FROM authorization_requests").get() as any;assert.equal(after.request_digest,before.request_digest);
  }finally{await x.close();}
 });
+
+
+// Keep these representative cases separate from the load/approval drift matrix:
+// recovered fresh eligibility cannot replace immutable denied evidence, and every
+// operation uses the same fresh gate whether or not an approval prompt is shown.
+const proposalResources = (available: number) => ({
+  memory: {totalBytes:100,usedBytes:100-available,availableBytes:available},
+  storage: {totalBytes:100,usedBytes:100-available,availableBytes:available},
+  accelerators: [{id:"gpu-1",name:"Synthetic GPU",kind:"nvidia",memory:{totalBytes:100,usedBytes:100-available,availableBytes:available},utilizationPercent:0}],
+});
+type ProposalFixture = Awaited<ReturnType<typeof fixture>>;
+function proposalEvidence(x: ProposalFixture) {
+  const authorization=x.repos.db.prepare("SELECT * FROM authorization_requests").get() as any;
+  const binding=x.repos.db.prepare("SELECT * FROM lifecycle_proposal_authorizations").get() as any;
+  const decisions=x.repos.db.prepare("SELECT * FROM decisions WHERE request_id=?").all(authorization.request_id);
+  return {authorization,binding,decisions};
+}
+function assertRevokedEvidence(x: ProposalFixture, before: ReturnType<typeof proposalEvidence>) {
+  assert.deepEqual(x.repos.db.prepare("SELECT * FROM authorization_requests WHERE request_id=?").get(before.authorization.request_id),before.authorization,"full intent digest and pinned policy remain immutable");
+  const binding=x.repos.db.prepare("SELECT * FROM lifecycle_proposal_authorizations WHERE request_id=?").get(before.authorization.request_id) as any;
+  assert.ok(binding.revoked_at);
+  assert.deepEqual({...binding,revoked_at:null},{...before.binding},"full command digest, deadline and exact session/credential binding remain immutable");
+  assert.deepEqual(x.repos.db.prepare("SELECT * FROM decisions WHERE request_id=?").all(before.authorization.request_id),before.decisions,"denied evidence is not rewritten");
+  assert.equal(x.app.runtime.services.commands.poll("host-1").command,null);
+  assert.equal((x.repos.db.prepare("SELECT COUNT(*) n FROM jobs").get() as any).n,0);
+  assert.equal((x.repos.db.prepare("SELECT COUNT(*) n FROM lifecycle_proposal_jobs").get() as any).n,0);
+}
+function finishedProposalWork(x: ProposalFixture) {
+  x.repos.db.prepare("INSERT INTO inference_executions VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?)").run("finished-gate","finished-gate-job","synthetic-token","a".repeat(32),"host-1","provider-1","model-1","0".repeat(64),1,"0".repeat(64),"2026-09-29T10:04:00.000Z",T0,T0,"succeeded");
+}
+for(const approvalRequired of [true,false]) {
+ for(const denial of ["memory","vram","storage","rate"] as const) {
+  test(`original ${denial} denial stays non-executable after recovery (${approvalRequired?"approval":"no-prompt"})`,{timeout:15_000},async(t)=>{
+   const x=await fixture();try{
+    const configured={...policy,approvalOperations:approvalRequired?["model-load" as const]:[],minimumVramHeadroomBytes:1,maxOperationsPerMinute:1};
+    assert.equal((await x.post("/api/v1/policy/install",configured,x.headers)).status,200);
+    const resources=proposalResources(90),empty={totalBytes:100,usedBytes:100,availableBytes:0};
+    if(denial==="vram")resources.accelerators[0]!.memory=empty;
+    else if(denial!=="rate")resources[denial]=empty;
+    if(denial==="rate")finishedProposalWork(x);
+    assert.ok(x.heartbeat(1,"unloaded",0,{},undefined,resources).ok);
+    const authorize=x.app.runtime.services.policy.authorize.bind(x.app.runtime.services.policy);
+    const observed: unknown[]=[];
+    t.mock.method(x.app.runtime.services.policy,"authorize",(intent:unknown)=>{observed.push(structuredClone(intent));return authorize(intent);});
+    const p=await proposal(x),before=proposalEvidence(x);
+    assert.deepEqual(p.reasons,approvalRequired?[denial==="rate"?"rate-limit":"insufficient-resources","approval-required"]:[denial==="rate"?"rate-limit":"insufficient-resources"]);
+    // +70s ages only completed rate work; the signed heartbeat keeps every
+    // semantic/identity fact fresh while all three resource quantities recover.
+    assert.ok(x.heartbeat(70,"unloaded",0,{},undefined,proposalResources(90)).ok);
+    const original=observed[0] as Parameters<typeof evaluateOperationPolicy>[1];
+    assert.equal(evaluateOperationPolicy(x.app.runtime.services.policy.current(),original).requestDigest,before.authorization.request_digest);
+    const fresh=evaluateOperationPolicy(x.app.runtime.services.policy.current(),{...original,availableMemoryBytes:90,availableVramBytes:90,availableStorageBytes:90,operationsLastMinute:0});
+    assert.deepEqual(fresh.reasons,approvalRequired?["approval-required"]:[]);
+    assert.notEqual(fresh.requestDigest,before.authorization.request_digest,"recovery really changes the full intent digest");
+    for(const action of approvalRequired?["approve","submit"]:["submit","approve"]) {
+     const response=await proposalAction(x,action,p);assert.equal(response.status,200);
+     assert.equal((await response.json() as any).value.state,"stale");
+    }
+    assert.ok(observed.length>=2);
+    for(const intent of observed)assert.deepEqual(intent,original,"only original full intent is authorized, never fresh facts under its request ID");
+    assertRevokedEvidence(x,before);
+    assert.equal((x.repos.db.prepare("SELECT COUNT(*) n FROM approvals").get() as any).n,0);
+    // A genuinely new review is eligible, but cannot revive or inherit the old
+    // proposal's request, command, digest or execution authority.
+    const next=await proposal(x);assert.notEqual(next.proposalId,p.proposalId);
+    assert.deepEqual(next.reasons,approvalRequired?["approval-required"]:[]);
+    const nextBinding=x.repos.db.prepare("SELECT * FROM lifecycle_proposal_authorizations WHERE request_id<>?").get(before.authorization.request_id) as any;
+    assert.notEqual(nextBinding.request_id,before.binding.request_id);assert.notEqual(nextBinding.command_digest,before.binding.command_digest);
+    const nextAuthorization=x.repos.db.prepare("SELECT * FROM authorization_requests WHERE request_id=?").get(nextBinding.request_id) as any;
+    assert.notEqual(nextAuthorization.request_digest,before.authorization.request_digest);
+    if(approvalRequired) {
+     assert.equal((await (await proposalAction(x,"approve",next)).json() as any).value.state,"approved");
+     const grant=x.repos.db.prepare("SELECT * FROM approvals").get() as any;
+     assert.equal(grant.request_id,nextBinding.request_id);assert.equal(grant.granted_command_digest,nextBinding.command_digest);assert.equal(grant.consumed_at,null);
+    }
+    const newGrants=x.repos.db.prepare("SELECT * FROM approvals").all();
+    assert.equal((await (await proposalAction(x,"submit",p)).json() as any).value.state,"stale");
+    assertRevokedEvidence(x,before);
+    assert.deepEqual(x.repos.db.prepare("SELECT * FROM approvals").all(),newGrants,"retrying the denied review cannot consume or revoke the new review's grant");
+    assert.deepEqual(x.repos.db.prepare("SELECT * FROM lifecycle_proposal_authorizations WHERE request_id=?").get(nextBinding.request_id),nextBinding);
+    assert.equal((x.repos.db.prepare("SELECT COUNT(*) n FROM approvals WHERE consumed_at IS NOT NULL").get() as any).n,0);
+   }finally{await x.close();}
+  });
+ }
+}
+
+for(const operation of ["load","drain","unload"] as const) {
+ for(const approvalRequired of [true,false]) {
+  const boundaries=approvalRequired?(operation==="load"?[]:["approve","submit"] as const):["submit"] as const;
+  for(const boundary of boundaries) {
+   for(const drift of ["memory","rate"] as const) {
+    test(`${operation} ${approvalRequired?"approval":"no-prompt"} blocks fresh ${drift} at ${boundary}`,{timeout:15_000},async()=>{
+     const x=await fixture();try{
+      assert.equal((await x.post("/api/v1/policy/install",{...policy,approvalOperations:approvalRequired?[commandPolicyOperation(operation)]:[],minimumVramHeadroomBytes:1,maxOperationsPerMinute:1},x.headers)).status,200);
+      const runtimeState=operation==="load"?"unloaded":"loaded-idle";
+      assert.ok(x.heartbeat(1,runtimeState,0,{},undefined,proposalResources(90)).ok);
+      x.app.runtime.services.admissions.register("model-1");
+      if(operation==="unload")await x.app.runtime.services.admissions.stopAdmission("model-1");
+      const p=await proposal(x,operation),before=proposalEvidence(x);
+      assert.equal(p.state,approvalRequired?"approval-required":"prepared");
+      let grant:any=null;
+      if(approvalRequired&&boundary==="submit") {
+       assert.equal((await (await proposalAction(x,"approve",p)).json() as any).value.state,"approved");
+       grant=x.repos.db.prepare("SELECT * FROM approvals").get();
+       assert.equal(grant.request_digest,before.authorization.request_digest);assert.equal(grant.granted_command_digest,before.binding.command_digest);
+      }
+      assert.ok(x.heartbeat(2,runtimeState,0,{},undefined,proposalResources(drift==="memory"?0:89)).ok);
+      if(drift==="rate")finishedProposalWork(x);
+      if(grant) {
+       // Duplicate approval is only a view, not a fresh readiness decision.
+       const duplicate=(await (await proposalAction(x,"approve",p)).json() as any).value;
+       assert.equal(duplicate.state,"approved");assert.equal(duplicate.jobId,null);
+       assert.deepEqual(x.repos.db.prepare("SELECT * FROM approvals").all(),[grant]);
+      }
+      const response=await proposalAction(x,boundary,p);assert.equal(response.status,200);
+      assert.equal((await response.json() as any).value.state,"stale");
+      assertRevokedEvidence(x,before);
+      const grants=x.repos.db.prepare("SELECT * FROM approvals").all() as any[];
+      assert.equal(grants.length,grant?1:0);
+      if(grant) {assert.ok(grants[0].revoked_at);assert.deepEqual({...grants[0],revoked_at:null},{...grant},"exact grant is revoked without consumption or authority transfer");}
+      assert.equal((await (await proposalAction(x,"submit",p)).json() as any).value.state,"stale");
+      assertRevokedEvidence(x,before);
+     }finally{await x.close();}
+    });
+   }
+  }
+  test(`${operation} ${approvalRequired?"approval":"no-prompt"} safe heartbeat retains full intent and command digests`,{timeout:15_000},async()=>{
+   const x=await fixture();try{
+    assert.equal((await x.post("/api/v1/policy/install",{...policy,approvalOperations:approvalRequired?[commandPolicyOperation(operation)]:[],minimumVramHeadroomBytes:1},x.headers)).status,200);
+    const runtimeState=operation==="load"?"unloaded":"loaded-idle";
+    assert.ok(x.heartbeat(1,runtimeState,0,{},undefined,proposalResources(90)).ok);
+    x.app.runtime.services.admissions.register("model-1");
+    if(operation==="unload")await x.app.runtime.services.admissions.stopAdmission("model-1");
+    const p=await proposal(x,operation),before=proposalEvidence(x);
+    assert.ok(x.heartbeat(2,runtimeState,0,{},undefined,proposalResources(89)).ok);
+    if(approvalRequired)assert.equal((await (await proposalAction(x,"approve",p)).json() as any).value.state,"approved");
+    assert.equal((x.repos.db.prepare("SELECT COUNT(*) n FROM jobs").get() as any).n,0);
+    assert.ok(x.heartbeat(3,runtimeState,0,{},undefined,proposalResources(88)).ok);
+    assert.equal((await (await proposalAction(x,"submit",p)).json() as any).value.state,"submitting");
+    const command=await x.poll();assert.equal(command.operation,operation);
+    assert.equal(command.requestId,before.authorization.request_id);assert.equal(command.deadline,before.binding.expires_at);
+    assert.equal(commandAuthorizationDigest(command),before.binding.command_digest);assert.equal(command.capability.requestDigest,before.binding.command_digest);
+    assert.deepEqual(proposalEvidence(x),before,"full authorization, policy, decision and exact session/command evidence remain unchanged");
+    const grants=x.repos.db.prepare("SELECT * FROM approvals").all() as any[];assert.equal(grants.length,approvalRequired?1:0);
+    if(approvalRequired) {
+     const grant=grants[0];assert.equal(grant.request_digest,before.authorization.request_digest);
+     assert.equal(grant.granting_session_binding,before.binding.session_binding);assert.equal(grant.granting_credential_version,before.binding.credential_version);
+     assert.equal(grant.granted_command_digest,before.binding.command_digest);assert.equal(grant.consumed_command_digest,before.binding.command_digest);assert.ok(grant.consumed_at);assert.equal(grant.revoked_at,null);
+    }
+    assert.equal((x.repos.db.prepare("SELECT COUNT(*) n FROM jobs").get() as any).n,1);
+    await x.complete(command,4);
+   }finally{await x.close();}
+  });
+ }
+}
