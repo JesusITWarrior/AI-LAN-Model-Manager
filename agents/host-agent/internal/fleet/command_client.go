@@ -7,6 +7,7 @@ import (
 	"crypto/sha256"
 	"encoding/hex"
 	"encoding/json"
+	"errors"
 	"io"
 	"log/slog"
 	"net/http"
@@ -28,7 +29,7 @@ const maxCommandEnvelopeBody = 768 << 10
 // the normal host logger. Never pass wire data, identifiers or error text here.
 func commandStage(code string, status int) {
 	switch code {
-	case "POLL_TRANSPORT", "POLL_HTTP", "POLL_CODEC", "POLL_CERTIFICATE", "POLL_SIGNATURE", "POLL_CLOCK", "POLL_PAYLOAD", "POLL_SEQUENCE", "PENDING_RESULT_EXPIRED", "EXECUTION_ENTERED", "EXECUTION_RETURNED", "EXECUTION_ADAPTER_FAILED", "EXECUTION_REJECTED", "RESULT_TRANSPORT", "RESULT_REJECTED", "RESULT_DELIVERED":
+	case "POLL_TRANSPORT", "POLL_HTTP", "POLL_CODEC", "POLL_CERTIFICATE", "POLL_SIGNATURE", "POLL_CLOCK", "POLL_PAYLOAD", "POLL_SEQUENCE", "PENDING_RESULT_EXPIRED", "EXECUTION_ENTERED", "EXECUTION_RETURNED", "EXECUTION_ADAPTER_FAILED", "EXECUTION_REJECTED", "EXECUTION_PERSISTENCE_UNCERTAIN", "RESULT_TRANSPORT", "RESULT_REJECTED", "RESULT_DELIVERED":
 	default:
 		code = "UNKNOWN_STAGE"
 	}
@@ -282,13 +283,17 @@ func (c *HTTPSClient) RunCommands(ctx context.Context, executor *command.Executo
 	if len(peerRelays) == 1 {
 		peerRelay = peerRelays[0]
 	}
-	type completion struct{ response command.Response }
+	type completion struct {
+		response             command.Response
+		persistenceUncertain bool
+	}
 	var activeJob string
 	var activeDeadline time.Time
 	var reportedExpiredPending bool
 	var cancelActive context.CancelFunc
 	var done chan completion
 	var pending *command.Response
+	var persistenceUncertain bool
 	var activeStream bool
 	var activeDigest string
 	for {
@@ -296,10 +301,15 @@ func (c *HTTPSClient) RunCommands(ctx context.Context, executor *command.Executo
 			select {
 			case completed := <-done:
 				pending = &completed.response
+				persistenceUncertain = completed.persistenceUncertain
 			default:
 			}
 		}
-		if pending != nil {
+		// Persistence failure may follow a real adapter mutation. Preserve the
+		// local outcome and block admission: neither fabricated rejection nor a
+		// normal success ACK conveys uncertainty safely. Expiry is not reconciliation.
+		// This guard lasts only for this runner/executor instance, not across restart.
+		if pending != nil && !persistenceUncertain {
 			if !reportedExpiredPending && !activeDeadline.IsZero() && !time.Now().Before(activeDeadline) {
 				commandStage("PENDING_RESULT_EXPIRED", 0)
 				reportedExpiredPending = true
@@ -368,6 +378,11 @@ func (c *HTTPSClient) RunCommands(ctx context.Context, executor *command.Executo
 				commandStage("EXECUTION_RETURNED", 0)
 				if result.ErrorCode != nil && *result.ErrorCode == "ADAPTER_FAILED" {
 					commandStage("EXECUTION_ADAPTER_FAILED", 0)
+				}
+				if errors.Is(runErr, command.ErrReplayPersistence) {
+					commandStage("EXECUTION_PERSISTENCE_UNCERTAIN", 0)
+					output <- completion{response: result, persistenceUncertain: true}
+					return
 				}
 				if runErr != nil {
 					commandStage("EXECUTION_REJECTED", 0)

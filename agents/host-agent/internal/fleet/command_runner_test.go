@@ -238,3 +238,68 @@ func TestExpiredPendingResultRemainsBlockingUntilReconciled(t *testing.T) {
 		}
 	}
 }
+
+type persistenceFailureAdapter struct {
+	path  string
+	fail  bool
+	calls int
+}
+
+func (a *persistenceFailureAdapter) Execute(context.Context, string, json.RawMessage) (any, error) {
+	a.calls++
+	// The executor was opened before this directory existed. Replacing a directory
+	// with the replay file fails after the synthetic adapter has already executed.
+	if err := os.Mkdir(a.path, 0700); err != nil {
+		return nil, err
+	}
+	if a.fail {
+		return nil, errors.New("private adapter failure")
+	}
+	return nil, nil
+}
+func TestRunCommandsHoldsPersistenceUncertaintyWithoutFabricatingResult(t *testing.T) {
+	for _, fail := range []bool{false, true} {
+		t.Run(map[bool]string{false: "success", true: "failure"}[fail], func(t *testing.T) {
+			ctx, cancel := context.WithTimeout(context.Background(), 4*time.Second)
+			defer cancel()
+			first := runnerRequest("uncertain", time.Now().Add(time.Minute))
+			second := runnerRequest("must-not-execute", time.Now().Add(time.Minute))
+			polls, results := 0, 0
+			client := signedCommandClient(t, nil, func(n int) *command.Request {
+				polls = n
+				if n >= 4 {
+					cancel()
+				}
+				if n == 1 {
+					return &first
+				}
+				return &second
+			}, func(command.Response) int { results++; return 200 })
+			adapter := &persistenceFailureAdapter{path: filepath.Join(t.TempDir(), "replay.json"), fail: fail}
+			executor, err := command.NewPersistent("host-1", adapter, time.Now, adapter.path)
+			if err != nil {
+				t.Fatal(err)
+			}
+			if err = client.RunCommands(ctx, executor); err != nil {
+				t.Fatal(err)
+			}
+			if polls < 4 || results != 0 || adapter.calls != 1 {
+				t.Fatalf("uncertainty lost: polls=%d results=%d calls=%d", polls, results, adapter.calls)
+			}
+			retained, err := executor.Execute(context.Background(), first)
+			if !errors.Is(err, command.ErrReplayPersistence) {
+				t.Fatalf("uncertainty lost: %v", err)
+			}
+			expected := "succeeded"
+			if fail {
+				expected = "failed"
+			}
+			if retained.Status != expected || retained.JobID != first.JobID || adapter.calls != 1 {
+				t.Fatalf("known outcome lost: %+v calls=%d", retained, adapter.calls)
+			}
+			if fail && (retained.ErrorCode == nil || *retained.ErrorCode != "ADAPTER_FAILED") {
+				t.Fatal("adapter failure replaced")
+			}
+		})
+	}
+}
