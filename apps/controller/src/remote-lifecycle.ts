@@ -4,7 +4,7 @@ import type { AdmissionController } from "./admission-accounting.js";
 import type { AgentCommandStore } from "./agent-command-channel.js";
 import type { CoupledContext, JobStores } from "./jobs-store.js";
 import { LifecycleService, verifyLifecycleObservation, type LifecycleExecution, type LifecycleResult } from "./lifecycle-service.js";
-import type { ControllerRepositories, ModelRecord } from "./repositories.js";
+import type { ControllerRepositories } from "./repositories.js";
 
 const OPERATIONS = new Set(["load", "drain", "unload"]);
 const fail = (): LifecycleResult => Object.freeze({ ok: false, error: "ERR_LIFECYCLE_OBSERVATION" });
@@ -115,18 +115,32 @@ export class RemoteLifecycleController {
 
   private finish(request: CommandRequest, response: CommandResponse): LifecycleResult {
     if (response.status !== "succeeded") return Object.freeze({ ok: true, state: response.status, observation: response.observation });
+    // Terminal outcomes are immutable. Replays report the exact durable result,
+    // never reapply inventory or clear uncertainty after a later cancellation.
+    // In particular a newer draining heartbeat need not match loaded-idle.
+    const job = this.jobs.jobs.get(request.jobId);
+    if (job && ["succeeded", "failed", "timed-out", "cancelled"].includes(job.state)) {
+      if (job.state === "succeeded") {
+        return JSON.stringify(this.commands.result(request.jobId)) === JSON.stringify(response)
+          ? Object.freeze({ ok: true, state: "succeeded", observation: response.observation }) : fail();
+      }
+      return Object.freeze({ ok: true, state: job.state, observation: null });
+    }
     const modelId = request.capability.modelId;
     const before = modelId === null ? null : this.repositories.models.get(modelId);
-    if (!before) return this.reject(request, response);
+    const params = object(request.params);
+    if (!before || before.hostId !== request.hostId || before.providerId !== params?.providerId || before.canonicalName !== params?.model) return this.reject(request, response);
     const observation = object(response.observation);
     if (!observation) return this.reject(request, response);
 
-    // A replay after the post-observation was already applied is a no-op.
-    if (this.jobs.jobs.get(request.jobId)?.state === "succeeded" && typeof observation.observedAt === "string" && before.observedAt >= observation.observedAt && this.matchesApplied(before, request.operation)) {
-      return Object.freeze({ ok: true, state: "succeeded", observation: response.observation });
-    }
     const now = Date.parse(this.clock());
-    if (!Number.isFinite(now) || Date.parse(response.observedAt) > now + 30_000 || Date.parse(String(observation.observedAt)) > now + 30_000 || !verifyLifecycleObservation(response, before.observedAt, request)) return this.reject(request, response);
+    if (!Number.isFinite(now) || Date.parse(response.observedAt) > now + 30_000 || Date.parse(String(observation.observedAt)) > now + 30_000 || now - Date.parse(String(observation.observedAt)) >= 60_000 || !verifyLifecycleObservation(response, before.observedAt, request)) return this.reject(request, response);
+    if (request.operation === "drain" && this.admissions) {
+      try {
+        const accounting = this.admissions.snapshot(before.modelId);
+        if (!accounting.draining || accounting.active !== 0) return Object.freeze({ ok: false, error: "ERR_LIFECYCLE_STATE" });
+      } catch { return Object.freeze({ ok: false, error: "ERR_LIFECYCLE_STATE" }); }
+    }
 
     let resumeAdmission = false;
     if (request.operation === "load" && this.admissions) {
@@ -142,7 +156,9 @@ export class RemoteLifecycleController {
 
     const prior = object(before.snapshot) ?? Object.create(null) as Record<string, unknown>;
     const runtimeState = request.operation === "unload" ? "unloaded" : "loaded-idle";
-    const post = Object.freeze({ ...prior, runtimeState, activeRequests: 0 });
+    // Detach nested heartbeat capability data: audit JSON rejects aliases
+    // between pre/post trees as well as cycles. Keep snapshot time bound to row.
+    const post = Object.freeze({ ...structuredClone(prior), runtimeState, activeRequests: 0, observedAt: observation.observedAt });
     const observedAt = String(observation.observedAt);
     try {
       const occurredAt = new Date(Math.max(Date.parse(this.clock()), Date.parse(response.observedAt) + 3)).toISOString();
@@ -189,8 +205,4 @@ export class RemoteLifecycleController {
     tx.audit.append({ actorKind: "agent", actorId: request.hostId, action: "command-result", outcome: target, requestId: request.requestId, jobId: request.jobId, hostId: request.hostId, details: { status: target }, occurredAt: new Date(at).toISOString() });
   }
 
-  private matchesApplied(model: ModelRecord, operation: CommandRequest["operation"]): boolean {
-    const state = object(model.snapshot)?.runtimeState;
-    return operation === "unload" ? model.state === "installed" && state === "unloaded" : model.state === "running" && state === "loaded-idle";
-  }
 }

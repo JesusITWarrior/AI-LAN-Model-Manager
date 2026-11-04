@@ -1,5 +1,5 @@
 import type { CommandRequest, CommandResponse, AuthorizationIntent } from "@lan-model-manager/core";
-import { commandPolicyOperation, parseCommandRequest } from "@lan-model-manager/core";
+import { commandPolicyOperation, parseCommandRequest, parseInstalledModelObservation } from "@lan-model-manager/core";
 import type { PolicyService } from "./policy-service.js";
 import type { CommandDispatcher, DispatchResult } from "./command-dispatch.js";
 import type { ControllerRepositories, ModelRecord } from "./repositories.js";
@@ -21,7 +21,7 @@ type Observation = { readonly observedAt: string; readonly runtimeState?: string
 const fail = (error: LifecycleError): LifecycleResult => Object.freeze({ ok: false, error });
 const record = (value: unknown): Record<string, unknown> | null => typeof value === "object" && value !== null && !Array.isArray(value) ? value as Record<string, unknown> : null;
 const snapshot = (model: ModelRecord | null): Record<string, unknown> | null => model ? record(model.snapshot) : null;
-const active = (model: ModelRecord | null): number | null => { const value = snapshot(model)?.activeRequests; return Number.isSafeInteger(value) && Number(value) >= 0 ? Number(value) : null; };
+const active = (model: ModelRecord | null): number | null => { const value = snapshot(model)?.activeRequests; return Number.isSafeInteger(value) && Number(value) >= 0 && Number(value) <= 1_000_000 ? Number(value) : null; };
 const runtime = (model: ModelRecord | null): string => String(snapshot(model)?.runtimeState ?? (model?.state === "running" ? "loaded-idle" : model?.state ?? "absent"));
 
 export function verifyLifecycleObservation(response: CommandResponse, before: string, request: CommandRequest): boolean {
@@ -56,6 +56,7 @@ export class LifecycleService {
     if (!authorization.ok) return fail("ERR_LIFECYCLE_DENIED");
     const approvalOnly = authorization.value.requiresApproval && authorization.value.reasons.every(reason => reason === "approval-required");
     if ((!authorization.value.allowed && !approvalOnly) || !this.policy.validateCapability(request.capability, input.intent, authorization.value, request)) return fail("ERR_LIFECYCLE_CAPABILITY");
+    if (model !== null && runtime(model) === "draining" && !this.admissions) return fail("ERR_LIFECYCLE_STATE");
     if (model !== null && this.admissions) {
       try {
         if (request.operation === "drain") void this.admissions.stopAdmission(model.modelId);
@@ -98,8 +99,16 @@ export class LifecycleService {
     switch (operation) {
       case "load": return model !== null && requests === 0 && ["installed", "unloaded", "failed"].includes(state);
       case "set-options": return model !== null && requests === 0 && ["loaded", "loaded-idle"].includes(state);
-      case "drain": return model !== null && requests !== null && requests >= 0 && ["serving", "running", "loaded", "loaded-idle"].includes(state);
-      case "unload": return model !== null && ["serving", "running", "loaded", "loaded-idle"].includes(state);
+      case "drain": return model !== null && requests !== null && requests >= 0 && ["serving", "running", "loaded", "loaded-idle", "draining"].includes(state);
+      case "unload": {
+        if (state !== "draining") return model !== null && ["serving", "running", "loaded", "loaded-idle"].includes(state);
+        // A heartbeat is inventory, not remote-idle confirmation. Require an
+        // exact bounded observation here AND authoritative accounting above.
+        const parsed = parseInstalledModelObservation(snap);
+        return model !== null && model.state === "running" && requests === 0 && parsed.ok &&
+          parsed.value.modelId === model.modelId && parsed.value.providerId === model.providerId &&
+          parsed.value.displayName === model.canonicalName && parsed.value.observedAt === model.observedAt;
+      }
       case "install": return model === null;
       case "remove-managed-artifact": return model !== null && requests === 0 && snap?.managedTemporary === true && snap?.pinned !== true && ["installed", "unloaded"].includes(state);
       default: return true;

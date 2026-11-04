@@ -5,13 +5,17 @@ import { mkdtempSync, rmSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { createServer } from "node:net";
-import { commandAuthorizationDigest, commandPolicyOperation, type CommandRequest, type OperationPolicy } from "@lan-model-manager/core";
+import { commandAuthorizationDigest, commandPolicyOperation, signTransportSignedEnvelope, transportBodyDigest, parseTransportParsedCertificate, type CommandRequest, type OperationPolicy } from "@lan-model-manager/core";
 import { createRuntimeInferenceHandler } from "./inference-runtime.js";
 import { createAdmissionController } from "./admission-accounting.js";
 import { CommandDispatcher } from "./command-dispatch.js";
 import { createControllerApplication, type ControllerApplicationOptions } from "./controller-application.js";
 import { createManagementDependencies } from "./management-runtime.js";
 import { CertificateRepository } from "./certificate-repository.js";
+import { FleetService } from "./fleet-service.js";
+import { ControllerTransport } from "./transport/controller-transport.js";
+import { PersistentReplayStore } from "./transport/replay-store.js";
+import { buildTransportNativeSigner, buildTransportNativeVerifier, generateTransportNativeKeyPair } from "./transport/transport-signer.js";
 
 const T0 = "2026-09-29T10:00:00.000Z";
 const policy: OperationPolicy = { version: 1, allowedOperations: ["model-load", "model-drain", "model-unload"], approvalOperations: [], allowArtifactAcquisition: false, allowArtifactRemoval: false, allowSubstitution: false, allowPublicExposure: false, minimumMemoryHeadroomBytes: 1, minimumVramHeadroomBytes: 0, minimumStorageHeadroomBytes: 1, maxConcurrentOperations: 10, maxOperationsPerMinute: 100 };
@@ -46,6 +50,27 @@ async function fixture(closeTimeoutMs = 5000) {
   repos.providers.upsert({ providerId: "provider-1", hostId: "host-1", kind: "ollama", endpoint: "http://127.0.0.1:11434", health: "ready", version: "", versionKnown: false, observedAt: T0, snapshot: {} });
   repos.models.upsert({ modelId: "model-1", providerId: "provider-1", hostId: "host-1", canonicalName: "example/model:latest", state: "installed", type: "llm", digest: "", digestKnown: false, observedAt: T0, snapshot: { runtimeState: "unloaded", activeRequests: 0 } });
   repos.db.prepare("INSERT INTO fleet_liveness(host_id,certificate_fingerprint,protocol_minor,last_sequence,last_observed_at,last_request_id,idle,updated_at) VALUES(?,?,?,?,?,?,?,?)").run("host-1", fp, 0, 1, T0, "heartbeat-1", 1, T0);
+  // Synthetic paired leaf and real signature/replay/inventory pipeline. No
+  // provider, model process, external host or inference listener is involved.
+  const parsedCertificate = parseTransportParsedCertificate({ fingerprint: fp, serial: "ABCD", commonName: "host-1", address: "192.0.2.10", spiffe: "spiffe://lanmodelmanager/host/host-1", notBefore: "2026-01-01T00:00:00.000Z", notAfter: "2027-01-01T00:00:00.000Z", issuerFingerprint: "c".repeat(64), isCa: false });
+  assert.ok(parsedCertificate.ok);
+  const pair = generateTransportNativeKeyPair(), signer = buildTransportNativeSigner(pair.keyPem, parsedCertificate.value), verifier = buildTransportNativeVerifier(pair.publicPem, parsedCertificate.value);
+  assert.ok(signer.ok && verifier.ok);
+  const heartbeatSigner = signer.value;
+  const transport = new ControllerTransport({ certificateRepository: certs, replayStore: new PersistentReplayStore(repos.db), verifier: () => verifier.value, clock: () => now });
+  const fleet = new FleetService(repos.db, transport, certs, repos, { clock: () => now });
+  let heartbeatSequence = 1;
+  function heartbeat(second: number, runtimeState = "loaded-idle", activeRequests: unknown = 0, overrides: Record<string, unknown> = {}, sourceAddress = "192.0.2.10") {
+    now = `2026-09-29T10:00:${String(second).padStart(2, "0")}.000Z`;
+    const sequence = ++heartbeatSequence;
+    const payload = { platform: "linux", protocolMinor: 0, idle: runtimeState === "loaded-idle", sequence, observedAt: now,
+      resource: { ...(repos.hosts.get("host-1")!.snapshot as any).resource, observedAt: now },
+      providers: [{ providerId: "provider-1", kind: "ollama", displayName: "Synthetic Ollama", endpoint: "http://127.0.0.1:11434", health: "ready", version: null, observedAt: now }],
+      models: [{ modelId: "model-1", providerId: "provider-1", displayName: "example/model:latest", artifactState: "installed", runtimeState, activeRequests, sizeBytes: 123, managedTemporary: false, pinned: false, capability: { tools: false, vision: false, reasoning: false, modalities: ["text"], contextWindow: 4096 }, observedAt: now, ...overrides }] };
+    const signed = signTransportSignedEnvelope({ protocolVersion: { major: 1, minor: 0 }, messageType: "transport.heartbeat", hostId: "host-1", requestId: `heartbeat-${sequence}`, sequence, sentAt: now, nonce: `heartbeat-nonce-${sequence}`, bodyDigest: transportBodyDigest(payload as never), certFingerprint: fp, certSerial: "ABCD", signature: "0".repeat(16), payload } as never, heartbeatSigner);
+    assert.ok(signed.ok);
+    return fleet.ingest(signed.value, sourceAddress);
+  }
   function command(operation: "load" | "drain" | "unload", n: number): CommandRequest {
     const value = { requestId: String(n).padStart(64, "0"), jobId: `job-${n}`, hostId: "host-1", operation, idempotencyKey: `idem-${n}`, sequence: 1, deadline: "2026-09-29T10:04:00.000Z", capability: { operation: commandPolicyOperation(operation), targetKind: "model", targetId: "model-1", hostId: "host-1", modelId: "model-1", requestDigest: "0".repeat(64), expiresAt: "2026-09-29T10:04:00.000Z" }, params: { providerId: "provider-1", model: "example/model:latest" } };
     value.capability.requestDigest = commandAuthorizationDigest(value as CommandRequest);
@@ -63,7 +88,7 @@ async function fixture(closeTimeoutMs = 5000) {
     now = `2026-09-29T10:00:${String(second).padStart(2, "0")}.000Z`;
     assert.ok(app.runtime.services.commands.complete("host-1", { requestId: request.requestId, jobId: request.jobId, hostId: request.hostId, sequence: request.sequence, status: "succeeded", progress: 100, observedAt: now, observation: { action: request.operation, providerId: "provider-1", canonicalModelName: "example/model:latest", outcome: "succeeded", runtimeState: request.operation === "unload" ? "unloaded" : "loaded", ...(request.operation === "drain" ? { activeRequests: 0 } : {}), observedAt: now }, errorCode: null }));
   }
-  return { app, repos, post, headers, cookie, command, poll, complete, certs, fp, reopen: () => createControllerApplication(options), setNow: (value: string) => now = value, async close() { await app.close(); rmSync(root, { recursive: true, force: true }); } };
+  return { app, repos, post, headers, cookie, command, poll, complete, heartbeat, certs, fp, reopen: () => createControllerApplication(options), setNow: (value: string) => now = value, async close() { await app.close(); rmSync(root, { recursive: true, force: true }); } };
 }
 
 // Real production application, real auth/CSRF/origin guard, real policy and
@@ -343,4 +368,180 @@ test("consumed approval cannot authorize a different execution after cancel, age
     const again = await x.post("/api/v1/lifecycle/operations", { request }, x.headers);
     assert.equal(again.status, 200); assert.equal((await again.json() as any).value.state, "cancelled");
   } finally { await reopened?.close(); await x.close(); }
+});
+
+
+async function runOwnerOperation(x: Awaited<ReturnType<typeof fixture>>, operation: "load" | "drain" | "unload", n: number, second: number) {
+  const request = x.command(operation, n);
+  const pending = x.post("/api/v1/lifecycle/operations", { request }, x.headers);
+  assert.equal((await x.poll()).jobId, request.jobId);
+  await x.complete(request, second);
+  const response = await pending, body = await response.json() as any;
+  assert.equal(response.status, 200, JSON.stringify(body));
+  assert.equal(body.value.state, "succeeded");
+  return request;
+}
+
+const inferencePolicy: OperationPolicy = { ...policy, allowedOperations: [...policy.allowedOperations, "model-inference"] };
+async function inferenceContext(x: Awaited<ReturnType<typeof fixture>>) {
+  const issued = await x.app.runtime.services.inferenceTokens.issue(x.cookie.split("=", 2)[1]!, { label: "synthetic-reconciliation", ttlMs: 120000 });
+  assert.ok(issued);
+  return { token: issued.metadata };
+}
+
+test("paired loaded-idle heartbeat persists running but cannot manufacture runtime admission or inference authority", { timeout: 15_000 }, async () => {
+  const x = await fixture();
+  try {
+    assert.ok(x.heartbeat(1).ok);
+    const model = x.repos.models.get("model-1")!;
+    assert.equal(model.state, "running"); assert.equal((model.snapshot as any).activeRequests, 0);
+    assert.equal((model.snapshot as any).observedAt, model.observedAt);
+    const context = await inferenceContext(x), inference = x.app.runtime.services.inference;
+    assert.throws(() => inference.select(context, model.canonicalName)); // closed default policy
+    assert.equal((await x.post("/api/v1/policy/install", inferencePolicy, x.headers)).status, 200);
+    assert.throws(() => x.app.runtime.services.admissions.snapshot(model.modelId));
+    assert.throws(() => inference.select(context, model.canonicalName));
+    for (const [index, operation] of (["load", "drain", "unload"] as const).entries()) {
+      assert.equal((await x.post("/api/v1/lifecycle/operations", { request: x.command(operation, 40 + index) }, x.headers)).status, 409);
+      assert.throws(() => x.app.runtime.services.admissions.snapshot(model.modelId));
+    }
+    assert.equal(x.app.runtime.services.commands.poll("host-1").command, null);
+  } finally { await x.close(); }
+});
+
+test("owner HTTP recovers cancellation uncertainty only through fresh drain across paired draining heartbeats and immutable replay", { timeout: 15_000 }, async () => {
+  const x = await fixture();
+  try {
+    assert.equal((await x.post("/api/v1/policy/install", inferencePolicy, x.headers)).status, 200);
+    await runOwnerOperation(x, "load", 50, 1); // sole legitimate registration path
+    assert.ok(x.heartbeat(2).ok);
+    const { admissions, inference } = x.app.runtime.services, context = await inferenceContext(x);
+    assert.equal(x.repos.models.get("model-1")?.state, "running");
+    const selected = inference.select(context, "example/model:latest");
+    assert.throws(() => inference.select(context, "other/model"));
+    const handle = inference.open(context, selected, { model: selected.model, messages: [{ role: "user", content: "synthetic local relay cancellation" }] }, new AbortController().signal);
+    assert.equal(admissions.snapshot("model-1").active, 1);
+    // Real runtime cancellation is not a remote provider idle proof.
+    handle.cancel(); await handle.outcome;
+    assert.equal(admissions.snapshot("model-1").active, 0);
+    assert.equal(admissions.snapshot("model-1").uncertain, true);
+    assert.ok(x.heartbeat(3, "draining").ok);
+    assert.equal((await x.post("/api/v1/lifecycle/operations", { request: x.command("unload", 51) }, x.headers)).status, 409);
+    assert.equal(admissions.snapshot("model-1").uncertain, true);
+    const drain = await runOwnerOperation(x, "drain", 52, 4);
+    assert.equal(admissions.snapshot("model-1").uncertain, undefined);
+    assert.equal(admissions.snapshot("model-1").draining, true);
+    assert.equal((x.repos.models.get("model-1")?.snapshot as any).observedAt, "2026-09-29T10:00:04.000Z");
+    assert.ok(x.heartbeat(5, "draining").ok);
+    const count = x.app.runtime.jobStores.audit.list().filter(row => row.action === "lifecycle-observation-applied").length;
+    const retry = await x.post("/api/v1/lifecycle/operations", { request: drain }, x.headers);
+    assert.equal(retry.status, 200); assert.equal((await retry.json() as any).value.state, "succeeded");
+    assert.equal(x.repos.models.get("model-1")?.observedAt, "2026-09-29T10:00:05.000Z");
+    assert.equal((x.repos.models.get("model-1")?.snapshot as any).runtimeState, "draining");
+    assert.equal(x.app.runtime.jobStores.audit.list().filter(row => row.action === "lifecycle-observation-applied").length, count);
+    // Even exact previously successful drain replay is not a NEW idle proof.
+    admissions.markUncertain("model-1");
+    assert.equal((await x.post("/api/v1/lifecycle/operations", { request: drain }, x.headers)).status, 200);
+    assert.equal(admissions.snapshot("model-1").uncertain, true);
+    assert.equal((await x.post("/api/v1/lifecycle/operations", { request: x.command("unload", 53) }, x.headers)).status, 409);
+    assert.throws(() => admissions.acquire("model-1"));
+    await runOwnerOperation(x, "drain", 54, 6);
+    assert.ok(x.heartbeat(7, "draining").ok);
+    await runOwnerOperation(x, "unload", 55, 8);
+    assert.equal(x.repos.models.get("model-1")?.state, "installed");
+    assert.equal(admissions.snapshot("model-1").draining, true);
+    assert.equal(admissions.snapshot("model-1").uncertain, undefined);
+    assert.throws(() => inference.select(context, selected.model));
+  } finally { await x.close(); }
+});
+
+test("draining unload remains closed for missing malformed unknown positive foreign stale or untrusted proof and active shared leases", { timeout: 30_000 }, async () => {
+  for (const mutation of ["missing-active", "malformed-active", "unbounded-active", "unknown", "positive", "foreign-model", "foreign-provider", "foreign-name", "unbound-time", "stale-model", "stale-liveness", "revoked", "policy", "shared-active"] as const) {
+    const x = await fixture();
+    try {
+      assert.equal((await x.post("/api/v1/policy/install", policy, x.headers)).status, 200);
+      await runOwnerOperation(x, "load", 60, 1);
+      const admissions = x.app.runtime.services.admissions;
+      const lease = mutation === "shared-active" ? admissions.acquire("model-1") : null;
+      void admissions.stopAdmission("model-1");
+      assert.ok(x.heartbeat(2, mutation === "unknown" ? "unknown" : "draining", mutation === "positive" ? 1 : 0).ok);
+      const model = x.repos.models.get("model-1")!, snapshot = { ...(model.snapshot as Record<string, unknown>) };
+      // Malformed legacy/corrupt durable facts must not bypass the heartbeat parser.
+      if (mutation === "missing-active") delete snapshot.activeRequests;
+      if (mutation === "malformed-active") snapshot.activeRequests = "0";
+      if (mutation === "unbounded-active") snapshot.activeRequests = 1_000_001;
+      if (mutation === "foreign-model") snapshot.modelId = "other-model";
+      if (mutation === "foreign-provider") snapshot.providerId = "other-provider";
+      if (mutation === "foreign-name") snapshot.displayName = "other/model";
+      if (mutation === "unbound-time") snapshot.observedAt = T0;
+      x.repos.db.prepare("UPDATE models SET snapshot_json=? WHERE model_id=?").run(JSON.stringify(snapshot), model.modelId);
+      if (mutation === "stale-model") x.repos.db.prepare("UPDATE models SET observed_at=? WHERE model_id=?").run("2026-09-29T09:58:00.000Z", model.modelId);
+      if (mutation === "stale-liveness") x.repos.db.prepare("UPDATE fleet_liveness SET last_observed_at=?").run("2026-09-29T09:58:00.000Z");
+      if (mutation === "revoked") assert.ok(x.certs.revoke(x.fp, "2026-09-29T10:00:02.000Z"));
+      if (mutation === "policy") assert.equal((await x.post("/api/v1/policy/install", { ...policy, version: 2, allowedOperations: [] }, x.headers)).status, 200);
+      assert.equal((await x.post("/api/v1/lifecycle/operations", { request: x.command("unload", 61) }, x.headers)).status, 409, mutation);
+      assert.equal(x.app.runtime.services.commands.poll("host-1").command, null, mutation);
+      assert.throws(() => admissions.acquire("model-1"), mutation);
+      lease?.release();
+    } finally { await x.close(); }
+  }
+});
+
+test("paired ingestion rejects missing or malformed active counts and foreign source without overwriting running proof", { timeout: 15_000 }, async () => {
+  const x = await fixture();
+  try {
+    assert.ok(x.heartbeat(1).ok);
+    for (const [index, value] of [undefined, "0", -1, 1_000_001, 1].entries()) {
+      assert.equal(x.heartbeat(2 + index, "loaded-idle", value, value === undefined ? { activeRequests: undefined } : {}).ok, false);
+      assert.equal(x.repos.models.get("model-1")?.observedAt, "2026-09-29T10:00:01.000Z");
+    }
+    assert.equal(x.heartbeat(8, "loaded-idle", 0, {}, "192.0.2.99").ok, false);
+    assert.equal(x.repos.models.get("model-1")?.state, "running");
+  } finally { await x.close(); }
+});
+
+test("remote drain rejects unbound missing positive stale superseded or cancelled idle results without clearing uncertainty", { timeout: 30_000 }, async () => {
+  for (const mutation of ["foreign-provider", "foreign-name", "missing-active", "positive-active", "stale", "aged", "superseded", "cancelled"] as const) {
+    const x = await fixture();
+    try {
+      assert.equal((await x.post("/api/v1/policy/install", policy, x.headers)).status, 200);
+      await runOwnerOperation(x, "load", 70, 1);
+      const admissions = x.app.runtime.services.admissions;
+      admissions.markUncertain("model-1"); void admissions.stopAdmission("model-1");
+      assert.ok(x.heartbeat(2, "draining").ok);
+      const request = x.command("drain", 71);
+      const pending = x.post("/api/v1/lifecycle/operations", { request }, x.headers);
+      await x.poll();
+      const at = "2026-09-29T10:00:03.000Z";
+      const observation: Record<string, unknown> = { action: "drain", outcome: "succeeded", providerId: "provider-1", canonicalModelName: "example/model:latest", runtimeState: "loaded", activeRequests: 0, observedAt: at };
+      if (mutation === "foreign-provider") observation.providerId = "other-provider";
+      if (mutation === "foreign-name") observation.canonicalModelName = "other/model";
+      if (mutation === "missing-active") delete observation.activeRequests;
+      if (mutation === "positive-active") observation.activeRequests = 1;
+      if (mutation === "stale") observation.observedAt = T0;
+      x.setNow(at);
+      if (mutation === "cancelled") assert.equal((await x.post("/api/v1/lifecycle/cancel", { jobId: request.jobId }, x.headers)).status, 200);
+      const result = x.app.runtime.services.commands.complete("host-1", { requestId: request.requestId, jobId: request.jobId, hostId: request.hostId, sequence: request.sequence, status: "succeeded", progress: 100, observedAt: at, observation, errorCode: null });
+      if (mutation === "aged" || mutation === "superseded") {
+        assert.ok(result);
+        if (mutation === "aged") x.setNow("2026-09-29T10:01:04.000Z");
+        else assert.ok(x.heartbeat(4, "draining").ok);
+        // Existing HTTP mapping exposes observation rejection as INTERNAL_ERROR;
+        // durable failure and unchanged uncertainty are the safety boundary.
+        assert.equal((await pending).status, 500, mutation);
+        assert.equal(x.app.runtime.jobStores.jobs.get(request.jobId)?.state, "failed");
+      } else {
+        assert.equal(result, null, mutation);
+        if (mutation !== "cancelled") assert.equal((await x.post("/api/v1/lifecycle/cancel", { jobId: request.jobId }, x.headers)).status, 200);
+        assert.equal((await pending).status, 200);
+        assert.equal(x.app.runtime.jobStores.jobs.get(request.jobId)?.state, "cancelled");
+      }
+      assert.equal(admissions.snapshot("model-1").uncertain, true, mutation);
+      assert.equal(admissions.snapshot("model-1").draining, true, mutation);
+      assert.equal(admissions.snapshot("model-1").active, 0, mutation);
+      assert.equal((x.repos.models.get("model-1")?.snapshot as any).runtimeState, "draining");
+      assert.throws(() => admissions.acquire("model-1"), mutation);
+      assert.equal(x.app.runtime.jobStores.audit.list().filter(row => row.action === "lifecycle-observation-applied").length, 1, mutation);
+    } finally { await x.close(); }
+  }
 });

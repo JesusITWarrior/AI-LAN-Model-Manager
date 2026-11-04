@@ -12,6 +12,7 @@ test("runtime heartbeats retain serving, admission, and drain safety through rec
  const c = setup();
  try {
   const states = [
+   { runtimeState: "loaded-idle", activeRequests: 0, idle: true },
    { runtimeState: "serving", activeRequests: 0, idle: true },
    { runtimeState: "serving", activeRequests: 1, idle: false },
    { runtimeState: "unknown", activeRequests: 1, idle: false },
@@ -27,6 +28,7 @@ test("runtime heartbeats retain serving, admission, and drain safety through rec
    c.set(envelope(index+1, payload));
    assert.equal(c.service.ingest({}, "192.168.1.20").ok, true);
    assert.deepEqual(JSON.parse(JSON.stringify(c.repos.models.get("model-1")?.snapshot)), m);
+   assert.equal(c.repos.models.get("model-1")?.state, ["loaded-idle", "serving", "draining"].includes(state.runtimeState) ? "running" : "installed");
    assert.equal(c.repos.providers.get("ollama-1")?.health, "ready");
    assert.equal((c.repos.hosts.get("agent-1")?.snapshot as any).idle, idle);
   }

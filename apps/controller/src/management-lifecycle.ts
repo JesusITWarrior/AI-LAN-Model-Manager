@@ -35,14 +35,14 @@ export class ManagementLifecycleService {
     if (!model || !host || !provider || model.hostId !== host.hostId || provider.hostId !== host.hostId || request.capability.targetKind !== "model" || request.capability.targetId !== model.modelId) return fail("ERR_LIFECYCLE_STATE");
     const resource = parseHostResourceObservation(record(host.snapshot)?.resource);
     if (!resource.ok || resource.value.hostId !== host.hostId || resource.value.platform !== host.platform) return fail("ERR_LIFECYCLE_STATE");
-    const live = repositories.db.prepare("SELECT c.status,c.not_before,c.not_after FROM fleet_liveness l JOIN host_certificates c ON c.fingerprint=l.certificate_fingerprint AND c.candidate_id=l.host_id WHERE l.host_id=?").get(host.hostId) as {status:string;not_before:string;not_after:string}|undefined;
+    const live = repositories.db.prepare("SELECT c.status,c.not_before,c.not_after,c.revoked_at,l.last_observed_at,l.health,l.revoked_at AS live_revoked_at FROM fleet_liveness l JOIN host_certificates c ON c.fingerprint=l.certificate_fingerprint AND c.candidate_id=l.host_id WHERE l.host_id=?").get(host.hostId) as {status:string;not_before:string;not_after:string;revoked_at:string|null;last_observed_at:string;health:string;live_revoked_at:string|null}|undefined;
     const fresh = (at: string) => { const age = nowMs - Date.parse(at); return Number.isFinite(age) && age >= 0 && age < 60_000; };
     const counts = repositories.db.prepare("SELECT SUM(CASE WHEN state NOT IN ('succeeded','failed','timed-out','cancelled') THEN 1 ELSE 0 END) active, SUM(CASE WHEN submitted_at>? THEN 1 ELSE 0 END) recent FROM jobs WHERE job_id<>?").get(new Date(nowMs - 60_000).toISOString(), request.jobId) as {active:number|null;recent:number|null};
     const intent: AuthorizationIntent = {
       requestId: request.requestId, actorKind: "owner", actorId: guard.session.ownerId,
       operation: commandPolicyOperation(request.operation), targetKind: "model", targetId: model.modelId, hostId: host.hostId, modelId: model.modelId,
-      observationFresh: host.online && host.freshness === "fresh" && [host.observedAt, provider.observedAt, model.observedAt, resource.value.observedAt].every(fresh),
-      hostRevoked: !live || live.status !== "active" || Date.parse(live.not_before) > nowMs || Date.parse(live.not_after) <= nowMs,
+      observationFresh: host.online && host.freshness === "fresh" && [host.observedAt, provider.observedAt, model.observedAt, resource.value.observedAt].every(fresh) && !!live && live.health === "active" && live.live_revoked_at === null && fresh(live.last_observed_at),
+      hostRevoked: !live || live.status !== "active" || live.revoked_at !== null || Date.parse(live.not_before) > nowMs || Date.parse(live.not_after) <= nowMs,
       modelCompatible: provider.health === "ready" && model.state !== "available",
       // These operations do not change listener exposure.
       publicExposure: false,
