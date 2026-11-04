@@ -204,59 +204,126 @@ func maintainFleetSessions(ctx context.Context, certDir, stateDir string, host *
 	if ollamaClient != nil {
 		registry.RegisterOllama("ollama-local", ollamaClient)
 	}
-	for ctx.Err() == nil {
-		// Rotation is attempted before every session generation. A durable pending
-		// CSR allows this call to recover when the prior process was interrupted
-		// after the controller atomically replaced/revoked the old certificate.
-		if _, rotateErr := fleet.RotateIdentityIfNeeded(ctx, certDir, 7*24*time.Hour); rotateErr != nil {
-			// Do not run a possibly revoked predecessor after a lost rotation
-			// response. Retry the durable pending CSR promptly and cancellation-aware.
-			select {
-			case <-ctx.Done():
-				return
-			case <-time.After(time.Minute):
-				continue
+	maintainFleetSessionLoop(ctx, fleetSessionHooks{
+		rotate: func(ctx context.Context) error {
+			// Durable pending CSR recovery remains inside the rotation operation;
+			// failed rotation never runs a possibly revoked predecessor session.
+			_, err := fleet.RotateIdentityIfNeeded(ctx, certDir, 7*24*time.Hour)
+			return err
+		},
+		newClient: func() (*fleet.HTTPSClient, error) { return fleet.NewHTTPSClient(certDir) },
+		newRunner: func() (*fleet.CommandRunner, error) {
+			executor, err := command.NewPersistent(host.HostID(), registry, time.Now, filepath.Join(stateDir, "command-replay.json"))
+			if err != nil {
+				return nil, err
 			}
+			return fleet.NewCommandRunner(executor)
+		},
+		runInventory: func(ctx context.Context, client *fleet.HTTPSClient) {
+			_ = client.Run(ctx, fleetCollector{source: host, resources: host, ollama: ollamaClient, report: reporter, registry: registry}, runtime.GOOS, "")
+		},
+		runCommands: func(ctx context.Context, runner *fleet.CommandRunner, client *fleet.HTTPSClient) {
+			_ = runner.Run(ctx, client)
+		},
+		closeIdle:       func(client *fleet.HTTPSClient) { client.CloseIdleConnections() },
+		commandsEnabled: ollamaClient != nil,
+		sessionDuration: 12 * time.Hour,
+		retryDelay:      time.Minute,
+	})
+}
+
+// Private offline seam: production supplies the same enrollment/client operations
+// and twelve-hour duration; tests can force rotation without touching live state.
+type fleetSessionHooks struct {
+	rotate       func(context.Context) error
+	newClient    func() (*fleet.HTTPSClient, error)
+	newRunner    func() (*fleet.CommandRunner, error)
+	runInventory func(context.Context, *fleet.HTTPSClient)
+	runCommands  func(context.Context, *fleet.CommandRunner, *fleet.HTTPSClient)
+	closeIdle    func(*fleet.HTTPSClient)
+	// Tests may block the handoff boundary; production always joins the owner.
+	quiesce         func(context.Context, *fleet.CommandRunner) error
+	commandsEnabled bool
+	sessionDuration time.Duration
+	retryDelay      time.Duration
+}
+
+func maintainFleetSessionLoop(ctx context.Context, hooks fleetSessionHooks) {
+	// Accept a single owner for this service lifetime. Retry construction failures,
+	// never a successfully accepted executor (including one subsequently poisoned).
+	var runner *fleet.CommandRunner
+	retry := func() bool {
+		timer := time.NewTimer(hooks.retryDelay)
+		defer timer.Stop()
+		select {
+		case <-ctx.Done():
+			return false
+		case <-timer.C:
+			return true
 		}
-		client, err := fleet.NewHTTPSClient(certDir)
-		if err != nil {
-			select {
-			case <-ctx.Done():
+	}
+	for ctx.Err() == nil {
+		// The preceding generation has already quiesced before any identity/sequence
+		// state is rotated or reloaded here.
+		if err := hooks.rotate(ctx); err != nil {
+			if !retry() {
 				return
-			case <-time.After(time.Minute):
-				continue
+			}
+			continue
+		}
+		if ctx.Err() != nil {
+			return
+		}
+		client, err := hooks.newClient()
+		if err != nil {
+			if !retry() {
+				return
+			}
+			continue
+		}
+		if hooks.commandsEnabled && runner == nil {
+			runner, err = hooks.newRunner()
+			if err != nil {
+				runner = nil
+				slog.Info("command-stage", "code", "EXECUTOR_UNAVAILABLE", "httpStatus", 0)
 			}
 		}
 		sessionCtx, cancel := context.WithCancel(ctx)
 		var workers sync.WaitGroup
 		workers.Add(1)
-		go func() {
-			defer workers.Done()
-			_ = client.Run(sessionCtx, fleetCollector{source: host, resources: host, ollama: ollamaClient, report: reporter, registry: registry}, runtime.GOOS, "")
-		}()
-		if ollamaClient != nil {
-			if executor, e := command.NewPersistent(host.HostID(), registry, time.Now, filepath.Join(stateDir, "command-replay.json")); e == nil {
-				workers.Add(1)
-				go func() { defer workers.Done(); _ = client.RunCommands(sessionCtx, executor) }()
-			} else {
-				slog.Info("command-stage", "code", "EXECUTOR_UNAVAILABLE", "httpStatus", 0)
-			}
+		go func() { defer workers.Done(); hooks.runInventory(sessionCtx, client) }()
+		if runner != nil {
+			workers.Add(1)
+			go func(owner *fleet.CommandRunner, generation *fleet.HTTPSClient, generationCtx context.Context) {
+				defer workers.Done()
+				hooks.runCommands(generationCtx, owner, generation)
+			}(runner, client, sessionCtx)
 		}
-		timer := time.NewTimer(12 * time.Hour)
+		timer := time.NewTimer(hooks.sessionDuration)
 		select {
 		case <-ctx.Done():
-			if !timer.Stop() {
-				<-timer.C
-			}
-			cancel()
-			client.CloseIdleConnections()
-			workers.Wait()
-			return
 		case <-timer.C:
-			cancel()
-			client.CloseIdleConnections()
-			workers.Wait()
 		}
+		timer.Stop()
+		cancel()
+		hooks.closeIdle(client)
+		workers.Wait()
+		if ctx.Err() != nil {
+			return
+		}
+		if runner != nil {
+			// Cancellation alone does not join an adapter or its old-client stream
+			// emitter. Wait fail-closed, retaining any late full completion unchanged.
+			slog.Info("command-stage", "code", "SESSION_HANDOFF_WAITING", "httpStatus", 0)
+			quiesce := hooks.quiesce
+			if quiesce == nil {
+				quiesce = func(ctx context.Context, owner *fleet.CommandRunner) error { return owner.Quiesce(ctx) }
+			}
+			if err := quiesce(ctx, runner); err != nil {
+				return
+			}
+		}
+		hooks.closeIdle(client)
 	}
 }
 

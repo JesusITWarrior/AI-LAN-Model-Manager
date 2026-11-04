@@ -65,6 +65,15 @@ func saveEnrollmentDiagnostic(stateDir string, entry service.LogEntry) error {
 // saveDiagnostic replaces one bounded, allowlisted status record in the protected
 // state tree. Callers supply only locally constructed JSON, never provider data.
 func saveDiagnostic(stateDir, filename string, raw []byte) error {
+	switch filename {
+	case "enrollment-status.json", "inventory-status.json", "command-status.json":
+	default:
+		return fmt.Errorf("enrollment diagnostic failed")
+	}
+	// Reserve one byte for the trailing newline before creating any temporary file.
+	if len(raw) >= 16*1024 || !json.Valid(raw) {
+		return fmt.Errorf("enrollment diagnostic failed")
+	}
 	if privatefile.Directory(stateDir) != nil {
 		return privatefile.ErrPermissions
 	}

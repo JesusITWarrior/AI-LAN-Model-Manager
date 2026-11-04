@@ -7,7 +7,6 @@ import (
 	"crypto/sha256"
 	"encoding/hex"
 	"encoding/json"
-	"errors"
 	"io"
 	"log/slog"
 	"net/http"
@@ -273,134 +272,13 @@ func uintString(v uint64) string {
 	return string(b)
 }
 
-// RunCommands is an explicitly injected command plane; constructing the fleet
-// client alone never starts it. Execution is restricted to the command.Executor.
+// RunCommands is an invocation-lifetime compatibility wrapper. Service owners
+// that replace session clients must retain a CommandRunner and Quiesce it before
+// replacement; this wrapper alone does not retain state across invocations.
 func (c *HTTPSClient) RunCommands(ctx context.Context, executor *command.Executor, peerRelays ...*command.PeerRelay) error {
-	if executor == nil || len(peerRelays) > 1 {
-		return ErrHTTPClient
+	runner, err := NewCommandRunner(executor, peerRelays...)
+	if err != nil {
+		return err
 	}
-	var peerRelay *command.PeerRelay
-	if len(peerRelays) == 1 {
-		peerRelay = peerRelays[0]
-	}
-	type completion struct {
-		response             command.Response
-		persistenceUncertain bool
-	}
-	var activeJob string
-	var activeDeadline time.Time
-	var reportedExpiredPending bool
-	var cancelActive context.CancelFunc
-	var done chan completion
-	var pending *command.Response
-	var persistenceUncertain bool
-	var activeStream bool
-	var activeDigest string
-	for {
-		if done != nil && pending == nil {
-			select {
-			case completed := <-done:
-				pending = &completed.response
-				persistenceUncertain = completed.persistenceUncertain
-			default:
-			}
-		}
-		// Persistence failure may follow a real adapter mutation. Preserve the
-		// local outcome and block admission: neither fabricated rejection nor a
-		// normal success ACK conveys uncertainty safely. Expiry is not reconciliation.
-		// This guard lasts only for this runner/executor instance, not across restart.
-		if pending != nil && !persistenceUncertain {
-			if !reportedExpiredPending && !activeDeadline.IsZero() && !time.Now().Before(activeDeadline) {
-				commandStage("PENDING_RESULT_EXPIRED", 0)
-				reportedExpiredPending = true
-			}
-			send := c.SendCommandResult
-			if activeStream {
-				send = func(ctx context.Context, result command.Response) error {
-					return c.SendStreamResult(ctx, result, activeDigest)
-				}
-			}
-			if err := send(ctx, *pending); err == nil || activeStream {
-				if cancelActive != nil {
-					cancelActive()
-				}
-				activeJob, cancelActive, done, pending = "", nil, nil, nil
-				activeDeadline, reportedExpiredPending = time.Time{}, false
-			} else if ctx.Err() != nil {
-				return nil
-			}
-		}
-		work, err := c.pollCommandWork(ctx, time.Second)
-		if err != nil {
-			if ctx.Err() != nil {
-				return nil
-			}
-			timer := time.NewTimer(time.Second)
-			select {
-			case <-ctx.Done():
-				timer.Stop()
-				return nil
-			case <-timer.C:
-			}
-			continue
-		}
-		if work.PeerTransfer != nil && peerRelay != nil {
-			result, relayErr := peerRelay.ExecuteDirective(ctx, *work.PeerTransfer)
-			if relayErr == nil {
-				_ = c.sendCommandPayload(ctx, result)
-			}
-		}
-		request, cancelled := work.Command, work.CancelledJobIDs
-		if work.stream != nil {
-			request = work.stream
-		}
-		for _, jobID := range cancelled {
-			if jobID == activeJob && cancelActive != nil {
-				cancelActive()
-			}
-		}
-		if request != nil && done == nil && pending == nil {
-			runCtx, cancel := context.WithCancel(ctx)
-			activeDeadline, _ = time.Parse(time.RFC3339Nano, request.Deadline)
-			reportedExpiredPending = false
-			activeStream = work.stream != nil
-			activeDigest = request.Capability.RequestDigest
-			activeJob, cancelActive, done = request.JobID, cancel, make(chan completion, 1)
-			go func(value command.Request, output chan<- completion) {
-				commandStage("EXECUTION_ENTERED", 0)
-				var result command.Response
-				var runErr error
-				if value.Operation == command.StreamOperation {
-					result, runErr = executor.ExecuteStream(runCtx, value, c.SendStreamEvent)
-				} else {
-					result, runErr = executor.Execute(runCtx, value)
-				}
-				commandStage("EXECUTION_RETURNED", 0)
-				if result.ErrorCode != nil && *result.ErrorCode == "ADAPTER_FAILED" {
-					commandStage("EXECUTION_ADAPTER_FAILED", 0)
-				}
-				if errors.Is(runErr, command.ErrReplayPersistence) {
-					commandStage("EXECUTION_PERSISTENCE_UNCERTAIN", 0)
-					output <- completion{response: result, persistenceUncertain: true}
-					return
-				}
-				if runErr != nil {
-					commandStage("EXECUTION_REJECTED", 0)
-					code := "COMMAND_REJECTED"
-					result = command.Response{RequestID: value.RequestID, JobID: value.JobID, HostID: value.HostID, Sequence: value.Sequence, Status: "failed", ObservedAt: time.Now().UTC().Format("2006-01-02T15:04:05.000Z"), ErrorCode: &code}
-				}
-				output <- completion{response: result}
-			}(*request, done)
-		}
-		timer := time.NewTimer(250 * time.Millisecond)
-		select {
-		case <-ctx.Done():
-			timer.Stop()
-			if cancelActive != nil {
-				cancelActive()
-			}
-			return nil
-		case <-timer.C:
-		}
-	}
+	return runner.Run(ctx, c)
 }

@@ -76,7 +76,12 @@ func signedCommandClient(t *testing.T, mutate func([]byte) []byte, next func(int
 		response := &http.Response{StatusCode: 200, Header: http.Header{"Content-Type": []string{"application/json"}}, TLS: &tls.ConnectionState{PeerCertificates: []*x509.Certificate{leaf}}}
 		if r.URL.Path == commandPollPath {
 			polls++
-			env, err := agenttransport.NewEnvelope("host-1", request.RequestID, "controller.command.poll", "synthetic-nonce", fingerprint, "11", request.Sequence, time.Now(), map[string]any{"command": next(polls), "cancelledJobIds": []string{}, "streamCommand": nil})
+			ordinary := next(polls)
+			var stream *command.Request
+			if ordinary != nil && ordinary.Operation == command.StreamOperation {
+				stream, ordinary = ordinary, nil
+			}
+			env, err := agenttransport.NewEnvelope("host-1", request.RequestID, "controller.command.poll", "synthetic-nonce", fingerprint, "11", request.Sequence, time.Now(), map[string]any{"command": ordinary, "cancelledJobIds": []string{}, "streamCommand": stream})
 			if err != nil || agenttransport.Sign(&env, keyPEM) != nil {
 				t.Fatal("sign")
 			}
