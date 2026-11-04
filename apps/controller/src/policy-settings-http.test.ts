@@ -32,3 +32,13 @@ test("two real owner sessions cannot clear unseen prompts through stale enable o
   assert.equal((await fixture.post(convenience,{enabled:false,expectedVersion:4},second)).status,200);assert.deepEqual((await get()).approvalOperations,["model-load","model-unload"]);assert.equal(fixture.jobs(),0);
  }finally{await fixture.close();}
 });
+
+test("default application serves inference and management on its actual configured listener with separate authentication",{timeout:30_000},async()=>{
+ const fixture=await browserController();try{
+  const models=await fetch(fixture.base+"/v1/models");assert.equal(models.status,401);
+  const management=await fetch(fixture.base+"/api/v1/fleet/summary");assert.equal(management.status,401);
+  const cookieOnly=await fetch(fixture.base+"/v1/models",{headers:{cookie:fixture.headers.cookie}});assert.equal(cookieOnly.status,401,"owner session is not an inference token");
+  const owner=await fetch(fixture.base+"/api/v1/fleet/summary",{headers:fixture.headers});assert.equal(owner.status,200);
+  assert.equal(fixture.jobs(),0);
+ }finally{await fixture.close();}
+});
