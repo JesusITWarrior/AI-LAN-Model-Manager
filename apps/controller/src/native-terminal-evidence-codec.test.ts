@@ -64,7 +64,7 @@ test("versioned unsigned evidence payload binds complete tuple and preserves imm
 test("frozen language-neutral golden vectors bind complete bytes and explicit tuple encoding", () => {
   const vectors = JSON.parse(readFileSync(join(dirname(fileURLToPath(import.meta.url)), "testdata/native-terminal-evidence-codec-v1.json"), "utf8")) as {
     version: number; responseDigestPrefix: string; tupleDigestPrefix: string;
-    authorizationRequestDigest: string; storedQueueDigest: string; storedRequest: CommandRequest;
+    authorizationRequestDigest: string; storedQueueDigest: string; storedQueueEncoding: string; storedRequest: CommandRequest;
     vectors: Array<{ name: string; responseBase64: string; responseByteLength: number; responseDigest: string; tupleEncoding: string; tupleDigest: string }>;
   };
   const snapshot = fixture();
@@ -72,6 +72,12 @@ test("frozen language-neutral golden vectors bind complete bytes and explicit tu
   assert.equal(vectors.responseDigestPrefix, "lanmm-native-response-bytes-v1\0");
   assert.equal(vectors.tupleDigestPrefix, "lanmm-native-terminal-evidence-tuple-digest-v1\0");
   assert.equal(JSON.stringify(vectors.storedRequest), JSON.stringify(snapshot.storedRequest));
+  const parsedRequest = parseCommandRequest(vectors.storedRequest);
+  assert.ok(parsedRequest.ok);
+  assert.equal(vectors.storedQueueEncoding, JSON.stringify(parsedRequest.value));
+  assert.equal(vectors.storedQueueEncoding, JSON.stringify(snapshot.storedRequest));
+  assert.equal(Buffer.byteLength(vectors.storedQueueEncoding, "utf8"), 470);
+  assert.equal(createHash("sha256").update(vectors.storedQueueEncoding, "utf8").digest("hex"), vectors.storedQueueDigest);
   assert.equal(vectors.authorizationRequestDigest, snapshot.native.authorizationDigest);
   assert.equal(vectors.storedQueueDigest, snapshot.storedQueueDigest);
   assert.equal(vectors.vectors.length, 4);

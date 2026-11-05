@@ -4,6 +4,7 @@
   "tupleDigestPrefix": "lanmm-native-terminal-evidence-tuple-digest-v1\u0000",
   "authorizationRequestDigest": "d7c3a4d75dd3c77bc7c4b2b02a9a96660abb60cb38c0c16187f7f563c5b7b695",
   "storedQueueDigest": "ab6c2470463feffd6542aa24f4b7cdcc399d927d9338058cc24c0736b5b2baf5",
+  "storedQueueEncoding": "{\"requestId\":\"request-1\",\"jobId\":\"job-1\",\"hostId\":\"host-1\",\"operation\":\"load\",\"idempotencyKey\":\"idem-1\",\"sequence\":7,\"deadline\":\"2026-11-04T16:15:43.000Z\",\"params\":{\"modelId\":\"model-1\",\"providerId\":\"ollama-1\",\"model\":\"model:1\"},\"capability\":{\"operation\":\"model-load\",\"targetKind\":\"model\",\"targetId\":\"model-1\",\"hostId\":\"host-1\",\"modelId\":\"model-1\",\"requestDigest\":\"d7c3a4d75dd3c77bc7c4b2b02a9a96660abb60cb38c0c16187f7f563c5b7b695\",\"expiresAt\":\"2026-11-04T16:15:43.000Z\"}}",
   "storedRequest": {
     "requestId": "request-1",
     "jobId": "job-1",
