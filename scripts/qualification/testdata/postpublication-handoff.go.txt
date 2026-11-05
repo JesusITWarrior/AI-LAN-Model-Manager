@@ -1,0 +1,104 @@
+
+// Offline overlay-only integration fixture; never part of production source.
+type postpublicationOverlayAdapter struct {
+	calls atomic.Int32
+	fail bool
+	observation any
+}
+
+func (a *postpublicationOverlayAdapter) Execute(context.Context, string, json.RawMessage) (any, error) {
+	a.calls.Add(1)
+	if a.fail {
+		return a.observation, errors.New("synthetic adapter failure")
+	}
+	return a.observation, nil
+}
+
+func TestCommandRunnerSignedPostpublicationFinishFailureHandoff(t *testing.T) {
+	for _, fail := range []bool{false, true} {
+		t.Run(map[bool]string{false: "success", true: "ADAPTER_FAILED"}[fail], func(t *testing.T) {
+			fixedNow := time.Now().UTC().Truncate(time.Millisecond)
+			first := runnerRequest("postpublication", fixedNow.Add(time.Minute))
+			later := runnerRequest("later-blocked", fixedNow.Add(time.Minute))
+			observation := map[string]any{"canary": "original", "nested": map[string]any{"count": float64(7), "items": []any{"a", map[string]any{"kept": true}}}}
+			adapter := &postpublicationOverlayAdapter{fail: fail, observation: observation}
+			path := filepath.Join(t.TempDir(), "replay.json")
+			if err := os.WriteFile(path, []byte("{}\n"), 0o600); err != nil { t.Fatal(err) }
+			executor, err := command.NewPersistent("host-1", adapter, func() time.Time { return fixedNow }, path)
+			if err != nil { t.Fatal(err) }
+			r := lifetimeRunner(t, executor)
+			complete := uint8(100)
+			expected := command.Response{RequestID: first.RequestID, JobID: first.JobID, HostID: first.HostID, Sequence: first.Sequence, Status: "succeeded", Progress: &complete, ObservedAt: fixedNow.Format("2006-01-02T15:04:05.000Z"), Observation: observation}
+			if fail { code := "ADAPTER_FAILED"; expected.Status, expected.Progress, expected.ErrorCode = "failed", nil, &code }
+			// Independently deep-copy the expected response before any comparison.
+			rawExpected, err := json.Marshal(expected)
+			if err != nil { t.Fatal(err) }
+			var snapshot command.Response
+			if err := json.Unmarshal(rawExpected, &snapshot); err != nil { t.Fatal(err) }
+			var events []CommandEvent
+			var posts atomic.Int32
+			var savedDone chan commandCompletion
+			var diskBefore []byte
+			for generation := 0; generation < 2; generation++ {
+				ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+				verified, offeredLater := 0, 0
+				uncertainSeen := false
+				client := signedCommandClient(t, nil, func(n int) *command.Request {
+					if generation == 0 && n == 1 { return &first }
+					offeredLater++
+					return &later
+				}, func(command.Response) int { posts.Add(1); return 200 })
+				client.SetCommandSink(func(e CommandEvent) error {
+					events = append(events, e)
+					if e.Domain == DomainPoll && e.Stage == StageVerified {
+						verified++
+						// A cancels only after capture of actual uncertainty and a later
+						// verified poll; B cancels after two verified later offers.
+						if (generation == 0 && uncertainSeen && offeredLater > 0) || (generation == 1 && verified >= 2) { cancel() }
+					}
+					return nil
+				})
+				r.SetCommandSink(func(e CommandEvent) error {
+					events = append(events, e)
+					if e.Domain == DomainPending && e.Stage == StageUncertain { uncertainSeen = true }
+					return nil
+				})
+				// Synchronous Run is itself joined; only its adapter goroutine exists.
+				runErr := r.Run(ctx, client)
+				deadlineErr := ctx.Err()
+				cancel()
+				joinCtx, joinCancel := context.WithTimeout(context.Background(), 2*time.Second)
+				joinErr := r.Quiesce(joinCtx)
+				joinCancel()
+				if runErr != nil || joinErr != nil || errors.Is(deadlineErr, context.DeadlineExceeded) { t.Fatalf("bounded joined run: %v / %v / %v", runErr, joinErr, deadlineErr) }
+				if verified < 2 || offeredLater < 1 { t.Fatal("missing verified later request offers") }
+				if generation == 0 && !uncertainSeen { t.Fatal("cancelled before actual uncertain completion") }
+				deadline, _ := time.Parse(time.RFC3339Nano, first.Deadline)
+				if r.executor != executor || r.done == nil || !r.persistenceUncertain || r.pending == nil || r.cancelActive == nil || r.activeJob != first.JobID || !r.activeDeadline.Equal(deadline) || r.activeDigest != first.Capability.RequestDigest || r.activeStream || r.reportedExpiredPending { t.Fatal("handoff changed original owner or binding") }
+				if !reflect.DeepEqual(*r.pending, snapshot) || adapter.calls.Load() != 1 || posts.Load() != 0 { t.Fatal("full pending response changed, execution repeated, or result posted") }
+				if generation == 0 { savedDone = r.done } else if savedDone != r.done { t.Fatal("completion channel replaced across handoff") }
+				diskRaw, err := os.ReadFile(path)
+				if err != nil { t.Fatal(err) }
+				var disk map[string]struct { Digest string `json:"digest"`; Response command.Response `json:"response"` }
+				if err := json.Unmarshal(diskRaw, &disk); err != nil { t.Fatal(err) }
+				entry, found := disk[first.IdempotencyKey]
+				if !found || len(disk) != 1 || entry.Digest != first.Capability.RequestDigest || !reflect.DeepEqual(entry.Response, snapshot) || !reflect.DeepEqual(entry.Response, *r.pending) { t.Fatal("actual published full response missing, rolled back, or changed") }
+				if generation == 0 { diskBefore = append([]byte(nil), diskRaw...) } else if string(diskRaw) != string(diskBefore) { t.Fatal("handoff rewrote disk") }
+				leftovers, err := filepath.Glob(filepath.Join(filepath.Dir(path), ".command-replay-*"))
+				if err != nil || len(leftovers) != 0 { t.Fatalf("temporary replay leak: %v / %v", leftovers, err) }
+			}
+			entered, completed, captured, uncertain := 0, 0, 0, 0
+			for _, e := range events {
+				if e.Stage == StageReleased || e.Stage == StageACKValidated || e.Stage == StageACKInvalid || e.Stage == StageSendStarted || e.Acknowledged || e.Domain == DomainDelivery { t.Fatal("unexpected result delivery, ACK, or release") }
+				if e.Domain == DomainExecution && e.Stage == StageEntered { entered++ }
+				if e.Domain == DomainExecution && e.Stage == StageCompleted {
+					completed++
+					if e.Persistence != PersistenceUncertain || e.ErrorClass != ErrorIndeterminate || string(e.Outcome) != snapshot.Status { t.Fatal("completion classification lost") }
+				}
+				if e.Domain == DomainPending && e.Stage == StageCaptured { captured++ }
+				if e.Domain == DomainPending && e.Stage == StageUncertain { uncertain++ }
+			}
+			if entered != 1 || completed != 1 || captured != 1 || uncertain != 1 { t.Fatalf("event counts: %d %d %d %d", entered, completed, captured, uncertain) }
+		})
+	}
+}
