@@ -3,6 +3,7 @@
 package main
 
 import (
+	"bytes"
 	"encoding/json"
 	"os"
 	"path/filepath"
@@ -64,10 +65,21 @@ func diagnosticTestRoot(t *testing.T) string {
 
 func TestDiagnosticWriterWindowsTEMPReplacementAndInheritedDACL(t *testing.T) {
 	root := diagnosticTestRoot(t)
-	for _, raw := range []string{`{"generation":1}`, `{"generation":2}`} {
+	assertNoDiagnosticTemps := func() {
+		t.Helper()
+		matches, err := filepath.Glob(filepath.Join(root, ".diagnostic-*"))
+		if err != nil {
+			t.Fatal(err)
+		}
+		if len(matches) != 0 {
+			t.Fatalf("diagnostic temporary files remain: %v", matches)
+		}
+	}
+	for index, raw := range []string{`{"generation":1}`, `{"generation":2}`} {
 		if err := saveDiagnostic(root, "command-status.json", []byte(raw)); err != nil {
 			t.Fatal(err)
 		}
+		assertNoDiagnosticTemps()
 		f, err := os.Open(filepath.Join(root, "command-status.json"))
 		if err != nil {
 			t.Fatal(err)
@@ -81,8 +93,25 @@ func TestDiagnosticWriterWindowsTEMPReplacementAndInheritedDACL(t *testing.T) {
 		}
 		err = json.NewDecoder(f).Decode(&record)
 		f.Close()
-		if err != nil || record.Generation == 0 {
+		if err != nil {
 			t.Fatal("invalid replacement", err)
+		}
+		if record.Generation != index+1 {
+			t.Fatalf("replacement generation = %d, want %d", record.Generation, index+1)
+		}
+	}
+	prior, err := os.ReadFile(filepath.Join(root, "command-status.json"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	assertPriorPreserved := func() {
+		t.Helper()
+		current, err := os.ReadFile(filepath.Join(root, "command-status.json"))
+		if err != nil {
+			t.Fatal(err)
+		}
+		if !bytes.Equal(current, prior) {
+			t.Fatalf("ACL rejection changed prior command status: got %q, want %q", current, prior)
 		}
 	}
 	// Granting Everyone read access to a synthetic directory must fail closed.
@@ -90,6 +119,8 @@ func TestDiagnosticWriterWindowsTEMPReplacementAndInheritedDACL(t *testing.T) {
 	if err := saveDiagnostic(root, "command-status.json", []byte(`{}`)); err == nil {
 		t.Fatal("Everyone-readable directory accepted")
 	}
+	assertNoDiagnosticTemps()
+	assertPriorPreserved()
 	// A private leaf whose children inherit Everyone access must also fail the
 	// tempfile Check. Chmod is not an ACL repair and must not make this pass.
 	diagnosticSetTestACL(t, root, diagnosticTrustedACL(t)+"(A;OICIIO;GR;;;WD)")
@@ -99,6 +130,8 @@ func TestDiagnosticWriterWindowsTEMPReplacementAndInheritedDACL(t *testing.T) {
 	if err := saveDiagnostic(root, "inventory-status.json", []byte(`{}`)); err == nil {
 		t.Fatal("Everyone-readable inherited temporary file accepted")
 	}
+	assertNoDiagnosticTemps()
+	assertPriorPreserved()
 	if _, err := os.Stat(filepath.Join(root, "inventory-status.json")); !os.IsNotExist(err) {
 		t.Fatal("failed tempfile validation published a target", err)
 	}
