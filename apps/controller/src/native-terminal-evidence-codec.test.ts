@@ -10,6 +10,9 @@ import { encodeNativeTerminalEvidence, decodeNativeTerminalEvidence, MAX_EVIDENC
   MAX_EVIDENCE_RESPONSE_BYTES, type NativeEvidenceCodecResult } from "./native-terminal-evidence-codec.js";
 
 const TIME = "2026-11-04T16:15:43.000Z";
+const FULL_PAYLOAD_GOLDEN_BASE64 = "eyJkb21haW4iOiJsYW5tbS1uYXRpdmUtdGVybWluYWwtZXZpZGVuY2UtcGF5bG9hZC12MSIsImtpbmQiOiJhZ2VudC5jb21tYW5kLnRlcm1pbmFsLWV2aWRlbmNlIiwidmVyc2lvbiI6MSwiZGlzcG9zaXRpb24iOiJldmlkZW5jZS1vbmx5IiwidHVwbGUiOnsiZG9tYWluIjoibGFubW0tbmF0aXZlLXRlcm1pbmFsLWV2aWRlbmNlLXYxIiwiaG9zdElkIjoiaG9zdC0xIiwiam9iSWQiOiJqb2ItMSIsInJlcXVlc3RJZCI6InJlcXVlc3QtMSIsImNvbW1hbmRTZXF1ZW5jZSI6NywiaWRlbXBvdGVuY3lLZXkiOiJpZGVtLTEiLCJhdXRob3JpemF0aW9uUmVxdWVzdERpZ2VzdCI6ImQ3YzNhNGQ3NWRkM2M3N2JjN2M0YjJiMDJhOWE5NjY2MGFiYjYwY2IzOGMwYzE2MTg3ZjdmNTYzYzViN2I2OTUiLCJzdG9yZWRRdWV1ZURpZ2VzdCI6ImFiNmMyNDcwNDYzZmVmZmQ2NTQyYWEyNGY0YjdjZGNjMzk5ZDkyN2Q5MzM4MDU4Y2MyNGMwNzM2YjViMmJhZjUiLCJ0ZXJtaW5hbFN0YXRlIjoidGltZWQtb3V0IiwidGVybWluYWxSZXZpc2lvbiI6Imhpc3RvcnktMSIsInJlc3BvbnNlRGlnZXN0IjoiYmJkNTFjNmE0NDZkODZjZjZmOWQxNWI0YmY5ZGU5N2FhYWU3YmZkNWE0OTZmNDIxMmEyZmVmYzM2Y2M3ZmUxNyIsInJlc3BvbnNlQnl0ZUxlbmd0aCI6MjU0LCJldmlkZW5jZUtpbmQiOiJmYWlsZWQiLCJob2xkQ2xhc3MiOiJyZXRhaW5lZCJ9LCJyZXNwb25zZUJhc2U2NCI6ImV5SnlaWEYxWlhOMFNXUWlPaUp5WlhGMVpYTjBMVEVpTENKcWIySkpaQ0k2SW1wdllpMHhJaXdpYUc5emRFbGtJam9pYUc5emRDMHhJaXdpYzJWeGRXVnVZMlVpT2pjc0luTjBZWFIxY3lJNkltWmhhV3hsWkNJc0luQnliMmR5WlhOeklqcHVkV3hzTENKdlluTmxjblpsWkVGMElqb2lNakF5TmkweE1TMHdORlF4TmpveE5UbzBNeTR3TURCYUlpd2liMkp6WlhKMllYUnBiMjRpT25zaWRHVjRkQ0k2SXNPcEwrbWJxaUlzSW1OdmRXNTBJam94TENKdVpYTjBaV1FpT25zaVkyRnVZWEo1SWpvaVVGSkpWa0ZVUlY5RFFVNUJVbGtpZlgwc0ltVnljbTl5UTI5a1pTSTZJa0ZFUVZCVVJWSmZSa0ZKVEVWRUluMD0iLCJldmlkZW5jZVNvdXJjZSI6InN5bnRoZXRpYyJ9";
+const FULL_PAYLOAD_GOLDEN_SHA256 = "45043ea7f2b2822284acf6f00140b7e4e1c818c1d4d09ed876e861118c980e3e";
+const FULL_PAYLOAD_GOLDEN_TUPLE_DIGEST = "2b14043a942b44d41eafbb4562c94f533ef8225bdc36c3d9f56827b1f80a88d1";
 function fixture() {
   const request: CommandRequest = { requestId: "request-1", jobId: "job-1", hostId: "host-1", operation: "load",
     idempotencyKey: "idem-1", sequence: 7, deadline: TIME,
@@ -90,6 +93,10 @@ test("frozen language-neutral golden vectors bind complete bytes and explicit tu
     assert.equal(JSON.stringify(Object.values(result.payload.tuple)), vector.tupleEncoding, vector.name);
     assert.equal(result.tupleDigest, vector.tupleDigest, vector.name);
   }
+  const payloadGolden = good(encodeNativeTerminalEvidence(snapshot));
+  assert.equal(payloadGolden.payloadBase64, FULL_PAYLOAD_GOLDEN_BASE64);
+  assert.equal(payloadGolden.tupleDigest, FULL_PAYLOAD_GOLDEN_TUPLE_DIGEST);
+  assert.equal(createHash("sha256").update(Buffer.from(FULL_PAYLOAD_GOLDEN_BASE64, "base64")).digest("hex"), FULL_PAYLOAD_GOLDEN_SHA256);
 });
 
 test("every tuple field and signed payload domain kind version disposition mismatch fails closed", () => {
