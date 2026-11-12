@@ -14,7 +14,7 @@ const MAX_PAYLOAD_BYTES = 768 * 1024;
 const MAX_RESPONSE_BYTES = 512 * 1024;
 const HEX = /^[a-f0-9]{64}$/;
 const TUPLE_KEYS = ["domain", "hostId", "jobId", "requestId", "commandSequence", "idempotencyKey", "authorizationRequestDigest", "storedQueueDigest", "terminalState", "terminalRevision", "responseDigest", "responseByteLength", "evidenceKind", "holdClass"] as const;
-const CERTIFICATE_KEYS = ["certificateId", "serial", "fingerprint", "version", "candidateId", "address", "port", "protocolVersion", "caId", "caVersion", "spiffeUri"] as const;
+const CERTIFICATE_KEYS = ["certificateId", "serial", "fingerprint", "version", "candidateId", "address", "port", "protocolMajor", "protocolMinor", "notBefore", "notAfter", "caId", "caVersion", "spiffeUri"] as const;
 const VIEW_KEYS = ["tuple", "tupleDigest", "payloadBytes", "responseBytes", "certificateBindingAssertion"] as const;
 const SYNC_KEYS = ["ok", "session"] as const;
 const TYPED_ARRAY_PROTO = Object.getPrototypeOf(Uint8Array.prototype) as object;
@@ -47,7 +47,10 @@ export interface NativeEvidenceCertificateAssertion {
   readonly candidateId: string;
   readonly address: string;
   readonly port: number;
-  readonly protocolVersion: number;
+  readonly protocolMajor: number;
+  readonly protocolMinor: number;
+  readonly notBefore: string;
+  readonly notAfter: string;
   readonly caId: string;
   readonly caVersion: number;
   readonly spiffeUri: string;
@@ -159,7 +162,11 @@ function cloneCertificate(input: unknown): NativeEvidenceCertificateAssertion | 
   if (!c || ![c.certificateId, c.serial, c.candidateId, c.address, c.caId, c.spiffeUri].every(v => boundedText(v, 512)) ||
       typeof c.fingerprint !== "string" || !HEX.test(c.fingerprint) || !Number.isSafeInteger(c.version) || (c.version as number) < 1 ||
       !Number.isSafeInteger(c.port) || (c.port as number) < 1 || (c.port as number) > 65535 ||
-      !Number.isSafeInteger(c.protocolVersion) || (c.protocolVersion as number) < 1 || !Number.isSafeInteger(c.caVersion) || (c.caVersion as number) < 1) return null;
+      !canonicalTimestamp(c.notBefore) || !canonicalTimestamp(c.notAfter) ||
+      Date.parse(c.notAfter as string) <= Date.parse(c.notBefore as string) ||
+      !Number.isSafeInteger(c.protocolMajor) || (c.protocolMajor as number) < 1 ||
+      !Number.isSafeInteger(c.protocolMinor) || (c.protocolMinor as number) < 0 ||
+      !Number.isSafeInteger(c.caVersion) || (c.caVersion as number) < 1) return null;
   const result = Object.create(null) as Record<string, unknown>;
   for (const key of CERTIFICATE_KEYS) result[key] = c[key];
   return Object.freeze(result) as unknown as NativeEvidenceCertificateAssertion;
@@ -167,7 +174,9 @@ function cloneCertificate(input: unknown): NativeEvidenceCertificateAssertion | 
 function responseDigest(bytes: Uint8Array): string { return createHash("sha256").update("lanmm-native-response-bytes-v1\0", "utf8").update(bytes).digest("hex"); }
 function tupleDigest(tuple: NativeEvidenceCandidateTuple): string { return createHash("sha256").update("lanmm-native-terminal-evidence-tuple-digest-v1\0", "utf8").update(JSON.stringify(TUPLE_KEYS.map(k => tuple[k])), "utf8").digest("hex"); }
 function integrity(candidate: CapturedNativeEvidenceCandidate): string {
-  return createHash("sha256").update(JSON.stringify(TUPLE_KEYS.map(k => candidate.tuple[k]))).update(candidate.tupleDigest).update(candidate.payloadBytes).update(candidate.responseBytes).digest("hex");
+  return createHash("sha256").update(JSON.stringify(TUPLE_KEYS.map(k => candidate.tuple[k]))).update(candidate.tupleDigest)
+    .update(JSON.stringify(CERTIFICATE_KEYS.map(k => candidate.certificateBindingAssertion[k])))
+    .update(candidate.payloadBytes).update(candidate.responseBytes).digest("hex");
 }
 function guardSession(input: GuardResult, manager: SessionManager): { session: SessionMetadata; binding: Binding } | null {
   const g = record(input, SYNC_KEYS);
@@ -176,6 +185,12 @@ function guardSession(input: GuardResult, manager: SessionManager): { session: S
   const binding = manager.binding(session);
   if (!binding || !boundedText(session.ownerId, 128) || !Number.isSafeInteger(session.credentialVersion) || session.credentialVersion !== binding.credentialVersion) return null;
   return { session, binding };
+}
+function canonicalTimestamp(value: unknown): value is string {
+  // Canonical UTC millisecond instant: exact format, finite, and round-trips through Date.
+  if (typeof value !== "string" || !/^\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}\.\d{3}Z$/.test(value)) return false;
+  if (!Number.isFinite(Date.parse(value))) return false;
+  return new Date(value).toISOString() === value;
 }
 function nowMs(clock: () => string): number {
   const value = clock();

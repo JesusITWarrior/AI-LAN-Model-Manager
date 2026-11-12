@@ -11,7 +11,7 @@ import type { PasswordCryptoEngine } from "./credentials.js";
 import {
   OWNER_NATIVE_EVIDENCE_ACTION, OWNER_NATIVE_EVIDENCE_DISPOSITION,
   OWNER_NATIVE_EVIDENCE_MAX_CANDIDATES, OWNER_NATIVE_EVIDENCE_MAX_RETAINED_BYTES,
-  OwnerNativeEvidenceCandidateRegistry, type NativeEvidenceCandidateInput,
+  OwnerNativeEvidenceCandidateRegistry, type CapturedNativeEvidenceCandidate, type NativeEvidenceCandidateInput,
 } from "./owner-native-evidence-candidates.js";
 
 const START = "2026-09-27T10:00:00.000Z";
@@ -58,7 +58,8 @@ function makeCandidate(payload = new Uint8Array([80, 65, 89]), response = new Ui
   return {
     tuple, tupleDigest, payloadBytes: payload, responseBytes: response,
     certificateBindingAssertion: { certificateId: "cert-1", serial: "serial-1", fingerprint: "c".repeat(64), version: 1,
-      candidateId: "candidate-1", address: "127.0.0.1", port: 7341, protocolVersion: 1, caId: "ca-1", caVersion: 1, spiffeUri: "spiffe://lanmm/host-1" },
+      candidateId: "candidate-1", address: "127.0.0.1", port: 7341, protocolMajor: 1, protocolMinor: 0, notBefore: "2026-09-27T09:00:00.000Z",
+      notAfter: "2026-09-27T11:00:00.000Z", caId: "ca-1", caVersion: 1, spiffeUri: "spiffe://lanmm/host-1" },
   };
 }
 function makeRegistry(manager: SessionManager, prepare: () => unknown, consume: (candidate: unknown) => unknown = () => undefined, id = (() => { let n = 0; return () => `candidate-${++n}`; })(), clock: () => string = () => START) {
@@ -539,5 +540,114 @@ test("leased candidates count against capacity until release", async () => {
     assert.equal(registry.consume(guard, requests[0]!).ok, true);
     assert.equal(registry.size, OWNER_NATIVE_EVIDENCE_MAX_CANDIDATES - 1);
     assert.equal(registry.prepare(guard).ok, true);
+  } finally { db.close(); }
+});
+
+const certificateKeys = ["certificateId", "serial", "fingerprint", "version", "candidateId", "address", "port", "protocolMajor", "protocolMinor", "notBefore", "notAfter", "caId", "caVersion", "spiffeUri"] as const;
+const baseCertificate = (): Record<string, unknown> => ({
+  certificateId: "cert-1", serial: "serial-1", fingerprint: "c".repeat(64), version: 1, candidateId: "candidate-1",
+  address: "127.0.0.1", port: 7341, protocolMajor: 1, protocolMinor: 0, notBefore: "2026-09-27T09:00:00.000Z",
+  notAfter: "2026-09-27T11:00:00.000Z", caId: "ca-1", caVersion: 1, spiffeUri: "spiffe://lanmm/host-1" });
+function inputWithCertificate(certificate: unknown): NativeEvidenceCandidateInput {
+  return { ...makeCandidate(), certificateBindingAssertion: certificate as NativeEvidenceCandidateInput["certificateBindingAssertion"] };
+}
+function mutateCertificate(base: Record<string, unknown>, patch: Partial<Record<string, unknown>>): NativeEvidenceCandidateInput {
+  return inputWithCertificate({ ...base, ...patch });
+}
+test("prepare captures the complete canonical assertion while preserving summary redaction", async () => {
+  const { db, manager } = await setup();
+  try {
+    const session = await newSession(manager), guard = post(manager, session);
+    let delivered: CapturedNativeEvidenceCandidate | undefined;
+    const registry = makeRegistry(manager, makeCandidate, candidate => { delivered = candidate as CapturedNativeEvidenceCandidate; });
+    const prepared = registry.prepare(guard);
+    assert.equal(prepared.ok, true);
+    if (!prepared.ok) return;
+    const summaryCert = prepared.summary.certificateAssertion;
+    assert.deepEqual(Object.keys(summaryCert).sort(), ["caId", "caVersion", "candidateId", "certificateId", "fingerprint", "serial", "version"]);
+    const request = { handle: prepared.handle, action: OWNER_NATIVE_EVIDENCE_ACTION, disposition: OWNER_NATIVE_EVIDENCE_DISPOSITION };
+    assert.equal(registry.consume(guard, request).ok, true);
+    assert.ok(delivered);
+    const cert = delivered.certificateBindingAssertion;
+    assert.deepEqual(Object.keys(cert), [...certificateKeys]);
+    assert.equal(cert.protocolMajor, 1);
+    assert.equal(cert.protocolMinor, 0);
+    assert.equal(cert.notBefore, "2026-09-27T09:00:00.000Z");
+    assert.equal(cert.notAfter, "2026-09-27T11:00:00.000Z");
+    assert.ok(Object.isFrozen(cert));
+    assert.ok(!("protocolVersion" in cert));
+    const snapshot = JSON.stringify(prepared.summary);
+    assert.equal(snapshot.includes("806579"), false);
+  } finally { db.close(); }
+});
+test("certificate capture is detached from source mutation and includes immutable fields in stored integrity", async () => {
+  const { db, manager } = await setup();
+  try {
+    const session = await newSession(manager), guard = post(manager, session), source = baseCertificate();
+    let delivered: CapturedNativeEvidenceCandidate | undefined;
+    const registry = makeRegistry(manager, () => inputWithCertificate(source), candidate => { delivered = candidate as CapturedNativeEvidenceCandidate; });
+    const prepared = registry.prepare(guard);
+    assert.equal(prepared.ok, true);
+    if (!prepared.ok) return;
+    source.protocolMajor = 9; source.protocolMinor = 5; source.notBefore = "2026-09-27T08:00:00.000Z";
+    source.notAfter = "2026-09-27T12:00:00.000Z"; source.certificateId = "mutated";
+    assert.equal(registry.inspect(guard, prepared.handle).ok, true);
+    assert.equal(registry.consume(guard, { handle: prepared.handle, action: OWNER_NATIVE_EVIDENCE_ACTION, disposition: OWNER_NATIVE_EVIDENCE_DISPOSITION }).ok, true);
+    assert.ok(delivered);
+    assert.equal(delivered.certificateBindingAssertion.protocolMajor, 1);
+    assert.equal(delivered.certificateBindingAssertion.protocolMinor, 0);
+    assert.equal(delivered.certificateBindingAssertion.notBefore, "2026-09-27T09:00:00.000Z");
+    assert.equal(delivered.certificateBindingAssertion.notAfter, "2026-09-27T11:00:00.000Z");
+    assert.equal(delivered.certificateBindingAssertion.certificateId, "cert-1");
+  } finally { db.close(); }
+});
+test("legacy singular protocolVersion, missing/extra/symbol/accessor/proxy certificate shapes fail closed", async () => {
+  const { db, manager } = await setup();
+  try {
+    const session = await newSession(manager), guard = post(manager, session);
+    const attempt = (certificate: unknown) => makeRegistry(manager, () => inputWithCertificate(certificate)).prepare(guard).ok;
+    const legacy = baseCertificate(); delete legacy.protocolMajor; delete legacy.protocolMinor; legacy.protocolVersion = 1;
+    assert.equal(attempt(legacy), false);
+    const missing = baseCertificate(); delete missing.protocolMinor; assert.equal(attempt(missing), false);
+    const missingDate = baseCertificate(); delete missingDate.notAfter; assert.equal(attempt(missingDate), false);
+    const extra = { ...baseCertificate(), extra: true }; assert.equal(attempt(extra), false);
+    const withSymbol = baseCertificate(); (withSymbol as Record<symbol, unknown>)[Symbol("extra")] = 1; assert.equal(attempt(withSymbol), false);
+    let invoked = false;
+    const withGetter = baseCertificate(); Object.defineProperty(withGetter, "protocolMajor", { enumerable: true, get() { invoked = true; return 1; } });
+    assert.equal(attempt(withGetter), false); assert.equal(invoked, false);
+    assert.equal(attempt(new Proxy(baseCertificate(), {})), false);
+  } finally { db.close(); }
+});
+test("protocol versions require safe integer major >= 1 and minor >= 0", async () => {
+  const { db, manager } = await setup();
+  try {
+    const session = await newSession(manager), guard = post(manager, session);
+    const attempt = (patch: Partial<Record<string, unknown>>) => makeRegistry(manager, () => mutateCertificate(baseCertificate(), patch)).prepare(guard).ok;
+    for (const major of [0, -1, 1.5, Number.NaN, Number.POSITIVE_INFINITY, Number.MAX_SAFE_INTEGER + 1]) assert.equal(attempt({ protocolMajor: major }), false);
+    for (const minor of [-1, 0.5, Number.NaN, Number.POSITIVE_INFINITY, Number.MAX_SAFE_INTEGER + 1]) assert.equal(attempt({ protocolMinor: minor }), false);
+    for (const caVersion of [0, -1, 1.5, Number.MAX_SAFE_INTEGER + 1]) assert.equal(attempt({ caVersion }), false);
+    assert.equal(attempt({ protocolMajor: 1, protocolMinor: 0 }), true);
+    assert.equal(attempt({ protocolMajor: Number.MAX_SAFE_INTEGER, protocolMinor: Number.MAX_SAFE_INTEGER }), true);
+  } finally { db.close(); }
+});
+test("certificate validity timestamps must be real canonical UTC milliseconds", async () => {
+  const { db, manager } = await setup();
+  try {
+    const session = await newSession(manager), guard = post(manager, session);
+    const attempt = (patch: Partial<Record<string, unknown>>) => makeRegistry(manager, () => mutateCertificate(baseCertificate(), patch)).prepare(guard).ok;
+    for (const value of ["2026-02-30T00:00:00.000Z", "2026-13-01T00:00:00.000Z", "2026-09-27T25:00:00.000Z", "2026-09-27T09:00:00Z", "2026-09-27T09:00:00+00:00", "not-a-date"]) {
+      assert.equal(attempt({ notBefore: value }), false, value);
+    }
+    assert.equal(attempt({ notBefore: "2026-09-27T09:00:00.001Z" }), true);
+  } finally { db.close(); }
+});
+test("certificate validity interval rejects equal and reversed bounds", async () => {
+  const { db, manager } = await setup();
+  try {
+    const session = await newSession(manager), guard = post(manager, session);
+    const attempt = (patch: Partial<Record<string, unknown>>) => makeRegistry(manager, () => mutateCertificate(baseCertificate(), patch)).prepare(guard).ok;
+    assert.equal(attempt({ notAfter: "2026-09-27T09:00:00.000Z" }), false);
+    assert.equal(attempt({ notAfter: "2026-09-27T08:59:59.999Z" }), false);
+    assert.equal(attempt({ notBefore: "2026-09-27T09:00:00.001Z", notAfter: "2026-09-27T09:00:00.002Z" }), true);
   } finally { db.close(); }
 });
