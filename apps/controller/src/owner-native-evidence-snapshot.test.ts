@@ -21,6 +21,8 @@ import { OwnerNativeEvidenceMatchedAppendCoordinator, OwnerNativeEvidenceSnapsho
 import { SessionManager } from "./session-manager.js";
 import { guardManagementRequest } from "./guard.js";
 import { computeTerminalRevision } from "./native-terminal-revision.js";
+import { buildOwnerNativeEvidenceSnapshot } from "./owner-native-evidence-snapshot.js";
+import { encodeNativeTerminalEvidence } from "./native-terminal-evidence-codec.js";
 
 const START = "2026-09-27T10:00:00.000Z";
 const ORIGINS = createAllowedOrigins(["https://manager.example"]);
@@ -1457,4 +1459,113 @@ test("owner-confirm same-tuple retry from another fresh session conflicts and pr
     assert.deepEqual(f.db.prepare("SELECT * FROM supplemental_native_evidence").get(), original);
     assert.equal(evidenceCount(f), 1); assert.equal(auditCount(f), beforeAudit + 1);
   } finally { f.db.close(); rmSync(f.root, { recursive: true, force: true }); }
+});
+
+test("shared current-snapshot builder matches candidate comparison and performs no writes", async () => {
+  const f = await fixture();
+  try {
+    const before = readOnlyDatabaseSnapshot(f.db);
+    const builtHolder: { value: ReturnType<typeof buildOwnerNativeEvidenceSnapshot> } = { value: null };
+    f.stores.withAuditTransaction(tx => { builtHolder.value = buildOwnerNativeEvidenceSnapshot(f.db, tx, f.tuple.jobId, f.responseBytes, "synthetic", f.now); });
+    const built = builtHolder.value;
+    assert.ok(built);
+    assert.deepEqual(built.tuple, f.tuple);
+    assert.deepEqual(readOnlyDatabaseSnapshot(f.db), before, "projection is read-only");
+    const encoded = encodeNativeTerminalEvidence(built.snapshot);
+    assert.ok(encoded.ok);
+    assert.equal(encoded.tupleDigest, built.tupleDigest);
+    f.setCandidate({ ...makeInput(built.tuple as unknown as Record<string, unknown>, f.responseBytes,
+      f.certificates.getById("c".repeat(64))), payloadBytes: Buffer.from(encoded.payloadBase64, "base64") });
+    withClaim(f, token => {
+      let result: ReturnType<typeof f.reader.read> | undefined;
+      f.stores.withAuditTransaction(tx => { result = f.reader.read(f.guard, tx, token); });
+      assert.deepEqual(result, { ok: true, match: true });
+    });
+    assert.deepEqual(readOnlyDatabaseSnapshot(f.db), before, "builder and comparator append or mutate nothing");
+  } finally { f.db.close(); }
+});
+
+test("shared builder and existing comparison reject the same stale latest-history authority", async () => {
+  const f = await fixture();
+  try {
+    f.db.prepare("UPDATE job_history SET occurred_at=? WHERE job_id=?").run("2026-09-27T10:00:04.000Z", f.tuple.jobId);
+    const builtHolder: { value: ReturnType<typeof buildOwnerNativeEvidenceSnapshot> } = { value: null };
+    f.stores.withAuditTransaction(tx => { builtHolder.value = buildOwnerNativeEvidenceSnapshot(f.db, tx, f.tuple.jobId, f.responseBytes, "synthetic", f.now); });
+    const built = builtHolder.value;
+    assert.equal(built, null);
+    withClaim(f, token => {
+      let result: ReturnType<typeof f.reader.read> | undefined;
+      f.stores.withAuditTransaction(tx => { result = f.reader.read(f.guard, tx, token); });
+      assert.deepEqual(result, { ok: true, match: false });
+    });
+  } finally { f.db.close(); }
+});
+
+test("shared builder and comparator close over request, job, history, queue, CA, certificate, and expiry drift", async t => {
+  const cases: Array<{ name: string; mutate: (f: Awaited<ReturnType<typeof fixture>>) => void; builder: "reject" | "fresh" }> = [
+    { name: "request digest", mutate: f => { f.db.prepare("UPDATE agent_commands SET request_digest=? WHERE job_id=?").run("0".repeat(64), f.tuple.jobId); }, builder: "reject" },
+    { name: "job state", mutate: f => { f.db.prepare("UPDATE jobs SET state='running' WHERE job_id=?").run(f.tuple.jobId); }, builder: "reject" },
+    { name: "missing latest history", mutate: f => { f.db.prepare("DELETE FROM job_history WHERE job_id=?").run(f.tuple.jobId); }, builder: "reject" },
+    { name: "queue state/result contradiction", mutate: f => { f.db.prepare("UPDATE agent_commands SET state='queued' WHERE job_id=?").run(f.tuple.jobId); }, builder: "reject" },
+    { name: "CA version mismatch", mutate: f => { f.db.prepare("UPDATE certificate_authorities SET ca_version=ca_version+1 WHERE ca_id=?").run("b".repeat(64)); }, builder: "reject" },
+    { name: "revoked host certificate", mutate: f => { f.db.prepare("UPDATE host_certificates SET status='revoked',revoked_at=? WHERE candidate_id=?").run(f.now, f.tuple.hostId); }, builder: "reject" },
+    { name: "fresh host-certificate version", mutate: f => { f.db.prepare("UPDATE host_certificates SET version=version+1 WHERE candidate_id=?").run(f.tuple.hostId); }, builder: "fresh" },
+  ];
+  for (const item of cases) await t.test(item.name, async () => {
+    const f = await fixture();
+    try {
+      item.mutate(f);
+      const before = readOnlyDatabaseSnapshot(f.db);
+      const builtHolder: { value: ReturnType<typeof buildOwnerNativeEvidenceSnapshot> } = { value: null };
+      f.stores.withAuditTransaction(tx => { builtHolder.value = buildOwnerNativeEvidenceSnapshot(f.db, tx, f.tuple.jobId, f.responseBytes, "synthetic", f.now); });
+      const built = builtHolder.value;
+      if (item.builder === "reject") assert.equal(built, null);
+      else { assert.ok(built); assert.equal(built.certificateBindingAssertion.version, 2, "builder returns only the new server-current certificate facts"); }
+      assert.equal(readOnlyDatabaseSnapshot(f.db), before, "failed or fresh builder projection is read-only");
+      withClaim(f, token => {
+        let comparison: ReturnType<typeof f.reader.read> | undefined;
+        f.stores.withAuditTransaction(tx => { comparison = f.reader.read(f.guard, tx, token); });
+        assert.deepEqual(comparison, { ok: true, match: false }, "original candidate never previews against changed server authority");
+      });
+      assert.equal(readOnlyDatabaseSnapshot(f.db), before, "comparator is read-only");
+    } finally { f.db.close(); }
+  });
+});
+
+test("shared builder rejects hostile, detached, malformed, oversized response bytes without caller mutation", async () => {
+  const f = await fixture();
+  try {
+    const before = readOnlyDatabaseSnapshot(f.db), original = f.responseBytes.slice(); let invoked = 0;
+    const accessor = Buffer.from(f.responseBytes);
+    Object.defineProperty(accessor, "buffer", { get() { invoked++; throw new Error("buffer accessor canary"); } });
+    class HostileResponse extends Uint8Array { override get byteLength(): number { invoked++; throw new Error("subclass accessor canary"); } }
+    const subclass = new HostileResponse(f.responseBytes);
+    const shared = new Uint8Array(new SharedArrayBuffer(f.responseBytes.length)); shared.set(f.responseBytes);
+    const detached = Uint8Array.from(f.responseBytes); structuredClone(detached.buffer, { transfer: [detached.buffer] });
+    const hostile = new Proxy(f.responseBytes, { get() { invoked++; throw new Error("proxy canary"); } });
+    const malformed = new Uint8Array([0xff, 0xfe]), oversized = new Uint8Array(512 * 1024 + 1);
+    const build = (bytes: Uint8Array) => {
+      let result: ReturnType<typeof buildOwnerNativeEvidenceSnapshot> = null;
+      f.stores.withAuditTransaction(tx => { result = buildOwnerNativeEvidenceSnapshot(f.db, tx, f.tuple.jobId, bytes, "synthetic", f.now); });
+      assert.equal(result, null);
+    };
+    build(accessor); build(subclass); build(shared); build(detached); build(hostile); build(malformed); build(oversized);
+    assert.equal(invoked, 0, "hostile property accessors and proxy traps are not invoked");
+    assert.deepEqual(f.responseBytes, original, "caller-owned bytes remain unchanged");
+    assert.equal(readOnlyDatabaseSnapshot(f.db), before, "rejected byte views cause no database side effects");
+  } finally { f.db.close(); }
+});
+
+test("shared builder uses caller-sampled canonical time to reject expired host and CA certificates", async t => {
+  for (const now of ["not-a-time", "2036-01-01T00:00:00.000Z"] as const) await t.test(now, async () => {
+    const f = await fixture();
+    try {
+      const before = readOnlyDatabaseSnapshot(f.db), caller = f.responseBytes.slice();
+      let result: ReturnType<typeof buildOwnerNativeEvidenceSnapshot> = null;
+      f.stores.withAuditTransaction(tx => { result = buildOwnerNativeEvidenceSnapshot(f.db, tx, f.tuple.jobId, f.responseBytes, "synthetic", now); });
+      assert.equal(result, null);
+      assert.deepEqual(f.responseBytes, caller);
+      assert.equal(readOnlyDatabaseSnapshot(f.db), before);
+    } finally { f.db.close(); }
+  });
 });

@@ -27,6 +27,23 @@ const terminal = new Set(["succeeded", "failed", "timed-out", "cancelled"]);
 const evidenceTerminal = new Set(["succeeded", "failed", "cancelled"]);
 type Row = Record<string, unknown>;
 const EXPECTED_TUPLE_DOMAIN = "lanmm-native-terminal-evidence-v1";
+const TYPED_ARRAY_PROTO = Object.getPrototypeOf(Uint8Array.prototype) as object;
+const byteSlot = (key: string) => Object.getOwnPropertyDescriptor(TYPED_ARRAY_PROTO, key)?.get;
+function ownedBytes(input: unknown, cap: number): Uint8Array | null {
+  try {
+    if (types.isProxy(input) || !types.isUint8Array(input)) return null;
+    const prototype = Object.getPrototypeOf(input);
+    if (prototype !== Uint8Array.prototype && prototype !== Buffer.prototype) return null;
+    if (["buffer", "byteLength", "byteOffset", Symbol.iterator].some(key => Object.getOwnPropertyDescriptor(input, key) !== undefined)) return null;
+    const backing = byteSlot("buffer")!.call(input) as ArrayBuffer;
+    const length = byteSlot("byteLength")!.call(input) as number;
+    const offset = byteSlot("byteOffset")!.call(input) as number;
+    if (!types.isArrayBuffer(backing) || !Number.isSafeInteger(length) || length < 1 || length > cap || !Number.isSafeInteger(offset)) return null;
+    const copy = new Uint8Array(length);
+    Uint8Array.prototype.set.call(copy, new Uint8Array(backing, offset, length));
+    return copy;
+  } catch { return null; }
+}
 function strictWireJson(bytes: Uint8Array, max: number): unknown {
   const value = parseStreamWireJSON(bytes, max);
   const safe = (item: unknown): boolean => {
@@ -188,73 +205,82 @@ function verifyCurrentTrust(db: DatabaseSync, view: SnapshotComparisonView, now:
 type SnapshotComparisonView = Readonly<{
   tuple: import("./owner-native-evidence-candidates.js").NativeEvidenceCandidateTuple;
   responseBytes: Uint8Array;
+  payloadBytes: Uint8Array;
   certificateBindingAssertion: import("./owner-native-evidence-candidates.js").NativeEvidenceCertificateAssertion;
   serverBinding: Readonly<{ ownerId: string; sessionId: string; credentialVersion: number; expiresAt: string }>;
 }>;
-function compareCurrentSnapshot(db: DatabaseSync, tx: unknown, view: SnapshotComparisonView, now: string): "match" | "mismatch" {
+export type OwnerNativeEvidenceBuiltSnapshot = Readonly<{
+  snapshot: Readonly<Record<string, unknown>>;
+  responseBytes: Uint8Array;
+  tuple: import("./owner-native-evidence-candidates.js").NativeEvidenceCandidateTuple;
+  tupleDigest: string;
+  certificateBindingAssertion: import("./owner-native-evidence-candidates.js").NativeEvidenceCertificateAssertion;
+}>;
+
+/**
+ * One server-derived authority projection shared by owner intake and later
+ * confirmation comparison. The selector and response are untrusted selectors/data;
+ * all job, history, queue, revision and certificate facts come from SQLite.
+ */
+export function buildOwnerNativeEvidenceSnapshot(
+  db: DatabaseSync, tx: unknown, jobSelector: unknown, responseBytes: Uint8Array,
+  evidenceSource: unknown, now: string,
+): OwnerNativeEvidenceBuiltSnapshot | null {
+  let responseCopy: Uint8Array | null = null, keepResponse = false;
   try {
-    const tuple = view.tuple;
-    if (tuple.domain !== EXPECTED_TUPLE_DOMAIN) return "mismatch";
-    // Evaluate injected code before selecting any authoritative row. A clock
-    // callback may reenter this connection; its changes must be in the snapshot.
-    if (!canonicalTime(now) || !isActiveCoupledContext(tx, db)) return "mismatch";
-    const jobs = all(db, "SELECT job_id,state,host_id,submitted_at,updated_at,attempt,idempotency_key,payload_json FROM jobs WHERE job_id=? LIMIT 2", tuple.jobId);
-    if (jobs.length !== 1) return "mismatch";
+    if (!isActiveCoupledContext(tx, db) || !canonicalTime(now) || typeof jobSelector !== "string" ||
+        !/^[A-Za-z0-9][A-Za-z0-9._:-]{0,127}$/.test(jobSelector) ||
+        !["retained_same_process", "explicit_snapshot", "synthetic"].includes(evidenceSource as string)) return null;
+    responseCopy = ownedBytes(responseBytes, MAX_RESPONSE_BYTES);
+    if (!responseCopy) return null;
+    const jobs = all(db, "SELECT job_id,state,host_id,submitted_at,updated_at,attempt,idempotency_key,payload_json FROM jobs WHERE job_id=? LIMIT 2", jobSelector);
+    if (jobs.length !== 1) return null;
     const j = jobs[0]!;
-    if (typeof j.payload_json !== "string" || Buffer.byteLength(j.payload_json, "utf8") > MAX_JOB_JSON) return "mismatch";
+    if (typeof j.payload_json !== "string" || Buffer.byteLength(j.payload_json, "utf8") > MAX_JOB_JSON) return null;
     const parsedJob = parseJobSnapshot(strictWireJson(Buffer.from(j.payload_json, "utf8"), MAX_JOB_JSON));
-    if (!parsedJob.ok) return "mismatch";
+    if (!parsedJob.ok) return null;
     const job = parsedJob.value, op = job.operation;
     if (op.jobId !== j.job_id || op.hostId !== j.host_id || op.submittedAt !== j.submitted_at || op.idempotencyKey !== j.idempotency_key ||
-        job.state !== j.state || job.updatedAt !== j.updated_at || job.attempt !== Number(j.attempt) || !terminal.has(job.state) ||
-        job.state !== tuple.terminalState || op.requestId !== tuple.requestId || op.hostId !== tuple.hostId) return "mismatch";
+        job.state !== j.state || job.updatedAt !== j.updated_at || job.attempt !== Number(j.attempt) || !terminal.has(job.state) || op.jobId !== jobSelector) return null;
 
     const histories = all(db, "SELECT history_id,job_id,from_state,to_state,attempt,occurred_at,created_at FROM job_history WHERE job_id=? ORDER BY history_id DESC LIMIT 1", j.job_id);
-    if (histories.length !== 1) return "mismatch";
+    if (histories.length !== 1) return null;
     const h = histories[0]!;
     if (!Number.isSafeInteger(h.history_id) || Number(h.history_id) < 1 || h.job_id !== j.job_id || h.to_state !== j.state ||
         Number(h.attempt) !== job.attempt || h.occurred_at !== j.updated_at || typeof h.from_state !== "string" ||
-        typeof h.occurred_at !== "string" || typeof h.created_at !== "string") return "mismatch";
+        typeof h.occurred_at !== "string" || typeof h.created_at !== "string") return null;
 
     const queues = all(db, "SELECT job_id,host_id,request_json,request_digest,state,lease_until,result_json FROM agent_commands WHERE job_id=? AND host_id=? LIMIT 2", j.job_id, j.host_id);
-    if (queues.length !== 1) return "mismatch";
+    if (queues.length !== 1) return null;
     const q = queues[0]!;
-    if (typeof q.request_json !== "string" || Buffer.byteLength(q.request_json, "utf8") > MAX_COMMAND_JSON || typeof q.request_digest !== "string") return "mismatch";
-    const requestRaw = strictWireJson(Buffer.from(q.request_json, "utf8"), MAX_COMMAND_JSON);
-    const parsedRequest = parseCommandRequest(requestRaw);
-    if (!parsedRequest.ok) return "mismatch";
+    if (typeof q.request_json !== "string" || Buffer.byteLength(q.request_json, "utf8") > MAX_COMMAND_JSON || typeof q.request_digest !== "string") return null;
+    const parsedRequest = parseCommandRequest(strictWireJson(Buffer.from(q.request_json, "utf8"), MAX_COMMAND_JSON));
+    if (!parsedRequest.ok) return null;
     const request = parsedRequest.value;
     const storedDigest = digest(Buffer.from(JSON.stringify(request), "utf8"));
     const authorizationDigest = commandAuthorizationDigest(request);
     if (q.job_id !== j.job_id || q.host_id !== j.host_id || request.jobId !== j.job_id || request.hostId !== j.host_id ||
-        request.requestId !== tuple.requestId || request.idempotencyKey !== tuple.idempotencyKey || request.sequence !== tuple.commandSequence ||
-        request.capability.requestDigest !== authorizationDigest || q.request_digest !== storedDigest ||
-        storedDigest !== tuple.storedQueueDigest || authorizationDigest !== tuple.authorizationRequestDigest) return "mismatch";
+        request.requestId !== op.requestId || request.idempotencyKey !== op.idempotencyKey || request.sequence < 1 ||
+        request.capability.requestDigest !== authorizationDigest || q.request_digest !== storedDigest) return null;
     const expectedAction = ["probe", "inventory", "estimate", "inference.chat"].includes(request.operation) ? "load" : request.operation;
-    if (op.action !== expectedAction) return "mismatch";
-
-    if (!(q.state === "queued" || q.state === "leased" || q.state === "completed" || q.state === "cancelled" || q.state === "expired")) return "mismatch";
-    if (q.state === "leased") {
-      const leaseUntil = parseUtcTimestamp(q.lease_until);
-      if (!leaseUntil.ok) return "mismatch";
-    } else if (q.lease_until !== null) return "mismatch";
-    let storedResult: ReturnType<typeof parseCommandResponse> extends { ok: true; value: infer T } ? T | null : never = null as never;
+    if (op.action !== expectedAction) return null;
+    if (!(q.state === "queued" || q.state === "leased" || q.state === "completed" || q.state === "cancelled" || q.state === "expired")) return null;
+    if (q.state === "leased") { if (!parseUtcTimestamp(q.lease_until).ok) return null; }
+    else if (q.lease_until !== null) return null;
+    let storedResult: unknown = null;
     if (q.result_json !== null) {
-      if (typeof q.result_json !== "string" || Buffer.byteLength(q.result_json, "utf8") > MAX_RESPONSE_BYTES) return "mismatch";
+      if (typeof q.result_json !== "string" || Buffer.byteLength(q.result_json, "utf8") > MAX_RESPONSE_BYTES) return null;
       const parsed = parseCommandResponse(strictWireJson(Buffer.from(q.result_json, "utf8"), MAX_RESPONSE_BYTES));
-      if (!parsed.ok || !responseMatches(request, parsed.value) || !canonicalTime(parsed.value.observedAt)) return "mismatch";
-      storedResult = parsed.value as never;
+      if (!parsed.ok || !responseMatches(request, parsed.value) || !canonicalTime(parsed.value.observedAt)) return null;
+      storedResult = parsed.value;
       const intermediate = parsed.value.status === "accepted" || parsed.value.status === "running";
       const storedTerminal = evidenceTerminal.has(parsed.value.status);
-      if ((q.state === "completed") !== storedTerminal || (q.state !== "completed" && !intermediate)) return "mismatch";
-    } else if (q.state === "completed") return "mismatch";
+      if ((q.state === "completed") !== storedTerminal || (q.state !== "completed" && !intermediate)) return null;
+    } else if (q.state === "completed") return null;
 
-    const response = parseCommandResponse(strictWireJson(view.responseBytes, MAX_RESPONSE_BYTES));
-    if (!response.ok || !responseMatches(request, response.value) || !canonicalTime(response.value.observedAt) || !evidenceTerminal.has(response.value.status) ||
-        view.responseBytes.byteLength !== tuple.responseByteLength ||
-        createHash("sha256").update(responseDomain).update(view.responseBytes).digest("hex") !== tuple.responseDigest ||
-        tuple.evidenceKind !== response.value.status) return "mismatch";
-    if (q.state === "completed" && !sameJson(storedResult, response.value)) return "mismatch";
+    const response = parseCommandResponse(strictWireJson(responseCopy, MAX_RESPONSE_BYTES));
+    if (!response.ok || !responseMatches(request, response.value) || !canonicalTime(response.value.observedAt) || !evidenceTerminal.has(response.value.status)) return null;
+    if (q.state === "completed" && !sameJson(storedResult, response.value)) return null;
 
     const revision = computeTerminalRevision({
       job: { jobId: String(j.job_id), requestId: op.requestId, state: job.state as "succeeded" | "failed" | "timed-out" | "cancelled",
@@ -265,31 +291,72 @@ function compareCurrentSnapshot(db: DatabaseSync, tx: unknown, view: SnapshotCom
         idempotencyKey: request.idempotencyKey, sequence: request.sequence, deadline: request.deadline,
         storedQueueDigest: storedDigest, authorizationDigest },
     });
-    if (!revision.ok || revision.revision !== tuple.terminalRevision || revision.state !== tuple.terminalState) return "mismatch";
+    if (!revision.ok || revision.state !== job.state) return null;
 
     const certRows = all(db, "SELECT cert_id,serial,fingerprint,candidate_id,binding_address,binding_port,protocol_major,protocol_minor,spiffe_uri,certificate,not_before,not_after,ca_id,ca_version,challenge_id,transcript_digest,status,version,issued_at,revoked_at FROM host_certificates WHERE candidate_id=? AND status='active' AND revoked_at IS NULL LIMIT 2", j.host_id);
-    if (certRows.length !== 1) return "mismatch";
+    if (certRows.length !== 1) return null;
     const c = certRows[0]!;
     const host = parseHostCertificateMetadata({ certificateId: c.cert_id, serial: c.serial, fingerprint: c.fingerprint, certificatePem: c.certificate,
       caId: c.ca_id, caVersion: Number(c.ca_version), binding: { candidateId: c.candidate_id, address: c.binding_address, port: Number(c.binding_port), protocolMajor: Number(c.protocol_major), protocolMinor: Number(c.protocol_minor) },
       spiffeUri: c.spiffe_uri, challengeId: c.challenge_id, transcriptDigest: c.transcript_digest, notBefore: c.not_before, notAfter: c.not_after,
       status: c.status, version: Number(c.version), issuedAt: c.issued_at, revokedAt: c.revoked_at });
-    if (!host.ok) return "mismatch";
-    const a = view.certificateBindingAssertion, m = host.value;
-    if (m.certificateId !== a.certificateId || !canonicalCertificateSerial(m.serial) || canonicalCertificateSerial(m.serial) !== canonicalCertificateSerial(a.serial) ||
-        m.fingerprint !== a.fingerprint || m.version !== a.version || m.binding.candidateId !== a.candidateId || m.binding.address !== a.address ||
-        m.binding.port !== a.port || m.binding.protocolMajor !== a.protocolMajor || m.binding.protocolMinor !== a.protocolMinor ||
-        m.notBefore !== a.notBefore || m.notAfter !== a.notAfter || m.caId !== a.caId || m.caVersion !== a.caVersion || m.spiffeUri !== a.spiffeUri) return "mismatch";
-    if (Date.parse(m.notBefore) > Date.parse(now) || Date.parse(m.notAfter) <= Date.parse(now)) return "mismatch";
+    if (!host.ok || Date.parse(host.value.notBefore) > Date.parse(now) || Date.parse(host.value.notAfter) <= Date.parse(now)) return null;
     const caRows = all(db, "SELECT ca_id,ca_version,serial,fingerprint,subject,certificate,not_before,not_after,created_at FROM certificate_authorities WHERE ca_id=? LIMIT 2", c.ca_id);
-    if (caRows.length !== 1) return "mismatch";
+    if (caRows.length !== 1) return null;
     const caRow = caRows[0]!;
     const ca = parseCertificateAuthorityMetadata({ caId: caRow.ca_id, version: Number(caRow.ca_version), serial: caRow.serial,
       fingerprint: caRow.fingerprint, certificatePem: caRow.certificate, notBefore: caRow.not_before, notAfter: caRow.not_after, createdAt: caRow.created_at });
     if (!ca.ok || ca.value.caId !== c.ca_id || ca.value.version !== Number(c.ca_version) ||
-        Date.parse(ca.value.notBefore) > Date.parse(now) || Date.parse(ca.value.notAfter) <= Date.parse(now)) return "mismatch";
+        Date.parse(ca.value.notBefore) > Date.parse(now) || Date.parse(ca.value.notAfter) <= Date.parse(now)) return null;
+    const m = host.value;
+    const certificateBindingAssertion = Object.freeze({ certificateId: m.certificateId, serial: m.serial, fingerprint: m.fingerprint, version: m.version,
+      candidateId: m.binding.candidateId, address: m.binding.address, port: m.binding.port, protocolMajor: m.binding.protocolMajor,
+      protocolMinor: m.binding.protocolMinor, notBefore: m.notBefore, notAfter: m.notAfter, caId: m.caId, caVersion: m.caVersion, spiffeUri: m.spiffeUri });
+    const snapshot = Object.freeze({ storedRequest: request, storedQueueDigest: storedDigest,
+      terminal: Object.freeze({ hostId: request.hostId, jobId: request.jobId, requestId: request.requestId, state: revision.state,
+        revision: revision.revision, occurredAt: h.occurred_at }),
+      native: Object.freeze({ kind: "response", responseBytes: responseCopy, authorizationDigest, source: evidenceSource }),
+      runnerHold: "unknown", currentTrust: Object.freeze({ provenance: "unavailable", hostId: null, bindingRevision: null }) });
+    const tuple: import("./owner-native-evidence-candidates.js").NativeEvidenceCandidateTuple = Object.freeze({
+      domain: EXPECTED_TUPLE_DOMAIN, hostId: request.hostId, jobId: request.jobId, requestId: request.requestId,
+      commandSequence: request.sequence, idempotencyKey: request.idempotencyKey, authorizationRequestDigest: authorizationDigest,
+      storedQueueDigest: storedDigest, terminalState: revision.state, terminalRevision: revision.revision,
+      responseDigest: createHash("sha256").update(responseDomain).update(responseCopy).digest("hex"),
+      responseByteLength: responseCopy.byteLength, evidenceKind: response.value.status as "succeeded" | "failed" | "cancelled", holdClass: "unknown",
+    });
+    const tupleKeys = ["domain", "hostId", "jobId", "requestId", "commandSequence", "idempotencyKey", "authorizationRequestDigest", "storedQueueDigest", "terminalState", "terminalRevision", "responseDigest", "responseByteLength", "evidenceKind", "holdClass"] as const;
+    const tupleDigest = createHash("sha256").update("lanmm-native-terminal-evidence-tuple-digest-v1\0", "utf8")
+      .update(JSON.stringify(tupleKeys.map(key => tuple[key])), "utf8").digest("hex");
+    const result = Object.freeze({ snapshot, responseBytes: responseCopy, tuple, tupleDigest, certificateBindingAssertion });
+    keepResponse = true;
+    return result;
+  } catch { return null; }
+  finally { if (!keepResponse) responseCopy?.fill(0); }
+}
+
+function compareCurrentSnapshot(db: DatabaseSync, tx: unknown, view: SnapshotComparisonView, now: string): "match" | "mismatch" {
+  let built: OwnerNativeEvidenceBuiltSnapshot | null = null;
+  try {
+    // Legacy candidate payload bytes are intentionally opaque here; only the
+    // server-current tuple/response and candidate's bounded comparison fields matter.
+    built = buildOwnerNativeEvidenceSnapshot(db, tx, view.tuple.jobId, view.responseBytes, "synthetic", now);
+    if (!built) return "mismatch";
+    const t = view.tuple, e = built.tuple;
+    if (t.domain !== e.domain || t.hostId !== e.hostId || t.jobId !== e.jobId || t.requestId !== e.requestId ||
+        t.commandSequence !== e.commandSequence || t.idempotencyKey !== e.idempotencyKey ||
+        t.authorizationRequestDigest !== e.authorizationRequestDigest || t.storedQueueDigest !== e.storedQueueDigest ||
+        t.terminalState !== e.terminalState || t.terminalRevision !== e.terminalRevision || t.responseDigest !== e.responseDigest ||
+        t.responseByteLength !== e.responseByteLength || t.evidenceKind !== e.evidenceKind) return "mismatch";
+    const a = view.certificateBindingAssertion, b = built.certificateBindingAssertion;
+    if (a.certificateId !== b.certificateId || !sameCertificateSerial(a.serial, b.serial) || a.fingerprint !== b.fingerprint ||
+        a.version !== b.version || a.candidateId !== b.candidateId || a.address !== b.address || a.port !== b.port ||
+        a.protocolMajor !== b.protocolMajor || a.protocolMinor !== b.protocolMinor || a.notBefore !== b.notBefore ||
+        a.notAfter !== b.notAfter || a.caId !== b.caId || a.caVersion !== b.caVersion || a.spiffeUri !== b.spiffeUri ||
+        view.responseBytes.byteLength !== view.tuple.responseByteLength ||
+        createHash("sha256").update(responseDomain).update(view.responseBytes).digest("hex") !== view.tuple.responseDigest) return "mismatch";
     return "match";
   } catch { return "mismatch"; }
+  finally { built?.responseBytes.fill(0); }
 }
 
 const CONSENT_ASSERTION_KEYS = ["hostCertificateBindingDigest", "consentedAt"] as const;

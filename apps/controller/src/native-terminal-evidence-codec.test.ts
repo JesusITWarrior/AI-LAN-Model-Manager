@@ -271,9 +271,21 @@ test("codec is unwired with only pure core dependencies and no runtime receipt r
   const dir = dirname(fileURLToPath(import.meta.url)), source = readFileSync(join(dir, "native-terminal-evidence-codec.ts"), "utf8");
   assert.deepEqual([...source.matchAll(/from\s+["']([^"']+)["']/g)].map(m => m[1]), ["node:crypto", "node:util", "@lan-model-manager/core"]);
   assert.equal(/\b(?:fetch|readFile|writeFile|setTimeout|setInterval|Date\.now|execute|release|persist|sign)\s*\(/i.test(source), false);
+  const isProductionImporter = (name: string, text: string) => name.endsWith(".ts") && !name.endsWith(".test.ts") &&
+    text.includes("native-terminal-evidence-codec");
+  assert.equal(isProductionImporter("unrelated-production-importer.ts", 'import { x } from "./native-terminal-evidence-codec.js";'), true,
+    "negative fixture proves an unrelated production import is classified as forbidden");
+  assert.equal(isProductionImporter("unrelated-production-importer.test.ts", 'import { x } from "./native-terminal-evidence-codec.js";'), false,
+    "test-file classification remains distinct from production importers");
   const files = (path: string): string[] => readdirSync(path, { withFileTypes: true }).flatMap(entry => entry.isDirectory() ? files(join(path, entry.name)) :
-    entry.name.endsWith(".ts") && !entry.name.endsWith(".test.ts") ? [join(path, entry.name)] : []);
-  for (const path of files(dir)) if (!path.endsWith("/native-terminal-evidence-codec.ts"))
-    assert.equal(readFileSync(path, "utf8").includes("native-terminal-evidence-codec"), false, path);
+    entry.name.endsWith(".ts") ? [join(path, entry.name)] : []);
+  const productionImporters = files(dir).filter(path => !path.endsWith("/native-terminal-evidence-codec.ts") &&
+    isProductionImporter(path, readFileSync(path, "utf8")));
+  assert.deepEqual(productionImporters.map(path => path.slice(dir.length + 1)), ["owner-native-evidence-intake.ts"],
+    "only the explicitly approved owner intake module may import the offline codec");
+  const testFiles = readdirSync(dir).filter(name => name.endsWith(".test.ts"));
+  assert.ok(testFiles.includes("owner-native-evidence-intake.test.ts"));
+  assert.ok(testFiles.includes("native-terminal-evidence-codec.test.ts"));
+  assert.ok(!productionImporters.some(path => path.endsWith(".test.ts")), "test files stay classified as tests, never production importers");
   bad(encodeNativeTerminalEvidence({ ...fixture(), adapters: { execute() { throw new Error("must not execute"); } } }));
 });
