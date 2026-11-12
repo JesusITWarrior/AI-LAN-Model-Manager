@@ -88,9 +88,32 @@ export type CandidateSuccess = Readonly<{ ok: true; handle: string; summary: Can
 export type CandidateResult = CandidateFailure | CandidateSuccess;
 export type ConsumeResult = Readonly<{ ok: true; consumed: true }> | CandidateFailure;
 
+/** Opaque, object-identity lease token. Intentionally contains no handle string and no
+ *  raw bytes: it is a per-registry-instance, per-entry reference resolved only through
+ *  this registry's WeakMap, so a forged object, a deep copy, or a token minted by
+ *  another registry instance all fail identity lookup. */
+export type CandidateLeaseToken = object;
+export type LeaseFailure = Readonly<{ ok: false; error: "ERR_NATIVE_EVIDENCE_LEASE" }>;
+export interface LeaseRequest {
+  readonly handle: string;
+  readonly action: typeof OWNER_NATIVE_EVIDENCE_ACTION;
+  readonly disposition: typeof OWNER_NATIVE_EVIDENCE_DISPOSITION;
+}
+export type LeaseResult = Readonly<{ ok: true; token: CandidateLeaseToken }> | LeaseFailure;
+export type CommitResult = Readonly<{ ok: true; committed: true }> | LeaseFailure;
+export type ReleaseResult = Readonly<{ ok: true; released: true }> | LeaseFailure;
+
 type Binding = Readonly<{ id: string; credentialVersion: number; expiresAt: string }>;
-type Entry = { readonly ownerId: string; readonly sessionId: string; readonly credentialVersion: number; readonly expiresAt: string; readonly summary: CandidateSummary; readonly candidate: CapturedNativeEvidenceCandidate; readonly integrity: string; readonly bytes: number };
+type LeaseRecord = { readonly handle: string; readonly bytes: number };
+type Entry = { readonly ownerId: string; readonly sessionId: string; readonly credentialVersion: number; readonly expiresAt: string; readonly summary: CandidateSummary; readonly candidate: CapturedNativeEvidenceCandidate; readonly integrity: string; readonly bytes: number; lease: LeaseRecord | null };
 const fail = (): CandidateFailure => Object.freeze({ ok: false, error: "ERR_NATIVE_EVIDENCE_CANDIDATE" });
+const failLease = (): LeaseFailure => Object.freeze({ ok: false, error: "ERR_NATIVE_EVIDENCE_LEASE" });
+// Resolves a lease token purely by object identity, independent of its literal contents: a
+// deeply-equal copy, a forged object with matching nonce/seq, or a token from a different
+// registry instance all fail because their reference is absent from this WeakMap.
+function leaseToken(leases: WeakMap<object, LeaseRecord>, token: unknown): LeaseRecord | null {
+  return token && typeof token === "object" && leases.has(token as object) ? leases.get(token as object)! : null;
+}
 function record(input: unknown, keys: readonly string[]): Record<string, unknown> | null {
   try {
     if (!input || typeof input !== "object" || Array.isArray(input) || types.isProxy(input)) return null;
@@ -165,6 +188,11 @@ export class OwnerNativeEvidenceCandidateRegistry {
   private readonly entries = new Map<string, Entry>();
   private retainedBytes = 0;
   private issuedSequence = 0;
+  private leaseSequence = 0;
+  /** Maps each issued lease token object (by identity) to its internal lease record. The
+   *  value carries the entry handle/bytes; the token carries neither raw bytes nor the
+   *  handle string, so only this registry instance can resolve a token it minted. */
+  private leases: WeakMap<object, LeaseRecord> = new WeakMap();
   private readonly instanceNonce = randomBytes(16).toString("hex");
   private closed = false;
   private preparing = false;
@@ -218,7 +246,7 @@ export class OwnerNativeEvidenceCandidateRegistry {
         tuple, tupleDigest: capturedTupleDigest, payloadBytes: payloadBytes.length, responseBytes: responseBytes.length, certificateAssertion: certSummary,
         expiresAt, currentHistoryAndCertificateRevalidated: false });
       this.entries.set(handle, { ownerId: auth.session.ownerId, sessionId: auth.binding.id, credentialVersion: auth.binding.credentialVersion,
-        expiresAt, summary, candidate, integrity: integrity(candidate), bytes });
+        expiresAt, summary, candidate, integrity: integrity(candidate), bytes, lease: null });
       this.retainedBytes += bytes;
       return Object.freeze({ ok: true, handle, summary });
     } catch { return fail(); }
@@ -244,7 +272,7 @@ export class OwnerNativeEvidenceCandidateRegistry {
       if (!auth || !request || !boundedText(request.handle, 128) || request.action !== OWNER_NATIVE_EVIDENCE_ACTION || request.disposition !== OWNER_NATIVE_EVIDENCE_DISPOSITION) return fail();
       const now = nowMs(this.clock); this.prune(now);
       const handle = request.handle as string, entry = this.entries.get(handle);
-      if (!entry || entry.ownerId !== auth.session.ownerId || entry.sessionId !== auth.binding.id || entry.credentialVersion !== auth.binding.credentialVersion ||
+      if (!entry || entry.lease || entry.ownerId !== auth.session.ownerId || entry.sessionId !== auth.binding.id || entry.credentialVersion !== auth.binding.credentialVersion ||
           Date.parse(entry.expiresAt) <= now || integrity(entry.candidate) !== entry.integrity) return fail();
       this.drop(handle);
       // Give trusted synchronous callback an owned private copy; never expose retained storage.
@@ -257,6 +285,96 @@ export class OwnerNativeEvidenceCandidateRegistry {
       return Object.freeze({ ok: true, consumed: true });
     } catch { return fail(); }
   }
+  /**
+   * Reserve an already-prepared (available) candidate into a single lease that must be
+   * settled with exactly one commit (transaction success) or release (confirmed
+   * rollback).
+   *
+   * Security contract: the GuardResult forwarded here carries no method provenance — the
+   * external caller MUST have verified it is its own real `POST` to an *exact* allowed
+   * origin with a matching CSRF token. This lease is not proof of any DB record, current
+   * job history, or certificate binding, and it holds no raw bytes or handle. The
+   * returned token is an opaque, registry-instance- and exact-entry-bound object-identity
+   * reference resolved through this registry's WeakMap: a forged object, a deep copy, or
+   * a token from another registry instance all fail. Repeated or reentrant claim fails.
+   * While leased, the entry stays owned and counts toward capacity; its bytes remain
+   * capacity-counted. Expiry/revocation/rotation/credential change/close all fail closed
+   * without exposing bytes. If the caller's transaction outcome is unknown it must call
+   * neither commit nor release and leave the lease unavailable.
+   */
+  claim(guard: GuardResult, input: unknown): LeaseResult {
+    try {
+      if (this.closed) return failLease();
+      const auth = guardSession(guard, this.manager);
+      if (!auth) return failLease();
+      const request = record(input, ["handle", "action", "disposition"]);
+      if (!request || !boundedText(request.handle, 128) ||
+          request.action !== OWNER_NATIVE_EVIDENCE_ACTION ||
+          request.disposition !== OWNER_NATIVE_EVIDENCE_DISPOSITION) return failLease();
+      const now = nowMs(this.clock); this.prune(now);
+      const entry = this.entries.get(request.handle as string);
+      if (!entry || entry.lease || entry.ownerId !== auth.session.ownerId || entry.sessionId !== auth.binding.id ||
+          entry.credentialVersion !== auth.binding.credentialVersion || Date.parse(entry.expiresAt) <= now ||
+          integrity(entry.candidate) !== entry.integrity) return failLease();
+      const seq = ++this.leaseSequence;
+      if (!Number.isSafeInteger(seq) || (seq as number) < 1) return failLease();
+      // A zero-field object token is opaque and can only be resolved by this registry's WeakMap.
+      const token = Object.freeze(Object.create(null)) as CandidateLeaseToken;
+      const lease: LeaseRecord = { handle: request.handle as string, bytes: entry.bytes };
+      this.leases.set(token, lease);
+      entry.lease = lease;
+      return Object.freeze({ ok: true, token });
+    } catch { return failLease(); }
+  }
+  /**
+   * Mark the leased entry spent and drop it (releasing its bytes) — call only AFTER the
+   * caller's transaction has been observed successful. Requires the exact token, a
+   * still-valid owner/session/credential guard, and an unexpired, nonclosed leased entry;
+   * otherwise fails closed without exposing bytes. One-shot: a committed token can
+   * neither be committed, released, nor re-claimed.
+   */
+  commitLease(guard: GuardResult, token: unknown): CommitResult {
+    try {
+      if (this.closed) return failLease();
+      const auth = guardSession(guard, this.manager);
+      if (!auth) return failLease();
+      const lease = leaseToken(this.leases, token);
+      if (!lease || !boundedText(lease.handle, 128)) return failLease();
+      const now = nowMs(this.clock); this.prune(now);
+      const entry = this.entries.get(lease.handle);
+      if (!entry || entry.lease !== lease || entry.ownerId !== auth.session.ownerId || entry.sessionId !== auth.binding.id ||
+          entry.credentialVersion !== auth.binding.credentialVersion || Date.parse(entry.expiresAt) <= now ||
+          integrity(entry.candidate) !== entry.integrity) return failLease();
+      this.leases.delete(token as object);
+      // Commit is terminal: remove the entry and release its exact accounting once.
+      this.drop(lease.handle);
+      return Object.freeze({ ok: true, committed: true });
+    } catch { return failLease(); }
+  }
+  /**
+   * Return the leased entry to available — call only AFTER the caller's rollback has been
+   * confirmed. Same exactness as `commitLease`: exact token, a still-valid
+   * owner/session/credential guard, and an unexpired, nonclosed leased entry; otherwise
+   * fails closed. One-shot: after release the token cannot be reused, but the entry
+   * becomes claimable anew.
+   */
+  releaseLease(guard: GuardResult, token: unknown): ReleaseResult {
+    try {
+      if (this.closed) return failLease();
+      const auth = guardSession(guard, this.manager);
+      if (!auth) return failLease();
+      const lease = leaseToken(this.leases, token);
+      if (!lease || !boundedText(lease.handle, 128)) return failLease();
+      const now = nowMs(this.clock); this.prune(now);
+      const entry = this.entries.get(lease.handle);
+      if (!entry || entry.lease !== lease || entry.ownerId !== auth.session.ownerId || entry.sessionId !== auth.binding.id ||
+          entry.credentialVersion !== auth.binding.credentialVersion || Date.parse(entry.expiresAt) <= now ||
+          integrity(entry.candidate) !== entry.integrity) return failLease();
+      this.leases.delete(token as object);
+      entry.lease = null;
+      return Object.freeze({ ok: true, released: true });
+    } catch { return failLease(); }
+  }
   /** Test/diagnostic count only; no payload or authority is returned. */
   get size(): number { return this.entries.size; }
   get retainedByteCount(): number { return this.retainedBytes; }
@@ -264,6 +382,7 @@ export class OwnerNativeEvidenceCandidateRegistry {
   close(): void {
     if (this.closed) return;
     for (const handle of this.entries.keys()) this.drop(handle);
+    this.leases = new WeakMap();
     this.retainedBytes = 0;
     this.closed = true;
   }

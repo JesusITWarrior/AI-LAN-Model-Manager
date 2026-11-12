@@ -381,3 +381,163 @@ test("preparation callbacks cannot reenter prepare or retain after clock shutdow
     assert.equal(closedByClock.retainedByteCount, 0);
   } finally { db.close(); }
 });
+
+test("lease token is opaque; commit terminally spends candidate and releases bytes", async () => {
+  const { db, manager } = await setup();
+  try {
+    const session = await newSession(manager), guard = post(manager, session), before = dbSnapshot(db);
+    const registry = makeRegistry(manager, makeCandidate);
+    const p = registry.prepare(guard);
+    assert.equal(p.ok, true);
+    if (!p.ok) return;
+    const req = { handle: p.handle, action: OWNER_NATIVE_EVIDENCE_ACTION, disposition: OWNER_NATIVE_EVIDENCE_DISPOSITION };
+    const lease = registry.claim(guard, req);
+    assert.equal(lease.ok, true);
+    if (!lease.ok) return;
+    assert.deepEqual(Reflect.ownKeys(lease.token), []);
+    assert.equal(JSON.stringify(lease.token), "{}");
+    const bytes = registry.retainedByteCount;
+    assert.ok(bytes > 0);
+    assert.equal(registry.consume(guard, req).ok, false);
+    assert.equal(registry.claim(guard, req).ok, false);
+    assert.deepEqual(registry.commitLease(guard, lease.token), { ok: true, committed: true });
+    assert.equal(registry.size, 0);
+    assert.equal(registry.retainedByteCount, 0);
+    assert.equal(registry.inspect(guard, p.handle).ok, false);
+    assert.equal(registry.consume(guard, req).ok, false);
+    assert.equal(registry.claim(guard, req).ok, false);
+    assert.equal(registry.commitLease(guard, lease.token).ok, false);
+    assert.equal(registry.releaseLease(guard, lease.token).ok, false);
+    assert.equal(dbSnapshot(db), before);
+  } finally { db.close(); }
+});
+
+test("only exact live lease token can release once; explicit release reopens entry", async () => {
+  const { db, manager } = await setup();
+  try {
+    const first = await newSession(manager), other = await newSession(manager);
+    const guard = post(manager, first), otherGuard = post(manager, other), registry = makeRegistry(manager, makeCandidate);
+    const p = registry.prepare(guard);
+    assert.equal(p.ok, true);
+    if (!p.ok) return;
+    const req = { handle: p.handle, action: OWNER_NATIVE_EVIDENCE_ACTION, disposition: OWNER_NATIVE_EVIDENCE_DISPOSITION };
+    const lease = registry.claim(guard, req);
+    assert.equal(lease.ok, true);
+    if (!lease.ok) return;
+    const forged = Object.freeze(Object.create(null));
+    assert.equal(registry.releaseLease(guard, forged).ok, false);
+    assert.equal(registry.releaseLease(otherGuard, lease.token).ok, false);
+    assert.equal(registry.commitLease(otherGuard, lease.token).ok, false);
+    assert.deepEqual(registry.releaseLease(guard, lease.token), { ok: true, released: true });
+    assert.equal(registry.releaseLease(guard, lease.token).ok, false);
+    assert.equal(registry.claim(guard, req).ok, true);
+    assert.equal(registry.consume(guard, req).ok, false);
+  } finally { db.close(); }
+});
+
+test("lease tokens are instance-local; leased bytes stay charged through explicit release", async () => {
+  const { db, manager } = await setup();
+  try {
+    const session = await newSession(manager), guard = post(manager, session), before = dbSnapshot(db);
+    const a = makeRegistry(manager, makeCandidate), b = makeRegistry(manager, makeCandidate);
+    const pa = a.prepare(guard), pb = b.prepare(guard);
+    assert.equal(pa.ok, true); assert.equal(pb.ok, true);
+    if (!pa.ok || !pb.ok) return;
+    const ra = { handle: pa.handle, action: OWNER_NATIVE_EVIDENCE_ACTION, disposition: OWNER_NATIVE_EVIDENCE_DISPOSITION };
+    const rb = { handle: pb.handle, action: OWNER_NATIVE_EVIDENCE_ACTION, disposition: OWNER_NATIVE_EVIDENCE_DISPOSITION };
+    const la = a.claim(guard, ra), lb = b.claim(guard, rb);
+    assert.equal(la.ok, true); assert.equal(lb.ok, true);
+    if (!la.ok || !lb.ok) return;
+    assert.equal(b.commitLease(guard, la.token).ok, false);
+    assert.equal(a.commitLease(guard, structuredClone(la.token)).ok, false);
+    assert.equal(a.releaseLease(guard, Object.freeze(Object.create(null))).ok, false);
+    const bytes = a.retainedByteCount;
+    assert.ok(bytes > 0);
+    assert.deepEqual(a.releaseLease(guard, la.token), { ok: true, released: true });
+    assert.equal(a.retainedByteCount, bytes);
+    assert.equal(a.consume(guard, ra).ok, true);
+    assert.equal(a.size, 0);
+    assert.equal(a.retainedByteCount, 0);
+    assert.equal(dbSnapshot(db), before);
+  } finally { db.close(); }
+});
+
+test("expiry, revoke and close invalidate leases without DB writes or caller-buffer mutation", async () => {
+  const { db, manager } = await setup();
+  try {
+    let now = START;
+    const session = await newSession(manager), guard = post(manager, session), source = makeCandidate();
+    const registry = makeRegistry(manager, () => source, undefined, undefined, () => now);
+    const before = dbSnapshot(db), p = registry.prepare(guard);
+    assert.equal(p.ok, true);
+    if (!p.ok) return;
+    const req = { handle: p.handle, action: OWNER_NATIVE_EVIDENCE_ACTION, disposition: OWNER_NATIVE_EVIDENCE_DISPOSITION };
+    const lease = registry.claim(guard, req);
+    assert.equal(lease.ok, true);
+    if (!lease.ok) return;
+    const retained = registry.retainedByteCount;
+    source.payloadBytes.fill(0); source.responseBytes.fill(0);
+    assert.equal(registry.retainedByteCount, retained);
+    now = "2026-09-27T10:01:00.000Z";
+    assert.equal(registry.commitLease(guard, lease.token).ok, false);
+    assert.equal(registry.releaseLease(guard, lease.token).ok, false);
+    assert.equal(registry.size, 0);
+    assert.equal(registry.retainedByteCount, 0);
+    assert.equal(dbSnapshot(db), before);
+
+    const second = await newSession(manager), guard2 = post(manager, second), registry2 = makeRegistry(manager, makeCandidate), p2 = registry2.prepare(guard2);
+    assert.equal(p2.ok, true);
+    if (p2.ok) {
+      const req2 = { handle: p2.handle, action: OWNER_NATIVE_EVIDENCE_ACTION, disposition: OWNER_NATIVE_EVIDENCE_DISPOSITION };
+      const lease2 = registry2.claim(guard2, req2);
+      assert.equal(lease2.ok, true);
+      registry2.close();
+      assert.equal(registry2.size, 0);
+      assert.equal(registry2.retainedByteCount, 0);
+      assert.equal(registry2.prepare(guard2).ok, false);
+      if (lease2.ok) {
+        assert.equal(registry2.commitLease(guard2, lease2.token).ok, false);
+        assert.equal(registry2.releaseLease(guard2, lease2.token).ok, false);
+      }
+    }
+
+    const third = await newSession(manager), guard3 = post(manager, third), registry3 = makeRegistry(manager, makeCandidate);
+    const p3 = registry3.prepare(guard3);
+    assert.equal(p3.ok, true);
+    if (p3.ok) {
+      const req3 = { handle: p3.handle, action: OWNER_NATIVE_EVIDENCE_ACTION, disposition: OWNER_NATIVE_EVIDENCE_DISPOSITION };
+      const lease3 = registry3.claim(guard3, req3);
+      assert.equal(lease3.ok, true);
+      if (lease3.ok) {
+        assert.equal(manager.revoke(third.sessionToken), true);
+        assert.equal(registry3.claim(guard3, req3).ok, false);
+        assert.equal(registry3.commitLease(guard3, lease3.token).ok, false);
+        assert.equal(registry3.releaseLease(guard3, lease3.token).ok, false);
+        registry3.close();
+      }
+    }
+  } finally { db.close(); }
+});
+
+test("leased candidates count against capacity until release", async () => {
+  const { db, manager } = await setup();
+  try {
+    const session = await newSession(manager), guard = post(manager, session);
+    let id = 0;
+    const registry = makeRegistry(manager, makeCandidate, undefined, () => `cap-${++id}`);
+    const requests: Array<{ handle: string; action: typeof OWNER_NATIVE_EVIDENCE_ACTION; disposition: typeof OWNER_NATIVE_EVIDENCE_DISPOSITION }> = [];
+    for (let i = 0; i < OWNER_NATIVE_EVIDENCE_MAX_CANDIDATES; i++) {
+      const p = registry.prepare(guard);
+      assert.equal(p.ok, true);
+      if (p.ok) requests.push({ handle: p.handle, action: OWNER_NATIVE_EVIDENCE_ACTION, disposition: OWNER_NATIVE_EVIDENCE_DISPOSITION });
+    }
+    assert.equal(registry.size, OWNER_NATIVE_EVIDENCE_MAX_CANDIDATES);
+    const lease = registry.claim(guard, requests[0]!);
+    assert.equal(lease.ok, true);
+    assert.equal(registry.prepare(guard).ok, false);
+    if (lease.ok) assert.equal(registry.releaseLease(guard, lease.token).ok, true);
+    assert.equal(registry.consume(guard, requests[0]!).ok, true);
+    assert.equal(registry.size, OWNER_NATIVE_EVIDENCE_MAX_CANDIDATES - 1);
+    assert.equal(registry.prepare(guard).ok, true);
+  } finally { db.close(); }
+});
