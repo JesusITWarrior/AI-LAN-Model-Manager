@@ -17,7 +17,7 @@ import { createAllowedOrigins } from "./origin.js";
 import { createJobStores } from "./jobs-store.js";
 import { createOwnerBootstrapService } from "./owner-service.js";
 import { OwnerNativeEvidenceCandidateRegistry, OWNER_NATIVE_EVIDENCE_ACTION, OWNER_NATIVE_EVIDENCE_DISPOSITION, type NativeEvidenceCandidateInput } from "./owner-native-evidence-candidates.js";
-import { OwnerNativeEvidenceMatchedAppendCoordinator, OwnerNativeEvidenceSnapshotReader, OwnerNativeEvidenceTransactionOwner } from "./owner-native-evidence-snapshot.js";
+import { OwnerNativeEvidenceMatchedAppendCoordinator, OwnerNativeEvidenceSnapshotReader, OwnerNativeEvidenceTransactionOwner, OwnerNativeEvidenceOwnerConfirmService } from "./owner-native-evidence-snapshot.js";
 import { SessionManager } from "./session-manager.js";
 import { guardManagementRequest } from "./guard.js";
 import { computeTerminalRevision } from "./native-terminal-revision.js";
@@ -41,15 +41,16 @@ function makeInput(tuple: Record<string, unknown>, responseBytes: Uint8Array, ce
       candidateId: cert.binding.candidateId, address: cert.binding.address, port: cert.binding.port, protocolMajor: cert.binding.protocolMajor,
       protocolMinor: cert.binding.protocolMinor, notBefore: cert.notBefore, notAfter: cert.notAfter, caId: cert.caId, caVersion: cert.caVersion, spiffeUri: cert.spiffeUri } };
 }
-async function fixture(largeRequest = false) {
+async function fixture(largeRequest = false, productionEvidence = false) {
   const db = openControllerDatabase(":memory:");
   const testSchema = readFileSync(join(dirname(fileURLToPath(import.meta.url)), "supplemental-native-evidence-test-schema.sql"), "utf8");
   const marker = "CREATE TABLE evidence_commit_guard";
   assert.equal(testSchema.split(marker).length - 1, 1, "expected one opt-in evidence schema marker");
-  // These synthetic transaction tests own the deferred-commit fixture schema;
-  // discard the production migration table first to avoid conflating the two.
-  db.exec("DROP TABLE supplemental_native_evidence");
-  db.exec(testSchema.slice(testSchema.indexOf(marker)));
+  if (!productionEvidence) {
+    // Older synthetic transaction tests own the deferred-commit fixture schema.
+    db.exec("DROP TABLE supplemental_native_evidence");
+    db.exec(testSchema.slice(testSchema.indexOf(marker)));
+  }
   let now = START, random = 0;
   const owners = createOwnerBootstrapService(db, { now: () => now, ownerId: () => "a".repeat(32), crypto: passwordCrypto });
   await owners.bootstrapOwner({ username: "Admin", password: "owner-password-123" });
@@ -102,8 +103,8 @@ async function fixture(largeRequest = false) {
   const reader = new OwnerNativeEvidenceSnapshotReader(db, registry, { clock: () => now });
   return { db, now, guard, stores, registry, reader, candidate, setCandidate: (x: NativeEvidenceCandidateInput) => { candidate = x; }, tuple, responseBytes, sessions, session, certificates, setNow: (value: string) => { now = value; }, setRegistryClockHook: (hook: () => void) => { registryClockHook = hook; }, request };
 }
-async function verifiedTrustFixture() {
-  const f = await fixture(), root = mkdtempSync(join(tmpdir(), "lanmm-trust-snapshot-")), caDir = join(root, "ca"), hostDir = join(root, "host");
+async function verifiedTrustFixture(productionEvidence = false) {
+  const f = await fixture(false, productionEvidence), root = mkdtempSync(join(tmpdir(), "lanmm-trust-snapshot-")), caDir = join(root, "ca"), hostDir = join(root, "host");
   mkdirSync(hostDir, { mode: 0o700 });
   try {
     const engine = new OpenSslCertificateEngine(), issuedAt = new Date(Date.now() - 2_000).toISOString();
@@ -121,6 +122,16 @@ async function verifiedTrustFixture() {
     (f as unknown as { reader: OwnerNativeEvidenceSnapshotReader }).reader = new OwnerNativeEvidenceSnapshotReader(f.db, f.registry, { clock: () => currentTime });
     return { ...f, currentTime, root, caDir, leaf: new X509Certificate(issued.certificatePem), caCert: new X509Certificate(ca.certificatePem) };
   } catch (error) { f.db.close(); rmSync(root, { recursive: true, force: true }); throw error; }
+}
+async function alignOwnerConfirmSession(f: Awaited<ReturnType<typeof verifiedTrustFixture>>) {
+  // The generic job fixture uses a historical synthetic session clock, while real
+  // X.509 fixtures use current time. Owner-confirm must exercise one coherent server clock.
+  f.setNow(f.currentTime);
+  const session = await f.sessions.create({ username: "admin", password: "owner-password-123" }); assert.ok(session);
+  const guard = guardManagementRequest(f.sessions, ORIGINS, { method: "POST", cookieHeader: `__Host-lanmm_session=${session.sessionToken}`,
+    originHeader: "https://manager.example", csrfHeader: session.csrfToken });
+  assert.equal(guard.ok, true);
+  Object.assign(f, { session, guard });
 }
 function replaceTrustLeaf(f: Awaited<ReturnType<typeof verifiedTrustFixture>>, options: { cn: string; address: string; uri: string; eku: string; serial: string }): X509Certificate {
   const dir = join(f.root, `variant-${options.serial}`); mkdirSync(dir, { mode: 0o700 });
@@ -1182,4 +1193,268 @@ test("post-commit settlement unavailable preserves the known DB commit without r
     assert.equal(evidenceCount(f), 1); assert.equal(auditCount(f), beforeAudit + 1);
     assert.deepEqual(f.registry.releaseLease(f.guard, token), { ok: false, error: "ERR_NATIVE_EVIDENCE_LEASE" }, "failed settlement did not release/retry the lease");
   } finally { f.db.close(); }
+});
+
+test("server-owned owner-confirm appends to the production evidence table and exact retry preserves original consent time", async () => {
+  const f = await verifiedTrustFixture(true);
+  try {
+    await alignOwnerConfirmSession(f);
+    let serverNow = f.currentTime;
+    const mutableOrigins = ["https://manager.example"];
+    const service = new OwnerNativeEvidenceOwnerConfirmService(f.db, f.registry, f.sessions, mutableOrigins, () => serverNow);
+    mutableOrigins[0] = "https://evil.example";
+    const rawEnvelope = (body: string) => ({ method: "POST", path: "/api/v1/native-evidence/confirm", cookieHeader: `__Host-lanmm_session=${f.session.sessionToken}`,
+      originHeader: "https://manager.example", csrfHeader: f.session.csrfToken, body });
+    const duplicateJson = '{"candidateHandle":"x","candidateHandle":"y","expectedTupleDigest":"' + f.candidate.tupleDigest + '","action":"append-supplemental-native-evidence","disposition":"evidence-only"}';
+    assert.equal(service.confirm(rawEnvelope(duplicateJson)).outcome, "denied");
+    assert.equal(service.confirm({ ...rawEnvelope("{}"), path: "/api/v1/native-evidence/confirm?x=1" }).outcome, "denied");
+    assert.equal(service.confirm({ ...rawEnvelope("{}"), csrfHeader: "invalid" }).outcome, "denied");
+    const getterEnvelope = Object.defineProperty(rawEnvelope("{}"), "path", { get() { throw new Error("must not invoke getter"); } });
+    assert.equal(service.confirm(getterEnvelope).outcome, "denied");
+    const post = () => {
+      const prepared = f.registry.prepare(f.guard); assert.ok(prepared.ok);
+      assert.equal(prepared.summary.tupleDigest, f.candidate.tupleDigest);
+      const body = JSON.stringify({ candidateHandle: prepared.handle, expectedTupleDigest: f.candidate.tupleDigest,
+        action: "append-supplemental-native-evidence", disposition: "evidence-only" });
+      return service.confirm({ method: "POST", path: "/api/v1/native-evidence/confirm", cookieHeader: `__Host-lanmm_session=${f.session.sessionToken}`,
+        originHeader: "https://manager.example", csrfHeader: f.session.csrfToken, body });
+    };
+    assert.equal(service.confirm({ method: "GET", path: "/api/v1/native-evidence/confirm", cookieHeader: "", originHeader: null, csrfHeader: null, body: "{}" }).outcome, "denied");
+    const beforeAudit = Number((f.db.prepare("SELECT COUNT(*) AS n FROM audit_events").get() as { n: number }).n);
+    const beforeProtected = protectedState(f.db), beforeReplay = JSON.stringify(f.db.prepare("SELECT * FROM transport_replay_state ORDER BY certificate_fingerprint").all());
+    for (const table of ["jobs", "job_history", "agent_commands", "owners", "sessions", "host_certificates", "certificate_authorities"])
+      assert.ok(Number((f.db.prepare(`SELECT COUNT(*) AS n FROM ${table}`).get() as { n: number }).n) > 0, `${table} protected snapshot is nonempty`);
+    const first = post(); assert.equal(first.outcome, "stored");
+    assert.deepEqual(Object.keys(first).sort(), ["outcome", "tupleDigest"]);
+    const publicResult = JSON.stringify(first);
+    for (const secret of [f.session.sessionToken, f.session.csrfToken, f.leaf.toString(), Buffer.from(f.candidate.payloadBytes).toString("base64"), Buffer.from(f.candidate.responseBytes).toString("base64")])
+      assert.equal(publicResult.includes(secret), false, "owner-confirm result must not expose credentials, certificates, or evidence bytes");
+    assert.equal(protectedState(f.db), beforeProtected, "successful confirmation must preserve jobs/history/commands/owner/session/certificate rows");
+    assert.equal(JSON.stringify(f.db.prepare("SELECT * FROM transport_replay_state ORDER BY certificate_fingerprint").all()), beforeReplay);
+    const firstRow = f.db.prepare("SELECT consented_at,tuple_digest,receipt_core_json FROM supplemental_native_evidence").get() as { consented_at: string; tuple_digest: string; receipt_core_json: string };
+    assert.equal(firstRow.consented_at, f.currentTime);
+    assert.equal(Number((f.db.prepare("SELECT COUNT(*) AS n FROM audit_events").get() as { n: number }).n), beforeAudit + 1);
+    serverNow = new Date(Date.parse(serverNow) + 1000).toISOString();
+    const second = post(); assert.equal(second.outcome, "already_stored");
+    const secondRow = f.db.prepare("SELECT consented_at,tuple_digest,receipt_core_json FROM supplemental_native_evidence").get() as typeof firstRow;
+    assert.deepEqual(secondRow, firstRow, "duplicate retry must preserve original persisted consent and receipt");
+    assert.equal(Number((f.db.prepare("SELECT COUNT(*) AS n FROM audit_events").get() as { n: number }).n), beforeAudit + 1);
+    const currentCertId = f.leaf.fingerprint256.replaceAll(":", "").toLowerCase();
+    f.setCandidate({ ...makeInput(f.tuple, f.responseBytes, f.certificates.getById(currentCertId)), payloadBytes: new Uint8Array([0x58, 0x59, 0x5a]) });
+    const conflict = post(); assert.equal(conflict.outcome, "conflict", "same tuple with changed owner-supplied bytes must not be treated as duplicate");
+    assert.deepEqual(f.db.prepare("SELECT consented_at,tuple_digest,receipt_core_json FROM supplemental_native_evidence").get(), firstRow);
+    assert.equal(Number((f.db.prepare("SELECT COUNT(*) AS n FROM audit_events").get() as { n: number }).n), beforeAudit + 1);
+    assert.equal(f.registry.size, 1, "known no-append conflict releases the final candidate lease without changing persisted evidence");
+  } finally { f.db.close(); rmSync(f.root, { recursive: true, force: true }); }
+});
+
+test("owner-confirm audit failure leaves the candidate lease unavailable and reports unknown without retry", async () => {
+  const f = await verifiedTrustFixture(true);
+  try {
+    await alignOwnerConfirmSession(f);
+    const prepared = f.registry.prepare(f.guard); assert.ok(prepared.ok);
+    const service = new OwnerNativeEvidenceOwnerConfirmService(f.db, f.registry, f.sessions, ORIGINS, () => f.currentTime);
+    const body = JSON.stringify({ candidateHandle: prepared.handle, expectedTupleDigest: f.candidate.tupleDigest,
+      action: "append-supplemental-native-evidence", disposition: "evidence-only" });
+    const request = { method: "POST", path: "/api/v1/native-evidence/confirm", cookieHeader: `__Host-lanmm_session=${f.session.sessionToken}`,
+      originHeader: "https://manager.example", csrfHeader: f.session.csrfToken, body };
+    f.db.exec("CREATE TRIGGER reject_owner_confirm_audit BEFORE INSERT ON audit_events WHEN NEW.action='supplemental-native-evidence-append' BEGIN SELECT RAISE(ABORT,'denied'); END");
+    assert.equal(service.confirm(request).outcome, "transaction_unknown");
+    assert.equal(Number((f.db.prepare("SELECT COUNT(*) AS n FROM supplemental_native_evidence").get() as { n: number }).n), 0);
+    assert.equal(f.registry.size, 1, "unknown transaction must not release or settle the leased candidate");
+    assert.equal(service.confirm(request).outcome, "stale", "the service must not automatically retry an unknown append");
+  } finally { f.db.close(); rmSync(f.root, { recursive: true, force: true }); }
+});
+
+test("owner-confirm final same-transaction trust recheck rolls back audit-trigger certificate mutation", async () => {
+  const f = await verifiedTrustFixture(true);
+  try {
+    await alignOwnerConfirmSession(f);
+    const prepared = f.registry.prepare(f.guard); assert.ok(prepared.ok);
+    const service = new OwnerNativeEvidenceOwnerConfirmService(f.db, f.registry, f.sessions, ORIGINS, () => f.currentTime);
+    const request = { method: "POST", path: "/api/v1/native-evidence/confirm", cookieHeader: `__Host-lanmm_session=${f.session.sessionToken}`,
+      originHeader: "https://manager.example", csrfHeader: f.session.csrfToken,
+      body: JSON.stringify({ candidateHandle: prepared.handle, expectedTupleDigest: f.candidate.tupleDigest,
+        action: "append-supplemental-native-evidence", disposition: "evidence-only" }) };
+    const certBefore = f.db.prepare("SELECT status,revoked_at,not_after FROM host_certificates WHERE candidate_id='host-1'").get();
+    const auditsBefore = Number((f.db.prepare("SELECT COUNT(*) AS n FROM audit_events").get() as { n: number }).n);
+    f.db.exec(`CREATE TRIGGER mutate_trust_during_owner_audit AFTER INSERT ON audit_events WHEN NEW.action='supplemental-native-evidence-append' BEGIN
+      UPDATE host_certificates SET status='revoked',revoked_at='${f.currentTime}' WHERE candidate_id='host-1'; END`);
+    assert.equal(service.confirm(request).outcome, "transaction_unknown", "a thrown in-transaction abort is conservatively unknown to the wrapper");
+    assert.equal(Number((f.db.prepare("SELECT COUNT(*) AS n FROM supplemental_native_evidence").get() as { n: number }).n), 0);
+    assert.equal(Number((f.db.prepare("SELECT COUNT(*) AS n FROM audit_events").get() as { n: number }).n), auditsBefore);
+    assert.deepEqual(f.db.prepare("SELECT status,revoked_at,not_after FROM host_certificates WHERE candidate_id='host-1'").get(), certBefore,
+      "trigger mutation and append/audit must all roll back together");
+    assert.equal(f.registry.size, 1, "uncertain rollback must not settle or release the candidate lease");
+  } finally { f.db.close(); rmSync(f.root, { recursive: true, force: true }); }
+});
+
+function ownerConfirmRequest(f: Awaited<ReturnType<typeof verifiedTrustFixture>>, handle: string, digest = f.candidate.tupleDigest,
+  patch: Record<string, unknown> = {}) {
+  return { method: "POST", path: "/api/v1/native-evidence/confirm", cookieHeader: `__Host-lanmm_session=${f.session.sessionToken}`,
+    originHeader: "https://manager.example", csrfHeader: f.session.csrfToken,
+    body: JSON.stringify({ candidateHandle: handle, expectedTupleDigest: digest, action: "append-supplemental-native-evidence", disposition: "evidence-only", ...patch }) };
+}
+
+test("owner-confirm registry post-callback invalidation and final trust recheck roll back append, audit, and trigger changes", async t => {
+  for (const change of ["credential", "session", "trust"] as const) await t.test(change, async () => {
+    const f = await verifiedTrustFixture(true);
+    try {
+      await alignOwnerConfirmSession(f);
+      const prepared = f.registry.prepare(f.guard); assert.ok(prepared.ok);
+      const service = new OwnerNativeEvidenceOwnerConfirmService(f.db, f.registry, f.sessions, ORIGINS, () => f.currentTime);
+      const request = ownerConfirmRequest(f, prepared.handle), beforeProtected = protectedState(f.db), beforeAudit = auditCount(f);
+      let mutated = false;
+      f.setRegistryClockHook(() => {
+        if (mutated || evidenceCount(f) !== 1) return;
+        mutated = true;
+        if (change === "credential") f.db.prepare("UPDATE owners SET credential_version=credential_version+1").run();
+        else if (change === "session") f.db.prepare("UPDATE sessions SET session_version=session_version+1 WHERE owner_id=?").run(f.session.metadata.ownerId);
+        else f.db.prepare("UPDATE host_certificates SET status='revoked',revoked_at=? WHERE candidate_id='host-1'").run(f.currentTime);
+      });
+      assert.equal(service.confirm(request).outcome, "transaction_unknown", change);
+      assert.equal(mutated, true, "hook must run after evidence has been inserted but before transaction completion");
+      assert.equal(evidenceCount(f), 0); assert.equal(auditCount(f), beforeAudit);
+      assert.equal(protectedState(f.db), beforeProtected, "authority mutations from the callback must roll back with append/audit");
+      f.setRegistryClockHook(() => undefined);
+      assert.equal(service.confirm(request).outcome, "stale", "unknown outcome must leave the lease unavailable, not retry");
+      assert.equal(evidenceCount(f), 0); assert.equal(auditCount(f), beforeAudit);
+    } finally { f.db.close(); rmSync(f.root, { recursive: true, force: true }); }
+  });
+});
+
+test("owner-confirm real deferred-FK COMMIT error returns unknown with no evidence/audit and no settlement", async () => {
+  const f = await verifiedTrustFixture(true);
+  try {
+    await alignOwnerConfirmSession(f);
+    const prepared = f.registry.prepare(f.guard); assert.ok(prepared.ok);
+    f.db.exec("PRAGMA foreign_keys=ON; CREATE TABLE owner_confirm_commit_parent(id INTEGER PRIMARY KEY); CREATE TABLE owner_confirm_commit_child(parent_id INTEGER REFERENCES owner_confirm_commit_parent(id) DEFERRABLE INITIALLY DEFERRED); CREATE TRIGGER owner_confirm_deferred_failure AFTER INSERT ON supplemental_native_evidence BEGIN INSERT INTO owner_confirm_commit_child(parent_id) VALUES(987654); END");
+    const service = new OwnerNativeEvidenceOwnerConfirmService(f.db, f.registry, f.sessions, ORIGINS, () => f.currentTime);
+    const request = ownerConfirmRequest(f, prepared.handle), beforeAudit = auditCount(f);
+    assert.equal(service.confirm(request).outcome, "transaction_unknown");
+    assert.equal(f.db.isTransaction, false, "the owning DatabaseSync transaction must unwind the failed real COMMIT");
+    assert.equal(evidenceCount(f), 0); assert.equal(auditCount(f), beforeAudit);
+    assert.equal(f.registry.size, 1, "COMMIT uncertainty is neither release nor settlement");
+    assert.equal(service.confirm(request).outcome, "stale", "the service must not automatically retry unknown COMMIT");
+    assert.equal(evidenceCount(f), 0); assert.equal(auditCount(f), beforeAudit);
+  } finally { f.db.close(); rmSync(f.root, { recursive: true, force: true }); }
+});
+
+test("owner-confirm reports a committed but unsettled lease after post-COMMIT registry close", async () => {
+  const f = await verifiedTrustFixture(true);
+  try {
+    await alignOwnerConfirmSession(f);
+    const prepared = f.registry.prepare(f.guard); assert.ok(prepared.ok);
+    const service = new OwnerNativeEvidenceOwnerConfirmService(f.db, f.registry, f.sessions, ORIGINS, () => f.currentTime);
+    const request = ownerConfirmRequest(f, prepared.handle), beforeAudit = auditCount(f);
+    let closed = false;
+    f.setRegistryClockHook(() => {
+      if (!closed && evidenceCount(f) === 1 && !f.db.isTransaction) { closed = true; f.registry.close(); }
+    });
+    assert.equal(service.confirm(request).outcome, "committed_unsettled");
+    assert.equal(closed, true); assert.equal(f.db.isTransaction, false);
+    assert.equal(evidenceCount(f), 1); assert.equal(auditCount(f), beforeAudit + 1);
+    f.setRegistryClockHook(() => undefined);
+    assert.equal(service.confirm(request).outcome, "stale", "committed evidence is not automatically retried after settlement failure");
+    assert.equal(evidenceCount(f), 1); assert.equal(auditCount(f), beforeAudit + 1);
+  } finally { f.db.close(); rmSync(f.root, { recursive: true, force: true }); }
+});
+
+test("owner-confirm rejects hostile envelope/body, header bounds, origin/CSRF, digest, candidate, and foreign session manager before append", async () => {
+  const f = await verifiedTrustFixture(true), foreignDb = openControllerDatabase(":memory:");
+  try {
+    await alignOwnerConfirmSession(f);
+    const prepared = f.registry.prepare(f.guard); assert.ok(prepared.ok);
+    let serviceClockCalls = 0;
+    const service = new OwnerNativeEvidenceOwnerConfirmService(f.db, f.registry, f.sessions, ORIGINS, () => { serviceClockCalls++; return f.currentTime; });
+    const valid = ownerConfirmRequest(f, prepared.handle), beforeAudit = auditCount(f);
+    const badBody = JSON.stringify({ candidateHandle: prepared.handle, expectedTupleDigest: f.candidate.tupleDigest,
+      action: "append-supplemental-native-evidence", disposition: "evidence-only", consentedAt: START });
+    const proxy = new Proxy(valid, { ownKeys() { throw new Error("must not invoke proxy trap"); } });
+    const accessor = Object.defineProperty({ ...valid }, "path", { get() { throw new Error("must not invoke getter"); } });
+    const invalid: unknown[] = [
+      proxy, accessor, { ...valid, extra: true }, { ...valid, method: "GET" }, { ...valid, path: "/api/v1/native-evidence/confirm?x=1" },
+      { ...valid, cookieHeader: "x".repeat(4097) }, { ...valid, originHeader: "x".repeat(2049) }, { ...valid, csrfHeader: "x".repeat(129) },
+      { ...valid, originHeader: "https://evil.example" }, { ...valid, csrfHeader: "invalid" }, { ...valid, body: "x".repeat(4097) },
+      { ...valid, body: badBody }, { ...valid, body: '{"candidateHandle":"x","candidateHandle":"y"}' },
+      { ...valid, body: '{"candidateHandle":"\\ud800","expectedTupleDigest":"' + f.candidate.tupleDigest + '","action":"append-supplemental-native-evidence","disposition":"evidence-only"}' },
+      { ...valid, body: JSON.stringify({ candidateHandle: prepared.handle, expectedTupleDigest: f.candidate.tupleDigest, action: "append-supplemental-native-evidence", disposition: "evidence-only", ownerId: "a".repeat(32) }) },
+    ];
+    for (const request of invalid) assert.equal(service.confirm(request).outcome, "denied");
+    assert.equal(serviceClockCalls, 0, "invalid envelopes and guard failures must not sample transaction consent time");
+    assert.equal(service.confirm(ownerConfirmRequest(f, prepared.handle, "0".repeat(64))).outcome, "stale", "wrong expected tuple digest is comparison-only");
+    assert.equal(service.confirm(ownerConfirmRequest(f, "missing-candidate")).outcome, "stale");
+    assert.equal(serviceClockCalls, 0, "candidate/digest failures must not sample transaction time");
+    const foreignOwners = createOwnerBootstrapService(foreignDb, { now: () => START, ownerId: () => "9".repeat(32), crypto: passwordCrypto });
+    const foreignSessions = new SessionManager(foreignDb, foreignOwners, { clock: () => START });
+    const foreignService = new OwnerNativeEvidenceOwnerConfirmService(f.db, f.registry, foreignSessions, ORIGINS, () => { serviceClockCalls++; return f.currentTime; });
+    assert.equal(foreignService.confirm(valid).outcome, "denied", "foreign SessionManager cannot authenticate the real owner cookie against another DB");
+    assert.equal(serviceClockCalls, 0);
+    assert.equal(evidenceCount(f), 0); assert.equal(auditCount(f), beforeAudit);
+    assert.equal(f.registry.size, 1, "input and authorization rejects must not claim the candidate");
+  } finally { foreignDb.close(); f.db.close(); rmSync(f.root, { recursive: true, force: true }); }
+});
+
+test("owner-confirm revoked and expired sessions are denied before transaction time or candidate claim", async t => {
+  for (const change of ["revoked", "expired"] as const) await t.test(change, async () => {
+    const f = await verifiedTrustFixture(true);
+    try {
+      await alignOwnerConfirmSession(f);
+      const prepared = f.registry.prepare(f.guard); assert.ok(prepared.ok);
+      let serviceClockCalls = 0;
+      const service = new OwnerNativeEvidenceOwnerConfirmService(f.db, f.registry, f.sessions, ORIGINS, () => { serviceClockCalls++; return f.currentTime; });
+      if (change === "revoked") assert.equal(f.sessions.revoke(f.session.sessionToken), true);
+      else f.db.prepare("UPDATE sessions SET idle_expires_at=? WHERE session_digest=(SELECT session_digest FROM sessions ORDER BY rowid DESC LIMIT 1)").run("2026-01-01T00:00:00.000Z");
+      const beforeAudit = auditCount(f);
+      assert.equal(service.confirm(ownerConfirmRequest(f, prepared.handle)).outcome, "denied");
+      assert.equal(serviceClockCalls, 0); assert.equal(evidenceCount(f), 0); assert.equal(auditCount(f), beforeAudit);
+      assert.equal(f.registry.size, 1, "denied session must not claim/consume the prepared candidate");
+    } finally { f.db.close(); rmSync(f.root, { recursive: true, force: true }); }
+  });
+});
+
+test("owner-confirm requires fresh database-backed X.509 trust after a prior successful readVerified", async t => {
+  for (const change of ["ca-subject", "ca-version", "host-version"] as const) await t.test(change, async () => {
+    const f = await verifiedTrustFixture(true);
+    try {
+      await alignOwnerConfirmSession(f);
+      const token = newLease(f);
+      let earlier: ReturnType<typeof f.reader.readVerified> | undefined;
+      f.stores.withAuditTransaction(tx => { earlier = f.reader.readVerified(f.guard, tx, token); });
+      assert.equal(earlier?.ok, true); assert.equal(earlier?.ok && earlier.match, true);
+      assert.deepEqual(f.registry.releaseLease(f.guard, token), { ok: true, released: true });
+      if (change === "ca-subject") f.db.prepare("UPDATE certificate_authorities SET subject='CN=other root' WHERE ca_id=?").run(f.caCert.fingerprint256.replaceAll(":", "").toLowerCase());
+      if (change === "ca-version") f.db.prepare("UPDATE certificate_authorities SET ca_version=ca_version+1 WHERE ca_id=?").run(f.caCert.fingerprint256.replaceAll(":", "").toLowerCase());
+      if (change === "host-version") f.db.prepare("UPDATE host_certificates SET version=version+1 WHERE candidate_id='host-1'").run();
+      const prepared = f.registry.prepare(f.guard); assert.ok(prepared.ok);
+      const service = new OwnerNativeEvidenceOwnerConfirmService(f.db, f.registry, f.sessions, ORIGINS, () => f.currentTime);
+      const beforeAudit = auditCount(f);
+      assert.equal(service.confirm(ownerConfirmRequest(f, prepared.handle)).outcome, "stale", "prior readVerified output is not append permission");
+      assert.equal(evidenceCount(f), 0); assert.equal(auditCount(f), beforeAudit);
+    } finally { f.db.close(); rmSync(f.root, { recursive: true, force: true }); }
+  });
+});
+
+test("owner-confirm same-tuple retry from another fresh session conflicts and preserves the original consent row", async () => {
+  const f = await verifiedTrustFixture(true);
+  try {
+    await alignOwnerConfirmSession(f);
+    const service = new OwnerNativeEvidenceOwnerConfirmService(f.db, f.registry, f.sessions, ORIGINS, () => f.currentTime);
+    const firstCandidate = f.registry.prepare(f.guard); assert.ok(firstCandidate.ok);
+    const beforeAudit = auditCount(f);
+    assert.equal(service.confirm(ownerConfirmRequest(f, firstCandidate.handle)).outcome, "stored");
+    const original = f.db.prepare("SELECT * FROM supplemental_native_evidence").get();
+    const secondSession = await f.sessions.create({ username: "admin", password: "owner-password-123" }); assert.ok(secondSession);
+    const secondGuard = guardManagementRequest(f.sessions, ORIGINS, { method: "POST", cookieHeader: `__Host-lanmm_session=${secondSession.sessionToken}`,
+      originHeader: "https://manager.example", csrfHeader: secondSession.csrfToken });
+    assert.equal(secondGuard.ok, true);
+    const secondCandidate = f.registry.prepare(secondGuard); assert.ok(secondCandidate.ok);
+    const request = { method: "POST", path: "/api/v1/native-evidence/confirm", cookieHeader: `__Host-lanmm_session=${secondSession.sessionToken}`,
+      originHeader: "https://manager.example", csrfHeader: secondSession.csrfToken,
+      body: JSON.stringify({ candidateHandle: secondCandidate.handle, expectedTupleDigest: f.candidate.tupleDigest,
+        action: "append-supplemental-native-evidence", disposition: "evidence-only" }) };
+    assert.equal(service.confirm(request).outcome, "conflict", "session-bound owner consent cannot be silently reused as an exact duplicate");
+    assert.deepEqual(f.db.prepare("SELECT * FROM supplemental_native_evidence").get(), original);
+    assert.equal(evidenceCount(f), 1); assert.equal(auditCount(f), beforeAudit + 1);
+  } finally { f.db.close(); rmSync(f.root, { recursive: true, force: true }); }
 });

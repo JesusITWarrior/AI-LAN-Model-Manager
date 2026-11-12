@@ -1,6 +1,9 @@
 import { createHash, X509Certificate } from "node:crypto";
 import { types } from "node:util";
 import type { DatabaseSync } from "node:sqlite";
+import { guardManagementRequest } from "./guard.js";
+import type { SessionManager } from "./session-manager.js";
+import { createAllowedOrigins } from "./origin.js";
 import {
   canonicalCertificateSerial, sameCertificateSerial, commandAuthorizationDigest, parseCertificateAuthorityMetadata,
   parseCommandRequest, parseCommandResponse, parseHostCertificateMetadata, parseJobSnapshot,
@@ -186,6 +189,7 @@ type SnapshotComparisonView = Readonly<{
   tuple: import("./owner-native-evidence-candidates.js").NativeEvidenceCandidateTuple;
   responseBytes: Uint8Array;
   certificateBindingAssertion: import("./owner-native-evidence-candidates.js").NativeEvidenceCertificateAssertion;
+  serverBinding: Readonly<{ ownerId: string; sessionId: string; credentialVersion: number; expiresAt: string }>;
 }>;
 function compareCurrentSnapshot(db: DatabaseSync, tx: unknown, view: SnapshotComparisonView, now: string): "match" | "mismatch" {
   try {
@@ -369,5 +373,132 @@ export class OwnerNativeEvidenceTransactionOwner {
     } catch {
       return Object.freeze({ outcome: "committed_append_unsettled" });
     }
+  }
+}
+
+const OWNER_CONFIRM_ABORT = "ERR_OWNER_CONFIRM_ABORT";
+const OWNER_CONFIRM_PATH = "/api/v1/native-evidence/confirm";
+const OWNER_CONFIRM_MAX_BODY = 4096;
+export type OwnerConfirmResult = Readonly<{ outcome: "stored" | "already_stored" | "conflict" | "stale" | "denied" | "transaction_unknown" | "committed_unsettled"; tupleDigest?: string }>;
+function exactOwnData(value: unknown, keys: readonly string[]): Record<string, unknown> | null {
+  if (!value || typeof value !== "object" || Array.isArray(value) || types.isProxy(value)) return null;
+  try {
+    const proto = Object.getPrototypeOf(value), own = Reflect.ownKeys(value), descriptors = Object.getOwnPropertyDescriptors(value);
+    if ((proto !== Object.prototype && proto !== null) || own.length !== keys.length || own.some(k => typeof k !== "string" || !keys.includes(k))) return null;
+    const result = Object.create(null) as Record<string, unknown>;
+    for (const key of keys) { const descriptor = descriptors[key]; if (!descriptor || !("value" in descriptor)) return null; result[key] = descriptor.value; }
+    return result;
+  } catch { return null; }
+}
+function confirmResult(outcome: OwnerConfirmResult["outcome"], tupleDigest?: string): OwnerConfirmResult {
+  return Object.freeze(tupleDigest ? { outcome, tupleDigest } : { outcome });
+}
+function finalOwnerSessionCheck(db: DatabaseSync, session: import("./session-types.js").SessionMetadata,
+  binding: Readonly<{ ownerId: string; sessionId: string; credentialVersion: number; expiresAt: string }>, now: string): boolean {
+  // This is deliberately plain SQL after registry/session callbacks have all returned.
+  // SessionManager keeps the token digest private, so match its immutable metadata and
+  // require a unique persisted row; ambiguity fails closed rather than guessing a token.
+  if (session.ownerId !== binding.ownerId || session.credentialVersion !== binding.credentialVersion ||
+      session.revokedAt !== null || !canonicalTime(now)) return false;
+  const owner = db.prepare("SELECT disabled,credential_version FROM owners WHERE owner_id=? LIMIT 2").all(session.ownerId) as Row[];
+  if (owner.length !== 1 || owner[0]!.disabled !== 0 || Number(owner[0]!.credential_version) !== binding.credentialVersion) return false;
+  const rows = db.prepare("SELECT session_digest,credential_version,session_version,created_at,last_seen_at,absolute_expires_at,idle_expires_at,revoked_at FROM sessions WHERE owner_id=? AND credential_version=? AND session_version=? AND created_at=? AND last_seen_at=? AND absolute_expires_at=? AND idle_expires_at=?").all(
+    session.ownerId, session.credentialVersion, session.sessionVersion, session.createdAt, session.lastSeenAt, session.absoluteExpiresAt, session.idleExpiresAt) as Row[];
+  const exact = rows.filter(row => typeof row.session_digest === "string" && /^[a-f0-9]{64}$/.test(row.session_digest) &&
+    createHash("sha256").update(`owner-lifecycle-session:${row.session_digest}:${row.credential_version}`).digest("hex") === binding.sessionId);
+  if (exact.length !== 1 || exact[0]!.revoked_at !== null || exact[0]!.credential_version !== session.credentialVersion ||
+      exact[0]!.session_version !== session.sessionVersion || exact[0]!.created_at !== session.createdAt || exact[0]!.last_seen_at !== session.lastSeenAt ||
+      exact[0]!.absolute_expires_at !== session.absoluteExpiresAt || exact[0]!.idle_expires_at !== session.idleExpiresAt) return false;
+  const expiresAt = new Date(Math.min(Date.parse(session.absoluteExpiresAt), Date.parse(session.idleExpiresAt))).toISOString();
+  return expiresAt === binding.expiresAt && Date.parse(now) < Date.parse(expiresAt);
+}
+
+/** Server-owned, explicit POST boundary. This service is not itself an HTTP route. */
+export class OwnerNativeEvidenceOwnerConfirmService {
+  private readonly stores: ReturnType<typeof createJobStores>;
+  private readonly origins: readonly string[];
+  constructor(private readonly db: DatabaseSync, private readonly registry: OwnerNativeEvidenceCandidateRegistry,
+    private readonly sessions: SessionManager, allowedOrigins: readonly string[], private readonly clock: () => string = () => new Date().toISOString()) {
+    this.origins = createAllowedOrigins([...allowedOrigins]);
+    this.stores = createJobStores(db);
+  }
+
+  confirm(request: unknown): OwnerConfirmResult {
+    const envelope = exactOwnData(request, ["method", "path", "cookieHeader", "originHeader", "csrfHeader", "body"]);
+    if (!envelope || envelope.method !== "POST" || envelope.path !== OWNER_CONFIRM_PATH ||
+        typeof envelope.cookieHeader !== "string" || envelope.cookieHeader.length > 4096 || (envelope.originHeader !== null && (typeof envelope.originHeader !== "string" || envelope.originHeader.length > 2048)) ||
+        (envelope.csrfHeader !== null && (typeof envelope.csrfHeader !== "string" || envelope.csrfHeader.length > 128)) || typeof envelope.body !== "string" ||
+        Buffer.byteLength(envelope.body, "utf8") > OWNER_CONFIRM_MAX_BODY) return confirmResult("denied");
+    let body: Record<string, unknown> | null = null;
+    try { body = exactOwnData(strictWireJson(Buffer.from(envelope.body, "utf8"), OWNER_CONFIRM_MAX_BODY), ["candidateHandle", "expectedTupleDigest", "action", "disposition"]); } catch { /* fixed denial */ }
+    if (!body || typeof body.candidateHandle !== "string" || !/^[\x21-\x7e]{1,128}$/.test(body.candidateHandle) ||
+        typeof body.expectedTupleDigest !== "string" || !/^[a-f0-9]{64}$/.test(body.expectedTupleDigest) ||
+        body.action !== EVIDENCE_ONLY_ACTION || body.disposition !== EVIDENCE_ONLY_DISPOSITION) return confirmResult("denied");
+    const guard = guardManagementRequest(this.sessions, this.origins, { method: envelope.method, cookieHeader: envelope.cookieHeader,
+      originHeader: envelope.originHeader, csrfHeader: envelope.csrfHeader });
+    if (!guard.ok) return confirmResult("denied");
+    const observed = this.registry.inspect(guard, body.candidateHandle);
+    if (!observed.ok || observed.summary.tupleDigest !== body.expectedTupleDigest) return confirmResult("stale");
+    const claimed = this.registry.claim(guard, { handle: body.candidateHandle, action: EVIDENCE_ONLY_ACTION, disposition: EVIDENCE_ONLY_DISPOSITION });
+    if (!claimed.ok) return confirmResult("stale");
+    const token = claimed.token;
+    let sampledAt = "", attempted = false, callbackComplete = false;
+    const state: { appendResult: AppendResult | null; captured: { view: SnapshotComparisonView; trust: VerifiedCurrentTrustSnapshot } | null } = { appendResult: null, captured: null };
+    const repository = new SupplementalNativeEvidenceRepository(this.db, () => sampledAt);
+    try {
+      this.stores.withAuditTransaction(tx => {
+        sampledAt = this.clock();
+        if (!canonicalTime(sampledAt)) throw new Error(OWNER_CONFIRM_ABORT);
+        const lease = this.registry.withLeaseView(guard, tx, token, view => {
+          if (view.tupleDigest !== body!.expectedTupleDigest || compareCurrentSnapshot(this.db, tx, view, sampledAt) !== "match") return "mismatch";
+          const trust = verifyCurrentTrust(this.db, view, sampledAt);
+          if (!trust) return "mismatch";
+          const prior = this.db.prepare("SELECT consented_at FROM supplemental_native_evidence WHERE tuple_digest=?").get(view.tupleDigest) as { consented_at: unknown } | undefined;
+          const priorTime = prior && canonicalTime(prior.consented_at) ? prior.consented_at : null;
+          const consentedAt = priorTime ?? sampledAt;
+          const input = { tuple: view.tuple, tupleDigest: view.tupleDigest, payloadBytes: view.payloadBytes, responseBytes: view.responseBytes,
+            consent: { ownerId: view.serverBinding.ownerId, sessionBindingDigest: view.serverBinding.sessionId,
+              credentialVersion: view.serverBinding.credentialVersion, hostCertificateBindingDigest: trust.hostCertificateBindingDigest,
+              action: EVIDENCE_ONLY_ACTION, disposition: EVIDENCE_ONLY_DISPOSITION, consentedAt } };
+          state.captured = { view, trust };
+          attempted = true;
+          try { state.appendResult = repository.appendInTransaction(tx as CoupledContext, input); }
+          catch (error) {
+            if (error instanceof Error && error.message === "ERR_SUPPLEMENTAL_EVIDENCE_CONFLICT") {
+              state.appendResult = Object.freeze({ ok: false as const, code: "ERR_SUPPLEMENTAL_EVIDENCE_CONFLICT" as const });
+              return "match";
+            }
+            throw error;
+          }
+          return "match";
+        });
+        if (attempted && !(lease.ok && lease.match)) throw new Error(OWNER_CONFIRM_ABORT);
+        if (!lease.ok || !lease.match) { callbackComplete = true; return; }
+        // All callback-capable registry/session checks are complete. Re-read only SQLite facts now.
+        const final = state.captured;
+        if (!final || !finalOwnerSessionCheck(this.db, guard.session, final.view.serverBinding, sampledAt) ||
+            compareCurrentSnapshot(this.db, tx, final.view, sampledAt) !== "match") throw new Error(OWNER_CONFIRM_ABORT);
+        const finalTrust = verifyCurrentTrust(this.db, final.view, sampledAt);
+        if (!finalTrust || JSON.stringify(finalTrust) !== JSON.stringify(final.trust)) throw new Error(OWNER_CONFIRM_ABORT);
+        callbackComplete = true;
+      });
+    } catch {
+      // The transaction wrapper does not report whether rollback itself succeeded.
+      // A thrown callback/COMMIT therefore leaves both DB and lease outcome unknown.
+      return confirmResult("transaction_unknown");
+    }
+    if (!callbackComplete) {
+      try { this.registry.releaseLease(guard, token); } catch { /* fixed stale result */ }
+      return confirmResult("stale");
+    }
+    const appendResult = state.appendResult;
+    if (!appendResult?.ok) {
+      try { this.registry.releaseLease(guard, token); } catch { /* known no-append transaction */ }
+      return confirmResult(appendResult?.code === "ERR_SUPPLEMENTAL_EVIDENCE_CONFLICT" ? "conflict" : "stale");
+    }
+    let settled = false;
+    try { settled = this.registry.commitLease(guard, token).ok; } catch { /* committed state remains truthful */ }
+    if (!settled) return confirmResult("committed_unsettled", appendResult.tupleDigest);
+    return confirmResult(appendResult.duplicate ? "already_stored" : "stored", appendResult.tupleDigest);
   }
 }
