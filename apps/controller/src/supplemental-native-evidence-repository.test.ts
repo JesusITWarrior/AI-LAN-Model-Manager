@@ -1,16 +1,40 @@
 import assert from "node:assert/strict";
 import { createHash } from "node:crypto";
-import { readFileSync } from "node:fs";
+import { mkdtempSync, readFileSync, rmSync } from "node:fs";
 import { dirname, join } from "node:path";
+import { tmpdir } from "node:os";
 import { fileURLToPath } from "node:url";
 import test from "node:test";
 import { DatabaseSync } from "node:sqlite";
 import { commandAuthorizationDigest, parseCommandRequest, type CommandRequest } from "@lan-model-manager/core";
+import { CONTROLLER_MIGRATIONS, migrateControllerDatabase, openControllerDatabase } from "./database.js";
 import { decodeNativeTerminalEvidence, encodeNativeTerminalEvidence, MAX_EVIDENCE_RESPONSE_BYTES } from "./native-terminal-evidence-codec.js";
 import { SupplementalNativeEvidenceRepository, EVIDENCE_MAX_PAYLOAD_BYTES, EVIDENCE_MAX_RESPONSE_BYTES, type EvidenceTuple, type SupplementalEvidenceInput } from "./supplemental-native-evidence-repository.js";
 import { createJobStores, type CoupledContext } from "./jobs-store.js";
 
 const NOW = "2026-11-11T19:00:00.000Z";
+// These hashes are the immutable migration ledger checksums from committed baseline
+// 8a5b9a6e4bb0eb85ddf3ca9fa2b4259ab8e39a10, not values captured from the candidate.
+const BASELINE_MIGRATION_CHECKSUMS_1_TO_18 = [
+  "4329948742a7560ca654fdd0fe076aa2e503150cbc4835b099011e5a0209faa0",
+  "5a7f1cb743c39557d94f6610c094727690476e96a288b5dc1c051456f48bd1ef",
+  "00b4141acc8ed6d251aade3213c43eb4c818be57a1c1d31c03759cf2119bea3d",
+  "a1570861e67748e877929be958c3a93d813d03a9fecef1e2f08d93c2854272da",
+  "4c5d8a818963dc82fa6b64d4e0c2385ba3e5d25eb1acb8601026063cd22c5e86",
+  "6b441582433a647c4fceffba33d7458f721f8e0880d4f3863a127c4bb6cd6561",
+  "26ed19a4241ed604717918c29fa7dd3a11c8081eabaf289337463cbf79344474",
+  "c41abf1deaee8be1a232f153fb31bdf4575a3368d27a127787bdc552d9083b8e",
+  "6ef8c8f6bf6c952cc8bb60c9a88cc9f70d1e5a67bf75704e2e933d5e0ef02a72",
+  "84e0b665bca0e45e3a7a1516d3f4543c97d3b7e910069dbd84848843a2ef741a",
+  "f784679afa036d0600422df07c9902667eed026a8bff2586be3f259ea17d3c32",
+  "84346d49c6c78e4c7fa9767061ca8fd29403aea0839686e625c6c4aa164f1713",
+  "e56af9f18933939c25e46e569ff2cf5bfbd7b80166f8ea57ff5ce2c980e97ae9",
+  "5b8ef8e0b538c4be1fe87091029d1396ce590e945b56309de331a53425876d7f",
+  "393b251e9ca76c68b8d9e6399b049c58636d4c45c38afc948dfc14506e9d2cfb",
+  "3ff48fe4ff900daba02f600cdd8ec420f2fd5290953aa415ce8f4854a9a50187",
+  "913aedfc7a0d7bf65306d7c6b38ca1ee8cad963a8cd0402b2465cd452125b3b3",
+  "230268288fd4eee541ec2d37b72f223ce8d4ee99613c5c88804107b75342aaec",
+] as const;
 const TUPLE_KEYS = ["domain", "hostId", "jobId", "requestId", "commandSequence", "idempotencyKey", "authorizationRequestDigest",
   "storedQueueDigest", "terminalState", "terminalRevision", "responseDigest", "responseByteLength", "evidenceKind", "holdClass"] as const;
 const hash = (domain: string, value: Uint8Array | string) => createHash("sha256").update(domain, "utf8").update(value).digest("hex");
@@ -49,14 +73,139 @@ function setup() {
   db.prepare("INSERT INTO agent_commands(job_id,result_json) VALUES(?,?)").run("job-1", '{"status":"completed","result":"unchanged"}');
   return { db, repo: new SupplementalNativeEvidenceRepository(db, () => NOW) };
 }
+
+test("production migration 19 proves baseline compatibility, atomic rollback, duplicate/conflict behavior, and append-only guards", () => {
+  const db = new DatabaseSync(":memory:");
+  try {
+    assert.equal(CONTROLLER_MIGRATIONS.length, 19);
+    assert.deepEqual(CONTROLLER_MIGRATIONS.slice(0, 18).map(m => m.checksum), BASELINE_MIGRATION_CHECKSUMS_1_TO_18);
+    const priorMigrations = CONTROLLER_MIGRATIONS.slice(0, 18);
+    migrateControllerDatabase(db, priorMigrations);
+    const priorLedger = db.prepare("SELECT version,name,checksum FROM schema_migrations ORDER BY version").all();
+    assert.deepEqual(priorLedger.map(row => (row as { checksum: string }).checksum), BASELINE_MIGRATION_CHECKSUMS_1_TO_18);
+    assert.equal((db.prepare("PRAGMA user_version").get() as { user_version: number }).user_version, 18);
+    db.prepare("INSERT INTO hosts VALUES(?,?,?,?,?,?,?,?,?)").run("host-before-upgrade", "Synthetic", "linux", NOW, 0, "offline", "{}", NOW, NOW);
+    const priorHost = db.prepare("SELECT * FROM hosts WHERE host_id=?").get("host-before-upgrade");
+
+    migrateControllerDatabase(db, CONTROLLER_MIGRATIONS);
+    assert.deepEqual(db.prepare("SELECT version,name,checksum FROM schema_migrations WHERE version<=18 ORDER BY version").all(), priorLedger);
+    assert.equal((db.prepare("PRAGMA user_version").get() as { user_version: number }).user_version, 19);
+    assert.deepEqual(db.prepare("SELECT * FROM hosts WHERE host_id=?").get("host-before-upgrade"), priorHost);
+    const columns = (db.prepare("PRAGMA table_info(supplemental_native_evidence)").all() as Array<{ name: string }>).map(row => row.name);
+    assert.deepEqual(columns, ["tuple_digest", "tuple_json", "payload_bytes", "payload_digest", "response_bytes", "response_digest",
+      "response_byte_length", "owner_id", "session_binding_digest", "credential_version", "host_certificate_binding_digest",
+      "consent_action", "consent_disposition", "consented_at", "consent_json", "consent_binding_digest", "receipt_core_json", "committed_at"]);
+    assert.equal(db.prepare("SELECT name FROM sqlite_master WHERE type='table' AND name='evidence_commit_guard'").get(), undefined);
+
+    const repo = new SupplementalNativeEvidenceRepository(db, () => NOW);
+    seedProtectedProductionRows(db);
+    const protectedBefore = lifecycleSnapshot(db);
+    db.exec("PRAGMA recursive_triggers=OFF");
+    assert.equal((db.prepare("PRAGMA recursive_triggers").get() as { recursive_triggers: number }).recursive_triggers, 0);
+
+    // The audit append happens after evidence INSERT in the same repository transaction.
+    // Force that second mutation to fail and prove neither mutation nor protected data survives.
+    db.exec("CREATE TRIGGER reject_production_audit BEFORE INSERT ON audit_events BEGIN SELECT RAISE(ABORT,'audit failure canary'); END;");
+    assert.deepEqual(repo.append(candidate()), { ok: false, code: "ERR_SUPPLEMENTAL_EVIDENCE_DATABASE" });
+    assert.deepEqual(counts(db), { evidence: 0, audit: 0 });
+    assert.equal(lifecycleSnapshot(db), protectedBefore);
+    db.exec("DROP TRIGGER reject_production_audit");
+
+    const input = candidate();
+    const first = repo.append(input);
+    assert.equal(first.ok, true);
+    if (!first.ok) return;
+    assert.equal(first.duplicate, false);
+    const evidenceAfterFirst = evidenceSnapshot(db), auditAfterFirst = JSON.stringify(db.prepare("SELECT * FROM audit_events ORDER BY seq").all());
+    const duplicate = repo.append(input);
+    assert.equal(duplicate.ok, true);
+    if (!duplicate.ok) return;
+    assert.equal(duplicate.duplicate, true);
+    assert.deepEqual(duplicate.receiptCore, first.receiptCore);
+    assert.deepEqual(counts(db), { evidence: 1, audit: 1 });
+    assert.equal(evidenceSnapshot(db), evidenceAfterFirst);
+    assert.equal(JSON.stringify(db.prepare("SELECT * FROM audit_events ORDER BY seq").all()), auditAfterFirst);
+    const evidenceBeforeConflict = evidenceSnapshot(db), auditBeforeConflict = JSON.stringify(db.prepare("SELECT * FROM audit_events ORDER BY seq").all());
+    assert.deepEqual(repo.append({ ...input, consent: { ...input.consent, sessionBindingDigest: "f".repeat(64) } }),
+      { ok: false, code: "ERR_SUPPLEMENTAL_EVIDENCE_CONFLICT" });
+    assert.deepEqual(counts(db), { evidence: 1, audit: 1 });
+    assert.equal(evidenceSnapshot(db), evidenceBeforeConflict);
+    assert.equal(JSON.stringify(db.prepare("SELECT * FROM audit_events ORDER BY seq").all()), auditBeforeConflict);
+    assert.equal(lifecycleSnapshot(db), protectedBefore);
+
+    const stored = evidenceSnapshot(db);
+    assert.ok(stored);
+    assert.throws(() => db.prepare("UPDATE supplemental_native_evidence SET committed_at=?").run(NOW));
+    assert.throws(() => db.prepare("DELETE FROM supplemental_native_evidence").run());
+    assert.throws(() => db.prepare("INSERT OR REPLACE INTO supplemental_native_evidence SELECT * FROM supplemental_native_evidence LIMIT 1").run());
+    assert.equal(evidenceSnapshot(db), stored);
+    assert.deepEqual(counts(db), { evidence: 1, audit: 1 });
+    assert.equal(lifecycleSnapshot(db), protectedBefore);
+  } finally { db.close(); }
+});
+
+test("production database retains evidence and audit across close/reopen with idempotent migration ledger", () => {
+  const dir = mkdtempSync(join(tmpdir(), "lanmm-evidence-production-"));
+  const path = join(dir, "controller.sqlite3");
+  let db: DatabaseSync | undefined;
+  try {
+    db = openControllerDatabase(path);
+    assert.deepEqual(CONTROLLER_MIGRATIONS.slice(0, 18).map(m => m.checksum), BASELINE_MIGRATION_CHECKSUMS_1_TO_18);
+    seedProtectedProductionRows(db);
+    const repo = new SupplementalNativeEvidenceRepository(db, () => NOW);
+    const result = repo.append(candidate());
+    assert.equal(result.ok, true);
+    assert.deepEqual(counts(db), { evidence: 1, audit: 1 });
+    const evidenceBefore = evidenceSnapshot(db);
+    const auditBefore = JSON.stringify(db.prepare("SELECT * FROM audit_events ORDER BY seq").all());
+    const protectedBefore = lifecycleSnapshot(db);
+    const ledgerBefore = JSON.stringify(db.prepare("SELECT version,name,checksum,applied_at FROM schema_migrations ORDER BY version").all());
+    db.close(); db = undefined;
+
+    db = openControllerDatabase(path);
+    assert.equal((db.prepare("PRAGMA user_version").get() as { user_version: number }).user_version, 19);
+    assert.equal(evidenceSnapshot(db), evidenceBefore);
+    assert.equal(JSON.stringify(db.prepare("SELECT * FROM audit_events ORDER BY seq").all()), auditBefore);
+    assert.equal(lifecycleSnapshot(db), protectedBefore);
+    assert.equal(JSON.stringify(db.prepare("SELECT version,name,checksum,applied_at FROM schema_migrations ORDER BY version").all()), ledgerBefore);
+    assert.equal((db.prepare("PRAGMA integrity_check").get() as { integrity_check: string }).integrity_check, "ok");
+    assert.deepEqual(db.prepare("PRAGMA foreign_key_check").all(), []);
+    assert.deepEqual(CONTROLLER_MIGRATIONS.slice(0, 18).map(m => m.checksum), BASELINE_MIGRATION_CHECKSUMS_1_TO_18);
+  } finally {
+    db?.close();
+    rmSync(dir, { recursive: true, force: true });
+  }
+});
+
+function seedProtectedProductionRows(db: DatabaseSync): void {
+  db.prepare(`INSERT INTO jobs(job_id,state,host_id,submitted_at,updated_at,attempt,idempotency_key,payload_json,created_at)
+    VALUES(?,?,?,?,?,?,?,?,?)`).run("protected-job", "timed-out", "host-1", NOW, NOW, 2, "protected-idem", '{"payload":"must remain byte-identical"}', NOW);
+  db.prepare(`INSERT INTO job_history(job_id,from_state,to_state,attempt,occurred_at,created_at)
+    VALUES(?,?,?,?,?,?)`).run("protected-job", "running", "timed-out", 2, NOW, NOW);
+  db.prepare(`INSERT INTO agent_commands(job_id,host_id,request_json,request_digest,state,lease_until,result_json,created_at,updated_at)
+    VALUES(?,?,?,?,?,?,?,?,?)`).run("protected-job", "host-1", '{"request":"protected"}', "a".repeat(64), "completed", null,
+      '{"result":"must remain byte-identical"}', NOW, NOW);
+}
+
+test("open production database applies migration 19 and repository appends synthetic evidence", () => {
+  const db = openControllerDatabase(":memory:");
+  try {
+    assert.equal((db.prepare("PRAGMA user_version").get() as { user_version: number }).user_version, 19);
+    const repo = new SupplementalNativeEvidenceRepository(db, () => NOW);
+    const result = repo.append(candidate());
+    assert.equal(result.ok, true);
+    assert.deepEqual(counts(db), { evidence: 1, audit: 1 });
+  } finally { db.close(); }
+});
+
 function counts(db: DatabaseSync) {
   return { evidence: (db.prepare("SELECT count(*) AS n FROM supplemental_native_evidence").get() as {n:number}).n,
     audit: (db.prepare("SELECT count(*) AS n FROM audit_events").get() as {n:number}).n };
 }
 function lifecycleSnapshot(db: DatabaseSync): string {
-  const jobs = db.prepare("SELECT job_id,payload_json FROM jobs ORDER BY job_id").all();
-  const history = db.prepare("SELECT history_id,job_id,event_json FROM job_history ORDER BY history_id").all();
-  const commands = db.prepare("SELECT job_id,result_json FROM agent_commands ORDER BY job_id").all();
+  const jobs = db.prepare("SELECT * FROM jobs ORDER BY job_id").all();
+  const history = db.prepare("SELECT * FROM job_history ORDER BY history_id").all();
+  const commands = db.prepare("SELECT * FROM agent_commands ORDER BY job_id").all();
   return JSON.stringify([jobs, history, commands]);
 }
 function evidenceSnapshot(db: DatabaseSync): string {

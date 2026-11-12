@@ -43,6 +43,9 @@ async function fixture(largeRequest = false) {
   const testSchema = readFileSync(join(dirname(fileURLToPath(import.meta.url)), "supplemental-native-evidence-test-schema.sql"), "utf8");
   const marker = "CREATE TABLE evidence_commit_guard";
   assert.equal(testSchema.split(marker).length - 1, 1, "expected one opt-in evidence schema marker");
+  // These synthetic transaction tests own the deferred-commit fixture schema;
+  // discard the production migration table first to avoid conflating the two.
+  db.exec("DROP TABLE supplemental_native_evidence");
   db.exec(testSchema.slice(testSchema.indexOf(marker)));
   let now = START, random = 0;
   const owners = createOwnerBootstrapService(db, { now: () => now, ownerId: () => "a".repeat(32), crypto: passwordCrypto });
