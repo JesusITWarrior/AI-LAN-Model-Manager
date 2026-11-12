@@ -445,27 +445,58 @@ test("captured coupled context is revoked when callback throws and a fresh callb
   } finally { db.close(); }
 });
 
-test("deferred COMMIT failure revokes context while SQLite transaction remains, then fresh callback works after rollback", () => {
+test("deferred COMMIT failure triggers automatic rollback then a fresh callback works without manual cleanup", () => {
   const { stores, db } = memoryStores();
   try {
     db.exec("CREATE TABLE tx_context_parent(id INTEGER PRIMARY KEY)");
     db.exec("CREATE TABLE tx_context_child(parent_id INTEGER REFERENCES tx_context_parent(id) DEFERRABLE INITIALLY DEFERRED)");
     let captured: unknown;
+    // A real deferred FK violation surfaces at COMMIT; withAuditTransaction now
+    // rolls back automatically, so no manual ROLLBACK is required by the caller.
     assert.throws(() => stores.withAuditTransaction((tx) => {
       captured = tx;
       assert.equal(isActiveCoupledContext(tx, db), true);
       db.prepare("INSERT INTO tx_context_child(parent_id) VALUES(?)").run(99);
     }));
-    // The existing API leaves failed-COMMIT cleanup to its owner; issuance is
-    // nevertheless revoked before this external cleanup, even while SQLite is active.
-    assert.equal(db.isTransaction, true);
+    // Transaction automatically rolled back; SQLite is no longer in a transaction.
+    assert.equal(db.isTransaction, false);
+    // The pending (uncommitted) insert was discarded by the rollback.
+    const rows: Array<Record<string, unknown>> = db.prepare("SELECT * FROM tx_context_child").all();
+    assert.equal(rows.length, 0);
+    // Captured context is revoked.
     assert.equal(isActiveCoupledContext(captured, db), false);
-    assert.throws(() => stores.withAuditTransaction(() => {}), JobStoreError);
-    assert.equal(db.isTransaction, true);
-    db.exec("ROLLBACK");
+    // Fresh callback works without any manual rollback/cleanup.
     stores.withAuditTransaction((tx) => assert.equal(isActiveCoupledContext(tx, db), true));
   } finally {
-    if (db.isTransaction) db.exec("ROLLBACK");
+    db.close();
+  }
+});
+
+test("callback failure preserves exact thrown object through rollback", () => {
+  const { stores, db } = memoryStores();
+  try {
+    db.exec("CREATE TABLE tx_error_child(id INTEGER PRIMARY KEY)");
+    const original = Object.freeze({ sentinel: "original callback failure" });
+    let captured: unknown;
+    let received: unknown;
+    assert.throws(
+      () => stores.withAuditTransaction((tx) => {
+        captured = tx;
+        db.prepare("INSERT INTO tx_error_child(id) VALUES(?)").run(1);
+        throw original;
+      }),
+      (error: unknown) => {
+        received = error;
+        return true;
+      },
+    );
+    // Preserve arbitrary thrown values exactly while rolling back callback writes.
+    assert.equal(received, original);
+    assert.equal(db.isTransaction, false);
+    assert.equal((db.prepare("SELECT count(*) AS n FROM tx_error_child").get() as { n: number }).n, 0);
+    assert.equal(isActiveCoupledContext(captured, db), false);
+    stores.withAuditTransaction((tx) => assert.equal(isActiveCoupledContext(tx, db), true));
+  } finally {
     db.close();
   }
 });

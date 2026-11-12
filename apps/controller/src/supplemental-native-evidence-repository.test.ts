@@ -343,14 +343,16 @@ test("exact in-transaction duplicate adds no audit; conflicting duplicate propag
   } finally { db.close(); }
 });
 
-test("in-transaction audit failure propagates for owner rollback and deferred COMMIT remains owner-managed", () => {
+test("in-transaction audit failure rolls back and deferred COMMIT failure is automatically cleaned up", () => {
   const { db, repo } = setup();
   const stores = createJobStores(db, { now: () => NOW });
+  const before = lifecycleSnapshot(db);
   try {
     db.exec("CREATE TRIGGER reject_outer_audit BEFORE INSERT ON audit_events BEGIN SELECT RAISE(ABORT,'audit failure canary'); END;");
     assert.throws(() => stores.withAuditTransaction((tx) => repo.appendInTransaction(tx, candidate())));
     assert.deepEqual(counts(db), { evidence: 0, audit: 0 });
     assert.equal(db.isTransaction, false);
+    assert.equal(lifecycleSnapshot(db), before);
     db.exec("DROP TRIGGER reject_outer_audit");
 
     db.exec(`CREATE TRIGGER invalidate_commit_guard AFTER INSERT ON supplemental_native_evidence
@@ -359,13 +361,17 @@ test("in-transaction audit failure propagates for owner rollback and deferred CO
     assert.throws(() => stores.withAuditTransaction((tx) => { tentative.push(repo.appendInTransaction(tx, candidate())); }));
     assert.equal(tentative.length, 1);
     assert.equal(tentative[0]!.duplicate, false);
-    assert.equal(db.isTransaction, true);
-    assert.deepEqual(counts(db), { evidence: 1, audit: 1 });
-    // The result above was only provisional: outer COMMIT failed. The transaction
-    // owner performs cleanup; the repository method must not commit/rollback it.
-    db.exec("ROLLBACK");
+    // A successful in-callback append is provisional; the deferred COMMIT fails,
+    // and the transaction owner automatically rolls the evidence and audit back.
     assert.equal(db.isTransaction, false);
     assert.deepEqual(counts(db), { evidence: 0, audit: 0 });
+    assert.equal(lifecycleSnapshot(db), before);
+
+    db.exec("DROP TRIGGER invalidate_commit_guard");
+    const recovered = repo.append(candidate());
+    assert.equal(recovered.ok, true);
+    assert.deepEqual(counts(db), { evidence: 1, audit: 1 });
+    assert.equal(lifecycleSnapshot(db), before);
   } finally { if (db.isTransaction) db.exec("ROLLBACK"); db.close(); }
 });
 

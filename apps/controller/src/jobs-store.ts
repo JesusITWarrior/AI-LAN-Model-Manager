@@ -856,6 +856,7 @@ export function createJobStores(db: DatabaseSync, options: { readonly now?: () =
         coupledContextIssues.set(context, issue);
         try {
           mutate(context);
+          db.exec("COMMIT");
         } catch (e) {
           try {
             db.exec("ROLLBACK");
@@ -864,7 +865,6 @@ export function createJobStores(db: DatabaseSync, options: { readonly now?: () =
           }
           throw e;
         }
-        db.exec("COMMIT");
       } finally {
         issue.active = false;
         couplingState.set(db, false);
