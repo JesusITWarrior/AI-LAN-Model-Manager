@@ -19,6 +19,8 @@ import { createAdmissionController, type AdmissionController } from "./admission
 import { LifecycleService } from "./lifecycle-service.js";
 import { RemoteLifecycleController } from "./remote-lifecycle.js";
 import type { CertificateEngine } from "./certificate-types.js";
+import { createOwnerNativeEvidenceRuntime, type OwnerNativeEvidenceRuntime } from "./owner-native-evidence-runtime.js";
+import type { OriginPolicyOptions } from "./origin.js";
 
 import { openControllerDatabase } from "./database.js";
 import type { ControllerRepositories } from "./repositories.js";
@@ -70,6 +72,8 @@ export interface ControllerCoreServices {
   readonly admissions: AdmissionController;
   readonly lifecycle: RemoteLifecycleController;
   readonly inference: RemoteInferenceService;
+  /** Present only when explicitly composed by the application/runtime caller. */
+  readonly ownerEvidence?: OwnerNativeEvidenceRuntime;
 }
 
 export interface CoreServiceDependencies {
@@ -197,6 +201,8 @@ export interface RuntimeBuildOptions {
   readonly hooks?: RuntimeLifecycleHooks;
   /** Optional dependency overrides for tests / edge cases. */
   readonly dependencies?: RuntimeDependencies;
+  /** Explicit opt-in; omitted runtimes do not compose owner-evidence services. */
+  readonly ownerEvidence?: Readonly<{ allowedOrigins: readonly string[]; originOptions?: OriginPolicyOptions }>;
 }
 
 const NATIVE_FLAVOR: "posix" | "win32" = process.platform === "win32" ? "win32" : "posix";
@@ -225,6 +231,34 @@ function isPlainRecord(input: unknown, keys: readonly string[]): boolean {
     const descriptor = descriptors[key];
     return !!descriptor && "value" in descriptor;
   });
+}
+
+/** Copy and validate optional caller-supplied evidence policy without exposing
+ * proxy/accessor failures from this opt-in boundary. */
+function validateOwnerEvidencePolicy(input: unknown): RuntimeBuildOptions["ownerEvidence"] {
+  try {
+    if (typeof input !== "object" || input === null || Array.isArray(input)) throw new Error();
+    const keys = Reflect.ownKeys(input);
+    if ((keys.length !== 1 && keys.length !== 2) || keys.some(key => typeof key !== "string" || !["allowedOrigins", "originOptions"].includes(key)) || !keys.includes("allowedOrigins") || !isPlainRecord(input, keys as string[])) throw new Error();
+    const rawOrigins = (input as { allowedOrigins: unknown }).allowedOrigins;
+    if (!Array.isArray(rawOrigins)) throw new Error();
+    const origins = Array.from(rawOrigins);
+    if (origins.some(origin => typeof origin !== "string")) throw new Error();
+
+    let originOptions: OriginPolicyOptions | undefined;
+    const rawOriginOptions = (input as { originOptions?: unknown }).originOptions;
+    if (rawOriginOptions !== undefined) {
+      if (typeof rawOriginOptions !== "object" || rawOriginOptions === null || Array.isArray(rawOriginOptions)) throw new Error();
+      const originKeys = Reflect.ownKeys(rawOriginOptions);
+      if (originKeys.some(key => key !== "allowLoopbackHttpDevelopment") || !isPlainRecord(rawOriginOptions, originKeys as string[])) throw new Error();
+      const allowLoopback = (rawOriginOptions as { allowLoopbackHttpDevelopment?: unknown }).allowLoopbackHttpDevelopment;
+      if (allowLoopback !== undefined && typeof allowLoopback !== "boolean") throw new Error();
+      originOptions = Object.freeze({ ...(allowLoopback === undefined ? {} : { allowLoopbackHttpDevelopment: allowLoopback }) });
+    }
+    return Object.freeze({ allowedOrigins: Object.freeze(origins), ...(originOptions ? { originOptions } : {}) });
+  } catch {
+    throw new ControllerRuntimeError("ERR_RUNTIME_CONFIG");
+  }
 }
 
 function containsWithin(root: string, child: string): boolean {
@@ -258,6 +292,9 @@ class RuntimeImpl {
   private servicesValue!: ControllerCoreServices;
   private createdDirs: string[] = [];
   private databaseCreated = false;
+  private ownerEvidenceValue: OwnerNativeEvidenceRuntime | undefined;
+  private ownerEvidenceSettled = false;
+  private validatedOwnerEvidenceValue: RuntimeBuildOptions["ownerEvidence"] = undefined;
 
   constructor(rawOptions: RuntimeBuildOptions) {
     this.fs = rawOptions.dependencies?.fs ?? (fs as unknown as ControllerFs);
@@ -267,6 +304,7 @@ class RuntimeImpl {
     this.passwordCrypto = rawOptions.dependencies?.passwordCrypto;
     this.certificateEngine = rawOptions.dependencies?.certificateEngine ?? new OpenSslCertificateEngine();
     const options = this.#validate(rawOptions);
+    this.validatedOwnerEvidenceValue = options.ownerEvidence;
     this.plan = options.plan;
     this.rootDir = options.plan.rootDir;
     this.hooks = options.hooks;
@@ -340,7 +378,6 @@ class RuntimeImpl {
 
   close(): void {
     if (this.state === "closed") return;
-    this.servicesValue?.inference.close();
     this.state = "closed";
     this.#closeDbOnce();
   }
@@ -352,6 +389,7 @@ class RuntimeImpl {
     readonly plan: ControllerPathPlan;
     readonly hooks: RuntimeLifecycleHooks | undefined;
     readonly dependencies: RuntimeDependencies | undefined;
+    readonly ownerEvidence: RuntimeBuildOptions["ownerEvidence"];
   } {
     const baseConfigKeys = CONTROLLER_CONFIG_KEYS as readonly string[];
     const ownConfigKeys=Reflect.ownKeys(options.config);
@@ -367,7 +405,15 @@ class RuntimeImpl {
     if (resolve(options.plan.rootDir) !== resolve(options.config.dataDir)) {
       throw new ControllerRuntimeError("ERR_RUNTIME_CONFIG");
     }
-    return { config: options.config, plan: options.plan, hooks: options.hooks, dependencies: options.dependencies };
+    let ownerEvidence: RuntimeBuildOptions["ownerEvidence"];
+    try {
+      const rawEvidence = options.ownerEvidence;
+      if (rawEvidence !== undefined) ownerEvidence = validateOwnerEvidencePolicy(rawEvidence);
+    } catch (error) {
+      if (error instanceof ControllerRuntimeError && error.code === "ERR_RUNTIME_CONFIG") throw error;
+      throw new ControllerRuntimeError("ERR_RUNTIME_CONFIG");
+    }
+    return { config: options.config, plan: options.plan, hooks: options.hooks, dependencies: options.dependencies, ownerEvidence };
   }
 
   #compose(): void {
@@ -407,6 +453,13 @@ class RuntimeImpl {
       this.jobStoresValue = this.buildJobStores(this.db, this.now);
       const owner = createOwnerBootstrapService(this.db, { now: this.now, ownerId: this.ownerId, ...(this.passwordCrypto ? { crypto: this.passwordCrypto } : {}) });
       const sessions = new SessionManager(this.db, owner, { clock: this.now, random: this.random });
+      if (this.#validatedOwnerEvidence) {
+        // Retain ownership immediately so any later composition failure closes
+        // the private registry before the database handle.
+        this.ownerEvidenceValue = createOwnerNativeEvidenceRuntime({ db: this.db, sessions,
+          allowedOrigins: this.#validatedOwnerEvidence.allowedOrigins, clock: this.now,
+          ...(this.#validatedOwnerEvidence.originOptions ? { originOptions: this.#validatedOwnerEvidence.originOptions } : {}) });
+      }
       const authorizeOwner = (value: unknown) => owner.authenticate(value);
       const authorizeSession = async (value: unknown) => sessions.authenticate(value) !== null;
       const policy = new PolicyService(this.db, { clock: this.now, random: this.random, stores: this.jobStoresValue });
@@ -427,6 +480,7 @@ class RuntimeImpl {
         fleet: new FleetQueryService(this.db, this.repositoriesValue, { clock: this.now }),
         policy,
         replay: new PersistentReplayStore(this.db),
+        ...(this.ownerEvidenceValue ? { ownerEvidence: this.ownerEvidenceValue } : {}),
       });
     } catch {
       const code: ControllerRuntimeErrorCode =
@@ -469,10 +523,16 @@ class RuntimeImpl {
 
   #closeDbOnce(): void {
     if (this.dbSettled) return;
-    this.servicesValue?.inference.close();
+    // Set the guard before invoking foreign cleanup. Every cleanup is
+    // best-effort, and the DB is still closed even if an earlier close throws.
     this.dbSettled = true;
     const db = this.db;
     this.db = null;
+    if (!this.ownerEvidenceSettled) {
+      this.ownerEvidenceSettled = true;
+      try { this.ownerEvidenceValue?.close(); } catch { /* continue database cleanup */ }
+    }
+    try { this.servicesValue?.inference.close(); } catch { /* continue database cleanup */ }
     if (db) {
       try {
         db.close();
@@ -481,6 +541,8 @@ class RuntimeImpl {
       }
     }
   }
+
+  get #validatedOwnerEvidence(): RuntimeBuildOptions["ownerEvidence"] { return this.validatedOwnerEvidenceValue; }
 }
 
 /**

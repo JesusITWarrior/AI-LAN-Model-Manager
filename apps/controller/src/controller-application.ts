@@ -10,20 +10,21 @@ import { createEnrollmentHttpHandler } from "./enrollment-http.js";
 import { DiscoveryListener } from "./discovery/listener.js";
 import type { OperatorServiceOptions } from "./operator-service.js";
 import {createProductionAgentPlane,ensureAgentPlaneMaterial,scheduleAgentPlaneRotation} from "./agent-plane.js";
+import { createAllowedOrigins } from "./origin.js";
 
 export type ControllerApplicationErrorCode="ERR_APP_START"|"ERR_APP_LISTEN"|"ERR_APP_STOP"|"ERR_APP_CLOSED";
 export class ControllerApplicationError extends Error{readonly code:ControllerApplicationErrorCode;constructor(code:ControllerApplicationErrorCode){super(code);this.name="ControllerApplicationError";this.code=code;}}
 export interface ApplicationServer{listen(port:number,host:string,callback:()=>void):unknown;close(callback:(error?:Error)=>void):unknown;once?(event:"error",listener:(error:Error)=>void):unknown;off?(event:"error",listener:(error:Error)=>void):unknown}
 export interface SignalSource{on(signal:"SIGINT"|"SIGTERM",listener:()=>void):unknown;off(signal:"SIGINT"|"SIGTERM",listener:()=>void):unknown}
-export interface ControllerApplicationOptions{readonly config:ControllerConfig;readonly plan:ControllerPathPlan;readonly consoleStaticOptions?:ConsoleStaticOptions;readonly runtimeDependencies?:RuntimeDependencies;readonly inferenceOptions?:InferenceRuntimeOptions;readonly operatorOptions?:OperatorServiceOptions;readonly runtimeFactory?:(options:{config:ControllerConfig;plan:ControllerPathPlan;dependencies?:RuntimeDependencies})=>ControllerRuntimeHandle;readonly serverFactory?:()=>ApplicationServer;readonly signalSource?:SignalSource;readonly closeTimeoutMs?:number}
+export interface ControllerApplicationOptions{readonly config:ControllerConfig;readonly plan:ControllerPathPlan;readonly consoleStaticOptions?:ConsoleStaticOptions;readonly runtimeDependencies?:RuntimeDependencies;readonly inferenceOptions?:InferenceRuntimeOptions;readonly operatorOptions?:OperatorServiceOptions;readonly ownerEvidence?:boolean;readonly runtimeFactory?:(options:{config:ControllerConfig;plan:ControllerPathPlan;dependencies?:RuntimeDependencies;ownerEvidence?:Readonly<{allowedOrigins:readonly string[];originOptions?:{readonly allowLoopbackHttpDevelopment?:boolean}}>})=>ControllerRuntimeHandle;readonly serverFactory?:()=>ApplicationServer;readonly signalSource?:SignalSource;readonly closeTimeoutMs?:number}
 export interface ControllerApplication{readonly runtime:ControllerRuntimeHandle;readonly isStarted:boolean;readonly isClosed:boolean;start():Promise<void>;stop():Promise<void>;close():Promise<void>}
 
 export function createControllerApplication(options:ControllerApplicationOptions):ControllerApplication{
  const makeRuntime=options.runtimeFactory??(value=>createControllerRuntime(value));
- const runtime=makeRuntime({config:options.config,plan:options.plan,...(options.runtimeDependencies?{dependencies:options.runtimeDependencies}:{})});
  const host=options.config.bindHost.includes(":")?`[${options.config.bindHost}]`:options.config.bindHost;
- const allowedOrigins=[`http://${host}:${options.config.port}`];
- const originOptions={allowLoopbackHttpDevelopment:true} as const;
+ const originOptions=Object.freeze({allowLoopbackHttpDevelopment:true} as const);
+ const allowedOrigins=createAllowedOrigins([`http://${host}:${options.config.port}`],originOptions);
+ const runtime=makeRuntime({config:options.config,plan:options.plan,...(options.runtimeDependencies?{dependencies:options.runtimeDependencies}:{}),...(options.ownerEvidence?{ownerEvidence:{allowedOrigins,originOptions}}:{})});
  const discovery=options.operatorOptions?.discovery??new DiscoveryListener(options.runtimeDependencies?.now?{now:options.runtimeDependencies.now}:{});
  const operatorOptions={...options.operatorOptions,discovery};
  const makeServer=options.serverFactory??(()=>{
