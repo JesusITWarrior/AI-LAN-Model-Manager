@@ -231,6 +231,8 @@ export class OwnerNativeEvidenceCandidateRegistry {
   private preparing = false;
   /** Registry-wide guard while trusted lease-view code or its clock is executing. */
   private inView = false;
+  /** Excludes all public registry operations while lease settlement samples clocks/authority. */
+  private settling = false;
   private readonly clock: () => string;
   private readonly makeId: () => string;
   constructor(private readonly manager: SessionManager, private readonly options: CandidateRegistryOptions) {
@@ -245,7 +247,7 @@ export class OwnerNativeEvidenceCandidateRegistry {
     if (entry) { this.retainedBytes -= entry.bytes; this.entries.delete(handle); }
   }
   prepare(guard: GuardResult): CandidateResult {
-    if (this.closed || this.preparing || this.inView) return fail();
+    if (this.closed || this.preparing || this.inView || this.settling) return fail();
     this.preparing = true;
     try {
       const auth = guardSession(guard, this.manager);
@@ -289,7 +291,7 @@ export class OwnerNativeEvidenceCandidateRegistry {
   }
   inspect(guard: GuardResult, handle: unknown): CandidateResult {
     try {
-      if (this.inView || this.closed) return fail();
+      if (this.inView || this.settling || this.closed) return fail();
       const auth = guardSession(guard, this.manager);
       if (!auth || !boundedText(handle, 128)) return fail();
       const now = nowMs(this.clock); this.prune(now);
@@ -301,7 +303,7 @@ export class OwnerNativeEvidenceCandidateRegistry {
   }
   consume(guard: GuardResult, input: unknown): ConsumeResult {
     try {
-      if (this.inView || this.closed) return fail();
+      if (this.inView || this.settling || this.closed) return fail();
       const auth = guardSession(guard, this.manager);
       const request = record(input, ["handle", "action", "disposition"]);
       if (!auth || !request || !boundedText(request.handle, 128) || request.action !== OWNER_NATIVE_EVIDENCE_ACTION || request.disposition !== OWNER_NATIVE_EVIDENCE_DISPOSITION) return fail();
@@ -333,7 +335,7 @@ export class OwnerNativeEvidenceCandidateRegistry {
     token: CandidateLeaseToken,
     inspect: (view: CandidateLeaseView) => "match" | "mismatch",
   ): LeaseViewResult {
-    if (this.inView || this.preparing || this.closed) return failLease();
+    if (this.inView || this.preparing || this.settling || this.closed) return failLease();
     this.inView = true;
     try {
       const auth = leaseViewSession(guard);
@@ -402,7 +404,7 @@ export class OwnerNativeEvidenceCandidateRegistry {
    */
   claim(guard: GuardResult, input: unknown): LeaseResult {
     try {
-      if (this.inView || this.closed) return failLease();
+      if (this.inView || this.settling || this.closed) return failLease();
       const auth = guardSession(guard, this.manager);
       if (!auth) return failLease();
       const request = record(input, ["handle", "action", "disposition"]);
@@ -432,22 +434,37 @@ export class OwnerNativeEvidenceCandidateRegistry {
    * neither be committed, released, nor re-claimed.
    */
   commitLease(guard: GuardResult, token: unknown): CommitResult {
+    if (this.inView || this.preparing || this.settling || this.closed) return failLease();
+    this.settling = true;
     try {
-      if (this.inView || this.closed) return failLease();
+      // The registry clock is caller-controlled. Run it under the guard, before the
+      // final fresh SessionManager authorization read, so its SQL side effects cannot
+      // invalidate authority after that read and before the local settlement.
+      const now = nowMs(this.clock);
+      if (this.closed) return failLease();
+      // Preserve registry-wide TTL cleanup before the final authorization callback;
+      // post-authorization work stays limited to this token's local settlement.
+      this.prune(now);
       const auth = guardSession(guard, this.manager);
-      if (!auth) return failLease();
+      if (this.closed || !auth) return failLease();
       const lease = leaseToken(this.leases, token);
       if (!lease || !boundedText(lease.handle, 128)) return failLease();
-      const now = nowMs(this.clock); this.prune(now);
       const entry = this.entries.get(lease.handle);
       if (!entry || entry.lease !== lease || entry.ownerId !== auth.session.ownerId || entry.sessionId !== auth.binding.id ||
-          entry.credentialVersion !== auth.binding.credentialVersion || Date.parse(entry.candidateExpiresAt) <= now ||
+          entry.credentialVersion !== auth.binding.credentialVersion || entry.serverExpiresAt !== auth.binding.expiresAt ||
+          !canonicalTimestamp(entry.serverExpiresAt) || !canonicalTimestamp(entry.candidateExpiresAt) ||
           integrity(entry.candidate) !== entry.integrity) return failLease();
+      if (Date.parse(entry.serverExpiresAt) <= now || Date.parse(entry.candidateExpiresAt) <= now) {
+        this.leases.delete(token as object);
+        this.drop(lease.handle);
+        return failLease();
+      }
       this.leases.delete(token as object);
       // Commit is terminal: remove the entry and release its exact accounting once.
       this.drop(lease.handle);
       return Object.freeze({ ok: true, committed: true });
     } catch { return failLease(); }
+    finally { this.settling = false; }
   }
   /**
    * Return the leased entry to available — call only AFTER the caller's rollback has been
@@ -457,21 +474,33 @@ export class OwnerNativeEvidenceCandidateRegistry {
    * becomes claimable anew.
    */
   releaseLease(guard: GuardResult, token: unknown): ReleaseResult {
+    if (this.inView || this.preparing || this.settling || this.closed) return failLease();
+    this.settling = true;
     try {
-      if (this.inView || this.closed) return failLease();
+      // Keep every caller-controlled clock and fresh authority read before the final
+      // local-only lease release, exactly as in commitLease.
+      const now = nowMs(this.clock);
+      if (this.closed) return failLease();
+      this.prune(now);
       const auth = guardSession(guard, this.manager);
-      if (!auth) return failLease();
+      if (this.closed || !auth) return failLease();
       const lease = leaseToken(this.leases, token);
       if (!lease || !boundedText(lease.handle, 128)) return failLease();
-      const now = nowMs(this.clock); this.prune(now);
       const entry = this.entries.get(lease.handle);
       if (!entry || entry.lease !== lease || entry.ownerId !== auth.session.ownerId || entry.sessionId !== auth.binding.id ||
-          entry.credentialVersion !== auth.binding.credentialVersion || Date.parse(entry.candidateExpiresAt) <= now ||
+          entry.credentialVersion !== auth.binding.credentialVersion || entry.serverExpiresAt !== auth.binding.expiresAt ||
+          !canonicalTimestamp(entry.serverExpiresAt) || !canonicalTimestamp(entry.candidateExpiresAt) ||
           integrity(entry.candidate) !== entry.integrity) return failLease();
+      if (Date.parse(entry.serverExpiresAt) <= now || Date.parse(entry.candidateExpiresAt) <= now) {
+        this.leases.delete(token as object);
+        this.drop(lease.handle);
+        return failLease();
+      }
       this.leases.delete(token as object);
       entry.lease = null;
       return Object.freeze({ ok: true, released: true });
     } catch { return failLease(); }
+    finally { this.settling = false; }
   }
   /** Test/diagnostic count only; no payload or authority is returned. */
   get size(): number { return this.entries.size; }

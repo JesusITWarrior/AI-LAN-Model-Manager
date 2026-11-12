@@ -25,12 +25,12 @@ const cryptoEngine = (): PasswordCryptoEngine => ({
   },
   equal: (a, b) => Buffer.from(a).equals(Buffer.from(b)),
 });
-async function setup() {
+async function setup(managerClock?: () => string) {
   const db = openControllerDatabase(":memory:");
   let now = START, counter = 0;
   const owners = createOwnerBootstrapService(db, { now: () => now, ownerId: () => "a".repeat(32), crypto: cryptoEngine() });
   await owners.bootstrapOwner({ username: "Admin", password: "owner-password-123" });
-  const manager = new SessionManager(db, owners, { clock: () => now, random: size => Buffer.alloc(size, ++counter),
+  const manager = new SessionManager(db, owners, { clock: () => managerClock ? managerClock() : now, random: size => Buffer.alloc(size, ++counter),
     policy: { absoluteTtlMs: 3_600_000, idleTtlMs: 600_000, touchAfterMs: 60_000 } });
   return { db, owners, manager, setNow: (value: string) => { now = value; }, getNow: () => now };
 }
@@ -1043,4 +1043,336 @@ test("certificate validity interval rejects equal and reversed bounds", async ()
     assert.equal(attempt({ notAfter: "2026-09-27T08:59:59.999Z" }), false);
     assert.equal(attempt({ notBefore: "2026-09-27T09:00:00.001Z", notAfter: "2026-09-27T09:00:00.002Z" }), true);
   } finally { db.close(); }
+});
+
+test("lease settlement rechecks live session after registry clock SQL mutation", async () => {
+  const observed: Array<{ method: string; ok: boolean; size: number; bytes: number; sqlMutation: boolean }> = [];
+  for (const method of ["commitLease", "releaseLease"] as const) {
+    const { db, manager } = await setup();
+    try {
+      const session = await newSession(manager), guard = post(manager, session);
+      let armed = false, sqlMutation = false;
+      const registry = makeRegistry(manager, makeCandidate, undefined, undefined, () => {
+        if (armed && !sqlMutation) {
+          sqlMutation = true;
+          db.prepare("UPDATE sessions SET session_version=session_version+1 WHERE owner_id=? AND revoked_at IS NULL").run(session.metadata.ownerId);
+        }
+        return START;
+      });
+      const prepared = registry.prepare(guard);
+      assert.equal(prepared.ok, true);
+      if (!prepared.ok) continue;
+      const request = { handle: prepared.handle, action: OWNER_NATIVE_EVIDENCE_ACTION, disposition: OWNER_NATIVE_EVIDENCE_DISPOSITION };
+      const lease = registry.claim(guard, request);
+      assert.equal(lease.ok, true);
+      if (!lease.ok) continue;
+      armed = true;
+      const result = registry[method](guard, lease.token);
+      observed.push({ method, ok: result.ok, size: registry.size, bytes: registry.retainedByteCount, sqlMutation });
+    } finally { db.close(); }
+  }
+  assert.deepEqual(observed, [
+    { method: "commitLease", ok: false, size: 1, bytes: 6, sqlMutation: true },
+    { method: "releaseLease", ok: false, size: 1, bytes: 6, sqlMutation: true },
+  ]);
+});
+
+test("both settlement paths reject SQL revocation, session version, owner rotation, and disablement", async () => {
+  for (const method of ["commitLease", "releaseLease"] as const) {
+    for (const change of ["revoke", "session-version", "server-binding", "credential-rotation", "owner-disable"] as const) {
+      const { db, owners, manager } = await setup();
+      try {
+        const session = await newSession(manager), guard = post(manager, session);
+        let armed = false, changed = false, undoSqlMutation: (() => void) | undefined;
+        const registry = makeRegistry(manager, makeCandidate, undefined, undefined, () => {
+          if (armed && !changed) {
+            changed = true;
+            if (change === "revoke") {
+              db.prepare("UPDATE sessions SET revoked_at=? WHERE owner_id=? AND revoked_at IS NULL").run(START, session.metadata.ownerId);
+              undoSqlMutation = () => { db.prepare("UPDATE sessions SET revoked_at=NULL WHERE owner_id=?").run(session.metadata.ownerId); };
+            } else if (change === "session-version") {
+              db.prepare("UPDATE sessions SET session_version=session_version+1 WHERE owner_id=? AND revoked_at IS NULL").run(session.metadata.ownerId);
+              undoSqlMutation = () => { db.prepare("UPDATE sessions SET session_version=? WHERE owner_id=? AND revoked_at IS NULL").run(session.metadata.sessionVersion, session.metadata.ownerId); };
+            } else if (change === "server-binding") {
+              db.prepare("UPDATE sessions SET idle_expires_at=? WHERE owner_id=? AND revoked_at IS NULL").run("2026-09-27T10:00:30.000Z", session.metadata.ownerId);
+              undoSqlMutation = () => { db.prepare("UPDATE sessions SET idle_expires_at=? WHERE owner_id=? AND revoked_at IS NULL").run(session.metadata.idleExpiresAt, session.metadata.ownerId); };
+            } else if (change === "credential-rotation") {
+              db.prepare("UPDATE owners SET credential_version=credential_version+1 WHERE owner_id=?").run(session.metadata.ownerId);
+              undoSqlMutation = () => { db.prepare("UPDATE owners SET credential_version=? WHERE owner_id=?").run(session.metadata.credentialVersion, session.metadata.ownerId); };
+            } else {
+              db.prepare("UPDATE owners SET disabled=1 WHERE owner_id=?").run(session.metadata.ownerId);
+              undoSqlMutation = () => { db.prepare("UPDATE owners SET disabled=0 WHERE owner_id=?").run(session.metadata.ownerId); };
+            }
+          }
+          return START;
+        });
+        const prepared = registry.prepare(guard);
+        assert.equal(prepared.ok, true, `${method}/${change} prepare`);
+        if (!prepared.ok) continue;
+        const lease = registry.claim(guard, { handle: prepared.handle, action: OWNER_NATIVE_EVIDENCE_ACTION, disposition: OWNER_NATIVE_EVIDENCE_DISPOSITION });
+        assert.equal(lease.ok, true, `${method}/${change} claim`);
+        if (!lease.ok) continue;
+        armed = true;
+        const result = registry[method](guard, lease.token);
+        assert.equal(changed, true, `${method}/${change} ran real SQL`);
+        assert.equal(result.ok, false, `${method}/${change}`);
+        assert.equal(registry.size, 1, `${method}/${change} preserves the nonexpired entry`);
+        assert.equal(registry.retainedByteCount, 6, `${method}/${change} preserves retained bytes`);
+        assert.equal(owners.getOwner()?.ownerId, session.metadata.ownerId);
+        assert.ok(undoSqlMutation, `${method}/${change} has an exact SQL restoration`);
+        assert.equal(registry.releaseLease(guard, lease.token).ok, false, `${method}/${change} invalid authorization cannot settle the original lease`);
+        assert.equal(registry.size, 1, `${method}/${change} invalid retry leaves the lease entry intact`);
+        assert.equal(registry.retainedByteCount, 6, `${method}/${change} invalid retry leaves bytes intact`);
+        undoSqlMutation();
+        assert.deepEqual(registry.releaseLease(guard, lease.token), { ok: true, released: true }, `${method}/${change} remains unsettled and recoverable`);
+        assert.equal(registry.size, 1, `${method}/${change} release preserves its available entry`);
+        assert.equal(registry.retainedByteCount, 6, `${method}/${change} release preserves its bytes`);
+      } finally { db.close(); }
+    }
+  }
+});
+
+test("settlement handles candidate and session expiry independently", async () => {
+  for (const method of ["commitLease", "releaseLease"] as const) {
+    {
+      const { db, manager } = await setup();
+      try {
+        let registryNow = START;
+        const session = await newSession(manager), guard = post(manager, session);
+        const registry = makeRegistry(manager, makeCandidate, undefined, undefined, () => registryNow);
+        const prepared = registry.prepare(guard);
+        assert.equal(prepared.ok, true);
+        if (!prepared.ok) continue;
+        const lease = registry.claim(guard, { handle: prepared.handle, action: OWNER_NATIVE_EVIDENCE_ACTION, disposition: OWNER_NATIVE_EVIDENCE_DISPOSITION });
+        assert.equal(lease.ok, true);
+        if (!lease.ok) continue;
+        registryNow = "2026-09-27T10:01:00.000Z";
+        assert.equal(registry[method](guard, lease.token).ok, false, `${method}/candidate expiry`);
+        assert.equal(registry.size, 0);
+        assert.equal(registry.retainedByteCount, 0);
+      } finally { db.close(); }
+    }
+    {
+      const { db, manager, setNow } = await setup();
+      try {
+        const session = await newSession(manager), guard = post(manager, session), registry = makeRegistry(manager, makeCandidate);
+        const prepared = registry.prepare(guard);
+        assert.equal(prepared.ok, true);
+        if (!prepared.ok) continue;
+        const lease = registry.claim(guard, { handle: prepared.handle, action: OWNER_NATIVE_EVIDENCE_ACTION, disposition: OWNER_NATIVE_EVIDENCE_DISPOSITION });
+        assert.equal(lease.ok, true);
+        if (!lease.ok) continue;
+        setNow("2026-09-27T10:10:00.000Z");
+        assert.equal(registry[method](guard, lease.token).ok, false, `${method}/session expiry`);
+        assert.equal(registry.size, 1, "invalid session does not prune an unexpired candidate");
+        assert.equal(registry.retainedByteCount, 6);
+      } finally { db.close(); }
+    }
+  }
+});
+
+test("throwing and malformed settlement clocks fail closed and finally release the guard", async () => {
+  for (const fault of ["throw", "malformed"] as const) {
+    for (const method of ["commitLease", "releaseLease"] as const) {
+      const { db, manager } = await setup();
+      try {
+        let armed = false, faulty = false;
+        const session = await newSession(manager), guard = post(manager, session);
+        const registry = makeRegistry(manager, makeCandidate, undefined, undefined, () => {
+          if (armed && !faulty) {
+            faulty = true;
+            if (fault === "throw") throw new Error("clock failure");
+            return "not-a-canonical-time";
+          }
+          return START;
+        });
+        const prepared = registry.prepare(guard);
+        assert.equal(prepared.ok, true);
+        if (!prepared.ok) continue;
+        const lease = registry.claim(guard, { handle: prepared.handle, action: OWNER_NATIVE_EVIDENCE_ACTION, disposition: OWNER_NATIVE_EVIDENCE_DISPOSITION });
+        assert.equal(lease.ok, true);
+        if (!lease.ok) continue;
+        armed = true;
+        assert.equal(registry[method](guard, lease.token).ok, false, `${fault}/${method}`);
+        assert.equal(faulty, true, `${fault}/${method} fault was sampled`);
+        assert.equal(registry.size, 1, `${fault}/${method} retains the entry after failure`);
+        assert.equal(registry.retainedByteCount, 6, `${fault}/${method} retains all candidate bytes`);
+
+        assert.deepEqual(registry.releaseLease(guard, lease.token), { ok: true, released: true }, `${fault}/${method} safe release works after clock recovery`);
+        assert.equal(registry.size, 1);
+        assert.equal(registry.retainedByteCount, 6);
+        const retry = registry.claim(guard, { handle: prepared.handle, action: OWNER_NATIVE_EVIDENCE_ACTION, disposition: OWNER_NATIVE_EVIDENCE_DISPOSITION });
+        assert.equal(retry.ok, true, `${fault}/${method} entry can be retried after release`);
+        if (retry.ok) assert.deepEqual(registry.commitLease(guard, retry.token), { ok: true, committed: true }, `${fault}/${method} retry commits normally`);
+        assert.equal(registry.size, 0);
+        assert.equal(registry.retainedByteCount, 0);
+      } finally { db.close(); }
+    }
+  }
+});
+
+test("registry clock close is irreversible during either settlement", async () => {
+  for (const method of ["commitLease", "releaseLease"] as const) {
+    const { db, manager } = await setup();
+    try {
+      let armed = false, registry!: OwnerNativeEvidenceCandidateRegistry;
+      const session = await newSession(manager), guard = post(manager, session);
+      registry = makeRegistry(manager, makeCandidate, undefined, undefined, () => {
+        if (armed) registry.close();
+        return START;
+      });
+      const prepared = registry.prepare(guard);
+      assert.equal(prepared.ok, true);
+      if (!prepared.ok) continue;
+      const lease = registry.claim(guard, { handle: prepared.handle, action: OWNER_NATIVE_EVIDENCE_ACTION, disposition: OWNER_NATIVE_EVIDENCE_DISPOSITION });
+      assert.equal(lease.ok, true);
+      if (!lease.ok) continue;
+      armed = true;
+      assert.equal(registry[method](guard, lease.token).ok, false, method);
+      assert.equal(registry.size, 0);
+      assert.equal(registry.retainedByteCount, 0);
+      assert.equal(registry.prepare(guard).ok, false);
+    } finally { db.close(); }
+  }
+});
+
+test("settlement clock blocks every registry reentrant operation without side effects", async () => {
+  for (const method of ["commitLease", "releaseLease"] as const) {
+    const { db, manager } = await setup();
+    try {
+      let armed = false, nested: boolean[] = [], nestedView: unknown, nestedViewCalls = 0;
+      let registry!: OwnerNativeEvidenceCandidateRegistry;
+      let callbackTx: Parameters<OwnerNativeEvidenceCandidateRegistry["withLeaseView"]>[1] | undefined;
+      let token: Parameters<OwnerNativeEvidenceCandidateRegistry["withLeaseView"]>[2] | undefined;
+      const session = await newSession(manager), guard = post(manager, session);
+      const requestFor = (handle: string) => ({ handle, action: OWNER_NATIVE_EVIDENCE_ACTION, disposition: OWNER_NATIVE_EVIDENCE_DISPOSITION });
+      let handle = "";
+      registry = new OwnerNativeEvidenceCandidateRegistry(manager, {
+        clock: () => {
+          if (armed && callbackTx && token) {
+            nestedView = registry.withLeaseView(guard, callbackTx, token, () => { nestedViewCalls++; return "match"; });
+            nested = [
+              registry.prepare(guard).ok,
+              registry.inspect(guard, handle).ok,
+              registry.consume(guard, requestFor(handle)).ok,
+              registry.claim(guard, requestFor(handle)).ok,
+              (nestedView as { readonly ok: boolean }).ok,
+              registry.commitLease(guard, token).ok,
+              registry.releaseLease(guard, token).ok,
+            ];
+          }
+          return START;
+        },
+        prepareCandidate: () => makeCandidate(), consumeCandidate: () => undefined,
+      });
+      const prepared = registry.prepare(guard);
+      assert.equal(prepared.ok, true);
+      if (!prepared.ok) continue;
+      handle = prepared.handle;
+      const lease = registry.claim(guard, requestFor(handle));
+      assert.equal(lease.ok, true);
+      if (!lease.ok) continue;
+      token = lease.token;
+      const bytes = registry.retainedByteCount;
+      let result: unknown;
+      let validViewCalls = 0;
+      const stores = createJobStores(db);
+      stores.withAuditTransaction(tx => {
+        callbackTx = tx;
+        assert.deepEqual(registry.withLeaseView(guard, tx, lease.token, () => { validViewCalls++; return "match"; }), { ok: true, match: true });
+        assert.equal(validViewCalls, 1, "the exact transaction context and token are valid before settlement");
+        armed = true;
+        result = registry[method](guard, lease.token);
+      });
+      assert.deepEqual(result, method === "commitLease" ? { ok: true, committed: true } : { ok: true, released: true }, method);
+      assert.deepEqual(nested, [false, false, false, false, false, false, false]);
+      assert.deepEqual(nestedView, { ok: false, error: "ERR_NATIVE_EVIDENCE_LEASE" });
+      assert.equal(nestedViewCalls, 0, "nested valid-view callback is rejected by the active settlement guard");
+      assert.equal(registry.size, method === "commitLease" ? 0 : 1);
+      assert.equal(registry.retainedByteCount, method === "commitLease" ? 0 : bytes);
+    } finally { db.close(); }
+  }
+});
+
+test("SessionManager clock close during final authorization aborts settlement", async () => {
+  for (const method of ["commitLease", "releaseLease"] as const) {
+    let armed = false, managerClockSampled = false, registry!: OwnerNativeEvidenceCandidateRegistry;
+    const { db, manager } = await setup(() => {
+      if (armed) {
+        managerClockSampled = true;
+        registry.close();
+      }
+      return START;
+    });
+    try {
+      const session = await newSession(manager), guard = post(manager, session);
+      registry = makeRegistry(manager, makeCandidate);
+      const prepared = registry.prepare(guard);
+      assert.equal(prepared.ok, true);
+      if (!prepared.ok) continue;
+      const lease = registry.claim(guard, { handle: prepared.handle, action: OWNER_NATIVE_EVIDENCE_ACTION, disposition: OWNER_NATIVE_EVIDENCE_DISPOSITION });
+      assert.equal(lease.ok, true);
+      if (!lease.ok) continue;
+      armed = true;
+      assert.equal(registry[method](guard, lease.token).ok, false, method);
+      assert.equal(managerClockSampled, true);
+      assert.equal(registry.size, 0);
+      assert.equal(registry.retainedByteCount, 0);
+    } finally { db.close(); }
+  }
+});
+
+test("SessionManager clock SQL mutation during final authorization aborts settlement and blocks valid nested lease view", async () => {
+  for (const method of ["commitLease", "releaseLease"] as const) {
+    let armed = false, changed = false;
+    let registry!: OwnerNativeEvidenceCandidateRegistry;
+    let activeGuard: GuardResult | undefined;
+    let callbackTx: Parameters<OwnerNativeEvidenceCandidateRegistry["withLeaseView"]>[1] | undefined;
+    let token: Parameters<OwnerNativeEvidenceCandidateRegistry["withLeaseView"]>[2] | undefined;
+    let nestedView: unknown, nestedViewCalls = 0;
+    let sessionOwnerId = "";
+    const { db, manager } = await setup(() => {
+      if (armed && !changed) {
+        changed = true;
+        db.prepare("UPDATE sessions SET session_version=session_version+1 WHERE owner_id=? AND revoked_at IS NULL").run(sessionOwnerId);
+        if (callbackTx && token && activeGuard) {
+          nestedView = registry.withLeaseView(activeGuard, callbackTx, token, () => { nestedViewCalls++; return "match"; });
+        }
+      }
+      return START;
+    });
+    try {
+      const session = await newSession(manager), guard = post(manager, session), stores = createJobStores(db);
+      sessionOwnerId = session.metadata.ownerId;
+      activeGuard = guard;
+      registry = makeRegistry(manager, makeCandidate);
+      const prepared = registry.prepare(guard);
+      assert.equal(prepared.ok, true, `${method} prepare`);
+      if (!prepared.ok) continue;
+      const lease = registry.claim(guard, { handle: prepared.handle, action: OWNER_NATIVE_EVIDENCE_ACTION, disposition: OWNER_NATIVE_EVIDENCE_DISPOSITION });
+      assert.equal(lease.ok, true, `${method} claim`);
+      if (!lease.ok) continue;
+      token = lease.token;
+
+      let validViewCalls = 0, result: unknown;
+      stores.withAuditTransaction(tx => {
+        callbackTx = tx;
+        assert.deepEqual(registry.withLeaseView(guard, tx, lease.token, () => { validViewCalls++; return "match"; }), { ok: true, match: true });
+        assert.equal(validViewCalls, 1, "the real coupled transaction/token is valid before settlement");
+        armed = true;
+        result = registry[method](guard, lease.token);
+        assert.equal(changed, true, "final SessionManager clock performed the genuine SQL mutation");
+      });
+      assert.deepEqual(result, { ok: false, error: "ERR_NATIVE_EVIDENCE_LEASE" }, method);
+      assert.deepEqual(nestedView, { ok: false, error: "ERR_NATIVE_EVIDENCE_LEASE" }, method);
+      assert.equal(nestedViewCalls, 0, "nested callback cannot run while settlement guard is active");
+      assert.equal(registry.size, 1, "the still-open entry remains after failed final authorization");
+      assert.equal(registry.retainedByteCount, 6, "all retained candidate bytes remain charged");
+
+      db.prepare("UPDATE sessions SET session_version=? WHERE owner_id=? AND revoked_at IS NULL").run(session.metadata.sessionVersion, sessionOwnerId);
+      assert.deepEqual(registry.releaseLease(guard, lease.token), { ok: true, released: true }, "reverting SQL restores the exact original lease");
+      assert.equal(registry.size, 1);
+      assert.equal(registry.retainedByteCount, 6);
+    } finally { db.close(); }
+  }
 });
