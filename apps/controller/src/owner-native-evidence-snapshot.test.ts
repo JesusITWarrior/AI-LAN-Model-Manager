@@ -14,7 +14,7 @@ import { createAllowedOrigins } from "./origin.js";
 import { createJobStores } from "./jobs-store.js";
 import { createOwnerBootstrapService } from "./owner-service.js";
 import { OwnerNativeEvidenceCandidateRegistry, OWNER_NATIVE_EVIDENCE_ACTION, OWNER_NATIVE_EVIDENCE_DISPOSITION, type NativeEvidenceCandidateInput } from "./owner-native-evidence-candidates.js";
-import { OwnerNativeEvidenceMatchedAppendCoordinator, OwnerNativeEvidenceSnapshotReader } from "./owner-native-evidence-snapshot.js";
+import { OwnerNativeEvidenceMatchedAppendCoordinator, OwnerNativeEvidenceSnapshotReader, OwnerNativeEvidenceTransactionOwner } from "./owner-native-evidence-snapshot.js";
 import { SessionManager } from "./session-manager.js";
 import { guardManagementRequest } from "./guard.js";
 import { computeTerminalRevision } from "./native-terminal-revision.js";
@@ -756,4 +756,127 @@ test("audit insertion and deferred COMMIT failures roll back evidence without se
       assert.deepEqual(f.registry.releaseLease(f.guard, claimed.token), { ok: true, released: true }, failure);
     } finally { f.db.close(); }
   }
+});
+
+function newLease(f: Awaited<ReturnType<typeof fixture>>) {
+  const prepared = f.registry.prepare(f.guard); assert.ok(prepared.ok);
+  const claimed = f.registry.claim(f.guard, { handle: prepared.handle, action: OWNER_NATIVE_EVIDENCE_ACTION, disposition: OWNER_NATIVE_EVIDENCE_DISPOSITION });
+  assert.ok(claimed.ok); return claimed.token;
+}
+const ASSERTION = Object.freeze({ hostCertificateBindingDigest: "e".repeat(64), consentedAt: START });
+function evidenceCount(f: Awaited<ReturnType<typeof fixture>>) {
+  return (f.db.prepare("SELECT count(*) AS n FROM supplemental_native_evidence").get() as { n: number }).n;
+}
+function auditCount(f: Awaited<ReturnType<typeof fixture>>) {
+  return (f.db.prepare("SELECT count(*) AS n FROM audit_events").get() as { n: number }).n;
+}
+
+test("transaction owner commits one evidence/audit pair before settling the exact lease", async () => {
+  const f = await fixture();
+  try {
+    const auditBefore = auditCount(f), beforeProtected = protectedState(f.db), token = newLease(f), owner = new OwnerNativeEvidenceTransactionOwner(f.db, f.registry);
+    let sawCommitBeforeSettlement = false;
+    f.setRegistryClockHook(() => {
+      if (evidenceCount(f) === 1 && !f.db.isTransaction) sawCommitBeforeSettlement = true;
+    });
+    assert.deepEqual(owner.append(f.guard, token, ASSERTION), { outcome: "committed_append_settled" });
+    assert.equal(sawCommitBeforeSettlement, true);
+    assert.equal(evidenceCount(f), 1); assert.equal(auditCount(f), auditBefore + 1);
+    const stored = f.db.prepare("SELECT tuple_digest,owner_id,session_binding_digest,credential_version,host_certificate_binding_digest,consented_at,receipt_core_json FROM supplemental_native_evidence").get() as Record<string, unknown>;
+    assert.equal(stored.tuple_digest, f.candidate.tupleDigest); assert.equal(stored.owner_id, "a".repeat(32));
+    assert.equal(stored.credential_version, 1); assert.equal(stored.host_certificate_binding_digest, ASSERTION.hostCertificateBindingDigest);
+    assert.equal(stored.consented_at, START);
+    const core = JSON.parse(String(stored.receipt_core_json)) as Record<string, unknown>;
+    assert.equal(core.domain, "lanmm-native-evidence-storage-core-v1");
+    assert.equal(core.disposition, "evidence-only"); assert.equal(core.tupleDigest, stored.tuple_digest);
+    assert.equal(typeof core.receiptId, "string"); assert.equal(typeof core.consentBindingDigest, "string");
+    assert.equal(protectedState(f.db), beforeProtected, "append preserves lifecycle and authority rows");
+    assert.deepEqual(f.registry.releaseLease(f.guard, token), { ok: false, error: "ERR_NATIVE_EVIDENCE_LEASE" });
+  } finally { f.db.close(); }
+});
+
+test("transaction owner rolls back after the real post-view session recheck fails", async () => {
+  const f = await fixture();
+  try {
+    const beforeAudit = auditCount(f), token = newLease(f), owner = new OwnerNativeEvidenceTransactionOwner(f.db, f.registry);
+    let invalidated = false;
+    f.setRegistryClockHook(() => {
+      if (evidenceCount(f) === 1 && !invalidated) {
+        invalidated = true;
+        f.db.prepare("UPDATE owners SET credential_version=credential_version+1").run();
+      }
+    });
+    assert.deepEqual(owner.append(f.guard, token, ASSERTION), { outcome: "transaction_unknown" });
+    assert.equal(invalidated, true); assert.equal(evidenceCount(f), 0); assert.equal(auditCount(f), beforeAudit);
+    f.setRegistryClockHook(() => undefined);
+    assert.equal((f.db.prepare("SELECT credential_version FROM owners").get() as { credential_version: number }).credential_version, 1, "session mutation rolled back with the append transaction");
+    assert.deepEqual(f.registry.releaseLease(f.guard, token), { ok: true, released: true }, "lease remains unsettled after rollback");
+  } finally { f.db.close(); }
+});
+
+test("transaction owner treats audit and deferred foreign-key COMMIT failures as unknown and unsettled", async () => {
+  for (const kind of ["audit", "commit"] as const) {
+    const f = await fixture();
+    try {
+      const beforeAudit = auditCount(f), token = newLease(f), owner = new OwnerNativeEvidenceTransactionOwner(f.db, f.registry);
+      if (kind === "audit") f.db.exec("CREATE TRIGGER reject_owner_audit BEFORE INSERT ON audit_events BEGIN SELECT RAISE(ABORT,'synthetic audit failure'); END");
+      else f.db.exec("CREATE TABLE owner_commit_parent(id INTEGER PRIMARY KEY); CREATE TABLE owner_commit_child(parent_id INTEGER REFERENCES owner_commit_parent(id) DEFERRABLE INITIALLY DEFERRED); CREATE TRIGGER owner_deferred_failure AFTER INSERT ON supplemental_native_evidence BEGIN INSERT INTO owner_commit_child(parent_id) VALUES(987654); END");
+      assert.deepEqual(owner.append(f.guard, token, ASSERTION), { outcome: "transaction_unknown" }, kind);
+      assert.equal(evidenceCount(f), 0, kind); assert.equal(auditCount(f), beforeAudit, kind);
+      assert.equal(f.db.isTransaction, false, "owner cleanup completes the real failed transaction");
+      assert.deepEqual(f.registry.releaseLease(f.guard, token), { ok: true, released: true }, "no settlement on transaction failure");
+    } finally { f.db.close(); }
+  }
+});
+
+test("transaction owner returns committed no-append for malformed, proxy, and mismatched assertions", async () => {
+  const f = await fixture();
+  try {
+    const beforeAudit = auditCount(f), token = newLease(f), owner = new OwnerNativeEvidenceTransactionOwner(f.db, f.registry);
+    let getterCalls = 0;
+    const accessor = Object.defineProperties({}, { hostCertificateBindingDigest: { get() { getterCalls++; return ASSERTION.hostCertificateBindingDigest; }, enumerable: true }, consentedAt: { value: START, enumerable: true } });
+    assert.deepEqual(owner.append(f.guard, token, accessor), { outcome: "committed_no_append" });
+    assert.deepEqual(owner.append(f.guard, token, new Proxy({}, { ownKeys() { throw new Error("must not inspect proxy"); } })), { outcome: "committed_no_append" });
+    assert.equal(getterCalls, 0);
+    f.db.prepare("UPDATE agent_commands SET request_digest=? WHERE job_id=?").run("0".repeat(64), "job-1");
+    const beforeMismatch = protectedState(f.db);
+    assert.deepEqual(owner.append(f.guard, token, ASSERTION), { outcome: "committed_no_append" });
+    assert.equal(evidenceCount(f), 0); assert.equal(auditCount(f), beforeAudit);
+    assert.equal(protectedState(f.db), beforeMismatch, "mismatch operation preserves all protected rows");
+    assert.deepEqual(f.registry.releaseLease(f.guard, token), { ok: true, released: true });
+  } finally { f.db.close(); }
+});
+
+test("transaction owner uses fresh leases for exact duplicate and conflicting assertion", async () => {
+  const f = await fixture();
+  try {
+    const owner = new OwnerNativeEvidenceTransactionOwner(f.db, f.registry), beforeAudit = auditCount(f);
+    assert.deepEqual(owner.append(f.guard, newLease(f), ASSERTION), { outcome: "committed_append_settled" });
+    const original = JSON.stringify(f.db.prepare("SELECT * FROM supplemental_native_evidence").get());
+    assert.deepEqual(owner.append(f.guard, newLease(f), ASSERTION), { outcome: "committed_append_settled" });
+    assert.equal(evidenceCount(f), 1); assert.equal(auditCount(f), beforeAudit + 1);
+    const conflict = { hostCertificateBindingDigest: ASSERTION.hostCertificateBindingDigest, consentedAt: "2026-09-27T10:00:01.000Z" }, conflictToken = newLease(f);
+    assert.deepEqual(owner.append(f.guard, conflictToken, conflict), { outcome: "transaction_unknown" });
+    assert.equal(JSON.stringify(f.db.prepare("SELECT * FROM supplemental_native_evidence").get()), original);
+    assert.equal(auditCount(f), beforeAudit + 1);
+    assert.deepEqual(f.registry.releaseLease(f.guard, conflictToken), { ok: true, released: true }, "conflict does not settle the fresh lease");
+  } finally { f.db.close(); }
+});
+
+test("post-commit settlement unavailable preserves the known DB commit without retry", async () => {
+  const f = await fixture();
+  try {
+    const token = newLease(f), beforeAudit = auditCount(f), owner = new OwnerNativeEvidenceTransactionOwner(f.db, f.registry);
+    let registryClosedAfterCommit = false;
+    f.setRegistryClockHook(() => {
+      if (!registryClosedAfterCommit && evidenceCount(f) === 1 && !f.db.isTransaction) {
+        registryClosedAfterCommit = true;
+        f.registry.close();
+      }
+    });
+    assert.deepEqual(owner.append(f.guard, token, ASSERTION), { outcome: "committed_append_unsettled" });
+    assert.equal(registryClosedAfterCommit, true); assert.equal(f.db.isTransaction, false);
+    assert.equal(evidenceCount(f), 1); assert.equal(auditCount(f), beforeAudit + 1);
+    assert.deepEqual(f.registry.releaseLease(f.guard, token), { ok: false, error: "ERR_NATIVE_EVIDENCE_LEASE" }, "failed settlement did not release/retry the lease");
+  } finally { f.db.close(); }
 });

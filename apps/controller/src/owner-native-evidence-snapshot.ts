@@ -7,7 +7,7 @@ import {
   parseStreamWireJSON, parseUtcTimestamp, responseMatches,
 } from "@lan-model-manager/core";
 import type { GuardResult } from "./guard.js";
-import { isActiveCoupledContext } from "./jobs-store.js";
+import { createJobStores, isActiveCoupledContext } from "./jobs-store.js";
 import {
   OwnerNativeEvidenceCandidateRegistry, type CandidateLeaseToken,
 } from "./owner-native-evidence-candidates.js";
@@ -213,5 +213,46 @@ export class OwnerNativeEvidenceMatchedAppendCoordinator {
     });
     if (appendAttempted && !(viewResult.ok && viewResult.match)) throw new Error(MATCHED_APPEND_ABORT);
     return viewResult.ok ? Object.freeze({ ok: true, match: viewResult.match, append: appendResult }) : Object.freeze({ ok: false, error: "ERR_NATIVE_EVIDENCE_LEASE" });
+  }
+}
+
+export type OwnerNativeEvidenceTransactionOutcome =
+  | Readonly<{ outcome: "committed_append_settled" }>
+  | Readonly<{ outcome: "committed_append_unsettled" }>
+  | Readonly<{ outcome: "committed_no_append" }>
+  | Readonly<{ outcome: "transaction_unknown" }>;
+
+/**
+ * Synthetic transaction owner. Normal return from the owned transaction is the
+ * only commit signal; assertion values still are not consent or trust proof.
+ */
+export class OwnerNativeEvidenceTransactionOwner {
+  private readonly stores: ReturnType<typeof createJobStores>;
+  private readonly coordinator: OwnerNativeEvidenceMatchedAppendCoordinator;
+
+  constructor(private readonly db: DatabaseSync, private readonly registry: OwnerNativeEvidenceCandidateRegistry) {
+    this.stores = createJobStores(db);
+    this.coordinator = new OwnerNativeEvidenceMatchedAppendCoordinator(db, registry);
+  }
+
+  append(guard: GuardResult, token: CandidateLeaseToken, assertion: unknown): OwnerNativeEvidenceTransactionOutcome {
+    let result: MatchedAppendResult | undefined;
+    try {
+      this.stores.withAuditTransaction(tx => {
+        result = this.coordinator.append(guard, tx, token, assertion);
+      });
+    } catch {
+      // A throw at any point, including COMMIT, is deliberately non-success.
+      return Object.freeze({ outcome: "transaction_unknown" });
+    }
+    if (!result?.ok || !result.match || !result.append?.ok) {
+      return Object.freeze({ outcome: "committed_no_append" });
+    }
+    try {
+      const settlement = this.registry.commitLease(guard, token);
+      return Object.freeze({ outcome: settlement.ok ? "committed_append_settled" : "committed_append_unsettled" });
+    } catch {
+      return Object.freeze({ outcome: "committed_append_unsettled" });
+    }
   }
 }
