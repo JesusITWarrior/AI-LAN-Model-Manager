@@ -16,7 +16,7 @@ import type { PasswordCryptoEngine } from "./credentials.js";
 
 const START="2026-09-27T10:00:00.000Z";
 const cryptoEngine=():PasswordCryptoEngine=>({random:size=>Buffer.alloc(size,3),async derive(password,salt,p){const seed=createHash("sha256").update(password).update(salt).digest();return Buffer.alloc(p.keyLength,seed[0]);},equal:(a,b)=>Buffer.from(a).equals(Buffer.from(b))});
-async function setup(db=openControllerDatabase(":memory:")){let now=START,counter=0;const owners=createOwnerBootstrapService(db,{now:()=>now,ownerId:()=>"a".repeat(32),crypto:cryptoEngine()});await owners.bootstrapOwner({username:"Admin",password:"owner-password-123"});const manager=new SessionManager(db,owners,{clock:()=>now,random:size=>Buffer.alloc(size,++counter),policy:{absoluteTtlMs:3_600_000,idleTtlMs:600_000,touchAfterMs:60_000}});return{db,owners,manager,setNow:(value:string)=>{now=value;}};}
+async function setup(db=openControllerDatabase(":memory:")){let now=START,counter=0,clockHook:(()=>void)|undefined;const owners=createOwnerBootstrapService(db,{now:()=>now,ownerId:()=>"a".repeat(32),crypto:cryptoEngine()});await owners.bootstrapOwner({username:"Admin",password:"owner-password-123"});const manager=new SessionManager(db,owners,{clock:()=>{const hook=clockHook;clockHook=undefined;hook?.();return now;},random:size=>Buffer.alloc(size,++counter),policy:{absoluteTtlMs:3_600_000,idleTtlMs:600_000,touchAfterMs:60_000}});return{db,owners,manager,setNow:(value:string)=>{now=value;},armClockHook:(hook:()=>void)=>{clockHook=hook;}};}
 
 test("migration3 upgrades to session migration4 with revocable rows",()=>{const dir=mkdtempSync(join(tmpdir(),"lanmm-session-upgrade-"));try{const path=join(dir,"db.sqlite3");let db=new DatabaseSync(path);migrateControllerDatabase(db,CONTROLLER_MIGRATIONS.slice(0,3));db.close();db=openControllerDatabase(path);assert.equal((db.prepare("PRAGMA user_version").get() as any).user_version,CONTROLLER_MIGRATIONS.length);const columns=(db.prepare("PRAGMA table_info(sessions)").all() as Array<{name:string}>).map(row=>row.name);assert.deepEqual(columns,["session_digest","csrf_digest","owner_id","credential_version","session_version","created_at","last_seen_at","absolute_expires_at","idle_expires_at","revoked_at"]);db.close();}finally{rmSync(dir,{recursive:true,force:true});}});
 
@@ -52,20 +52,49 @@ test("private lifecycle session binding is unique, unforgeable from metadata, re
  }finally{db.close();}
 });
 
+test("binding samples its clock before reading a session changed by the clock hook",async()=>{
+ const {db,manager,armClockHook}=await setup();try{
+  const session=await manager.create({username:"admin",password:"owner-password-123"});assert.ok(session);
+  const digest=(db.prepare("SELECT session_digest FROM sessions").get() as {session_digest:string}).session_digest;
+  armClockHook(()=>db.prepare("UPDATE sessions SET revoked_at=? WHERE session_digest=?").run("2026-09-27T10:01:00.000Z",digest));
+  assert.equal(manager.binding(session.metadata),null);
+ }finally{db.close();}
+});
+
+test("binding preserves malformed and throwing clock errors",async()=>{
+ const {db,manager,setNow,armClockHook}=await setup();try{
+  const session=await manager.create({username:"admin",password:"owner-password-123"});assert.ok(session);
+  setNow("not-a-timestamp");assert.throws(()=>manager.binding(session.metadata),/ERR_SESSION_INPUT/);setNow(START);
+  armClockHook(()=>{throw new Error("clock failure");});assert.throws(()=>manager.binding(session.metadata),/clock failure/);
+ }finally{db.close();}
+});
+
+test("binding in a transaction rejects a callback context rolled back by its clock hook",async()=>{
+ const {db,manager,armClockHook}=await setup();try{
+  const session=await manager.create({username:"admin",password:"owner-password-123"});assert.ok(session);const stores=createJobStores(db);
+  let binding:ReturnType<SessionManager["bindingInTransaction"]>|undefined;
+  armClockHook(()=>db.exec("ROLLBACK"));
+  assert.throws(()=>stores.withAuditTransaction(tx=>{binding=manager.bindingInTransaction(tx,session.metadata);}),/cannot commit - no transaction is active/);
+  assert.equal(binding,null);
+ }finally{db.close();}
+});
+
 
 test("transaction-bound session binding accepts only the live same-connection callback capability",async()=>{
- const {db,owners,manager}=await setup(),otherDb=openControllerDatabase(":memory:");try{
+ const {db,owners,manager,armClockHook}=await setup(),otherDb=openControllerDatabase(":memory:");try{
   const session=await manager.create({username:"admin",password:"owner-password-123"});assert.ok(session);
   const stores=createJobStores(db),otherStores=createJobStores(otherDb),before=JSON.stringify({owners:db.prepare("SELECT * FROM owners ORDER BY owner_id").all(),sessions:db.prepare("SELECT * FROM sessions ORDER BY session_digest").all()});
-  let captured:unknown,blockedReads=0;
+  let captured:unknown,blockedReads=0,clockCalls=0;
   stores.withAuditTransaction(tx=>{
    captured=tx;
    db.setAuthorizer((action,arg1)=>{if(action===sqliteConstants.SQLITE_READ&&(arg1==="sessions"||arg1==="owners")){blockedReads++;return sqliteConstants.SQLITE_DENY;}return sqliteConstants.SQLITE_OK;});
    try{
+    armClockHook(()=>{clockCalls++;});
     const forged=Object.freeze({jobs:tx.jobs,audit:tx.audit});
     for(const invalid of [{...tx},forged,new Proxy(tx,{}),null])assert.equal(manager.bindingInTransaction(invalid,session.metadata),null);
     otherStores.withAuditTransaction(foreignTx=>assert.equal(manager.bindingInTransaction(foreignTx,session.metadata),null));
     assert.equal(blockedReads,0,"invalid transaction contexts must be rejected before session or owner reads");
+    assert.equal(clockCalls,0,"invalid transaction contexts must be rejected before clock access");
    }finally{db.setAuthorizer(null);}
    const binding=manager.bindingInTransaction(tx,session.metadata);assert.ok(binding);assert.equal(Object.isFrozen(binding),true);assert.deepEqual(Object.keys(binding).sort(),["credentialVersion","expiresAt","id"]);assert.equal(JSON.stringify(binding).includes(session.sessionToken),false);assert.equal(JSON.stringify(binding).includes(session.csrfToken),false);
    assert.equal(manager.bindingInTransaction(tx,{...session.metadata}),null);
