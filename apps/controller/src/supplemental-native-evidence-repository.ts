@@ -1,7 +1,7 @@
 import { createHash } from "node:crypto";
 import { types } from "node:util";
 import type { DatabaseSync } from "node:sqlite";
-import { createJobStores } from "./jobs-store.js";
+import { createJobStores, isActiveCoupledContext, type CoupledContext } from "./jobs-store.js";
 
 /**
  * Synthetic, append-only persistence core. Every value supplied here is a
@@ -88,6 +88,7 @@ export type AppendResult = Readonly<{
   code: "ERR_SUPPLEMENTAL_EVIDENCE_INPUT" | "ERR_SUPPLEMENTAL_EVIDENCE_CONFLICT" | "ERR_SUPPLEMENTAL_EVIDENCE_DATABASE";
 }>;
 
+type AppendSuccess = Extract<AppendResult, { ok: true }>;
 type Data = Record<string, unknown>;
 type Prepared = {
   tuple: EvidenceTuple; tupleJson: string; tupleDigest: string;
@@ -197,52 +198,21 @@ export class SupplementalNativeEvidenceRepository {
     this.stores = createJobStores(db, { now });
   }
 
+  /** Append using the caller's exact live coupled transaction context. A success is provisional until that owner commits. */
+  appendInTransaction(tx: CoupledContext, input: unknown): AppendSuccess {
+    if (!isActiveCoupledContext(tx, this.db)) throw new Error("ERR_SUPPLEMENTAL_EVIDENCE_TRANSACTION");
+    const p = prepare(input);
+    if (!p) throw new Error("ERR_SUPPLEMENTAL_EVIDENCE_INPUT");
+    return this.appendPreparedInTransaction(tx, p);
+  }
+
   append(input: unknown): AppendResult {
     const p = prepare(input);
     if (!p) return fixedFailure("ERR_SUPPLEMENTAL_EVIDENCE_INPUT");
-    const receiptId = hash(RECEIPT_ID_DOMAIN, Buffer.from(p.tupleDigest, "ascii"));
-    const expected = { receiptId, tupleDigest: p.tupleDigest, terminalRevision: p.tuple.terminalRevision,
-      consentBindingDigest: p.consentBindingDigest };
-    let result: AppendResult | null = null;
+    let result: AppendSuccess | null = null;
     try {
       this.stores.withAuditTransaction((tx) => {
-        const existing = this.db.prepare("SELECT tuple_json,payload_bytes,payload_digest,response_bytes,response_digest,response_byte_length,owner_id,session_binding_digest,credential_version,host_certificate_binding_digest,consent_action,consent_disposition,consented_at,consent_json,consent_binding_digest,receipt_core_json FROM supplemental_native_evidence WHERE tuple_digest=?")
-          .get(p.tupleDigest) as Record<string, unknown> | undefined;
-        if (existing) {
-          const bytesEqual = (value: unknown, expectedBytes: Uint8Array) => value instanceof Uint8Array && Buffer.from(value).equals(Buffer.from(expectedBytes));
-          const same = existing.tuple_json === p.tupleJson && existing.payload_digest === p.payloadDigest &&
-            bytesEqual(existing.payload_bytes, p.payloadBytes) && bytesEqual(existing.response_bytes, p.responseBytes) &&
-            existing.response_digest === p.tuple.responseDigest && Number(existing.response_byte_length) === p.responseBytes.length &&
-            existing.owner_id === p.consent.ownerId && existing.session_binding_digest === p.consent.sessionBindingDigest &&
-            Number(existing.credential_version) === p.consent.credentialVersion &&
-            existing.host_certificate_binding_digest === p.consent.hostCertificateBindingDigest &&
-            existing.consent_action === p.consent.action && existing.consent_disposition === p.consent.disposition &&
-            existing.consented_at === p.consent.consentedAt && existing.consent_json === p.consentJson &&
-            existing.consent_binding_digest === p.consentBindingDigest;
-          if (!same) throw new Error("ERR_SUPPLEMENTAL_EVIDENCE_CONFLICT");
-          const core = parseReceipt(existing.receipt_core_json, expected);
-          if (!core) throw new Error("ERR_SUPPLEMENTAL_EVIDENCE_DATABASE");
-          result = Object.freeze({ ok: true as const, duplicate: true, tupleDigest: p.tupleDigest, receiptCore: core });
-          return;
-        }
-        const committedAt = this.now();
-        if (!validTime(committedAt)) throw new Error("ERR_SUPPLEMENTAL_EVIDENCE_DATABASE");
-        const receiptCore: ReceiptCore = Object.freeze({ domain: RECEIPT_CORE_DOMAIN, disposition: EVIDENCE_ONLY_DISPOSITION,
-          receiptId, tupleDigest: p.tupleDigest, terminalRevision: p.tuple.terminalRevision,
-          consentBindingDigest: p.consentBindingDigest, committedAt });
-        this.db.prepare(`INSERT INTO supplemental_native_evidence
-          (tuple_digest,tuple_json,payload_bytes,payload_digest,response_bytes,response_digest,response_byte_length,
-           owner_id,session_binding_digest,credential_version,host_certificate_binding_digest,consent_action,consent_disposition,consented_at,
-           consent_json,consent_binding_digest,receipt_core_json,committed_at)
-          VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)`)
-          .run(p.tupleDigest,p.tupleJson,p.payloadBytes,p.payloadDigest,p.responseBytes,p.tuple.responseDigest,p.responseBytes.length,
-            p.consent.ownerId,p.consent.sessionBindingDigest,p.consent.credentialVersion,p.consent.hostCertificateBindingDigest,
-            p.consent.action,p.consent.disposition,p.consent.consentedAt,p.consentJson,p.consentBindingDigest,JSON.stringify(receiptCore),committedAt);
-        tx.audit.append({ actorKind: "system", actorId: "controller", action: "supplemental-native-evidence-append",
-          outcome: "succeeded", requestId: p.tuple.requestId, jobId: p.tuple.jobId, hostId: p.tuple.hostId,
-          details: { tupleDigest: p.tupleDigest, receiptId, disposition: EVIDENCE_ONLY_DISPOSITION,
-            consentBindingDigest: p.consentBindingDigest }, occurredAt: committedAt });
-        result = Object.freeze({ ok: true as const, duplicate: false, tupleDigest: p.tupleDigest, receiptCore });
+        result = this.appendPreparedInTransaction(tx, p);
       });
       return result ?? fixedFailure("ERR_SUPPLEMENTAL_EVIDENCE_DATABASE");
     } catch (error) {
@@ -251,8 +221,52 @@ export class SupplementalNativeEvidenceRepository {
       // Attempt cleanup on this same owned connection, tolerating an already-closed
       // transaction, so commit failures cannot leave the evidence row visible.
       try { this.db.exec("ROLLBACK"); } catch { /* transaction already rolled back or closed */ }
+      if (error instanceof Error && error.message === "ERR_SUPPLEMENTAL_EVIDENCE_INPUT") return fixedFailure("ERR_SUPPLEMENTAL_EVIDENCE_INPUT");
       if (error instanceof Error && error.message === "ERR_SUPPLEMENTAL_EVIDENCE_CONFLICT") return fixedFailure("ERR_SUPPLEMENTAL_EVIDENCE_CONFLICT");
       return fixedFailure("ERR_SUPPLEMENTAL_EVIDENCE_DATABASE");
     }
+  }
+
+  /** Shared persistence core; caller must already own `tx` and handle rollback/COMMIT. */
+  private appendPreparedInTransaction(tx: CoupledContext, p: Prepared): AppendSuccess {
+    const receiptId = hash(RECEIPT_ID_DOMAIN, Buffer.from(p.tupleDigest, "ascii"));
+    const expected = { receiptId, tupleDigest: p.tupleDigest, terminalRevision: p.tuple.terminalRevision,
+      consentBindingDigest: p.consentBindingDigest };
+    const existing = this.db.prepare("SELECT tuple_json,payload_bytes,payload_digest,response_bytes,response_digest,response_byte_length,owner_id,session_binding_digest,credential_version,host_certificate_binding_digest,consent_action,consent_disposition,consented_at,consent_json,consent_binding_digest,receipt_core_json FROM supplemental_native_evidence WHERE tuple_digest=?")
+      .get(p.tupleDigest) as Record<string, unknown> | undefined;
+    if (existing) {
+      const bytesEqual = (value: unknown, expectedBytes: Uint8Array) => value instanceof Uint8Array && Buffer.from(value).equals(Buffer.from(expectedBytes));
+      const same = existing.tuple_json === p.tupleJson && existing.payload_digest === p.payloadDigest &&
+        bytesEqual(existing.payload_bytes, p.payloadBytes) && bytesEqual(existing.response_bytes, p.responseBytes) &&
+        existing.response_digest === p.tuple.responseDigest && Number(existing.response_byte_length) === p.responseBytes.length &&
+        existing.owner_id === p.consent.ownerId && existing.session_binding_digest === p.consent.sessionBindingDigest &&
+        Number(existing.credential_version) === p.consent.credentialVersion &&
+        existing.host_certificate_binding_digest === p.consent.hostCertificateBindingDigest &&
+        existing.consent_action === p.consent.action && existing.consent_disposition === p.consent.disposition &&
+        existing.consented_at === p.consent.consentedAt && existing.consent_json === p.consentJson &&
+        existing.consent_binding_digest === p.consentBindingDigest;
+      if (!same) throw new Error("ERR_SUPPLEMENTAL_EVIDENCE_CONFLICT");
+      const core = parseReceipt(existing.receipt_core_json, expected);
+      if (!core) throw new Error("ERR_SUPPLEMENTAL_EVIDENCE_DATABASE");
+      return Object.freeze({ ok: true as const, duplicate: true, tupleDigest: p.tupleDigest, receiptCore: core });
+    }
+    const committedAt = this.now();
+    if (!validTime(committedAt)) throw new Error("ERR_SUPPLEMENTAL_EVIDENCE_DATABASE");
+    const receiptCore: ReceiptCore = Object.freeze({ domain: RECEIPT_CORE_DOMAIN, disposition: EVIDENCE_ONLY_DISPOSITION,
+      receiptId, tupleDigest: p.tupleDigest, terminalRevision: p.tuple.terminalRevision,
+      consentBindingDigest: p.consentBindingDigest, committedAt });
+    this.db.prepare(`INSERT INTO supplemental_native_evidence
+      (tuple_digest,tuple_json,payload_bytes,payload_digest,response_bytes,response_digest,response_byte_length,
+       owner_id,session_binding_digest,credential_version,host_certificate_binding_digest,consent_action,consent_disposition,consented_at,
+       consent_json,consent_binding_digest,receipt_core_json,committed_at)
+      VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)`)
+      .run(p.tupleDigest,p.tupleJson,p.payloadBytes,p.payloadDigest,p.responseBytes,p.tuple.responseDigest,p.responseBytes.length,
+        p.consent.ownerId,p.consent.sessionBindingDigest,p.consent.credentialVersion,p.consent.hostCertificateBindingDigest,
+        p.consent.action,p.consent.disposition,p.consent.consentedAt,p.consentJson,p.consentBindingDigest,JSON.stringify(receiptCore),committedAt);
+    tx.audit.append({ actorKind: "system", actorId: "controller", action: "supplemental-native-evidence-append",
+      outcome: "succeeded", requestId: p.tuple.requestId, jobId: p.tuple.jobId, hostId: p.tuple.hostId,
+      details: { tupleDigest: p.tupleDigest, receiptId, disposition: EVIDENCE_ONLY_DISPOSITION,
+        consentBindingDigest: p.consentBindingDigest }, occurredAt: committedAt });
+    return Object.freeze({ ok: true as const, duplicate: false, tupleDigest: p.tupleDigest, receiptCore });
   }
 }
