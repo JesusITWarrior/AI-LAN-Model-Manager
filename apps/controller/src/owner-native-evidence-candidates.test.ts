@@ -4,6 +4,7 @@ import { DatabaseSync } from "node:sqlite";
 import test from "node:test";
 import { createAllowedOrigins } from "./origin.js";
 import { openControllerDatabase } from "./database.js";
+import { createJobStores } from "./jobs-store.js";
 import { createOwnerBootstrapService } from "./owner-service.js";
 import { SessionManager } from "./session-manager.js";
 import { guardManagementRequest, type GuardResult } from "./guard.js";
@@ -540,6 +541,398 @@ test("leased candidates count against capacity until release", async () => {
     assert.equal(registry.consume(guard, requests[0]!).ok, true);
     assert.equal(registry.size, OWNER_NATIVE_EVIDENCE_MAX_CANDIDATES - 1);
     assert.equal(registry.prepare(guard).ok, true);
+  } finally { db.close(); }
+});
+
+test("lease view requires the real active coupled transaction and returns a detached fixed verdict", async () => {
+  const { db, manager } = await setup();
+  try {
+    const session = await newSession(manager), guard = post(manager, session), stores = createJobStores(db, { now: () => START });
+    const registry = makeRegistry(manager, makeCandidate);
+    const prepared = registry.prepare(guard);
+    assert.equal(prepared.ok, true);
+    if (!prepared.ok) return;
+    const request = { handle: prepared.handle, action: OWNER_NATIVE_EVIDENCE_ACTION, disposition: OWNER_NATIVE_EVIDENCE_DISPOSITION };
+    const lease = registry.claim(guard, request);
+    assert.equal(lease.ok, true);
+    if (!lease.ok) return;
+    let captured: unknown;
+    let result: unknown;
+    stores.withAuditTransaction(tx => {
+      result = registry.withLeaseView(guard, tx, lease.token, view => {
+        captured = view;
+        assert.deepEqual(Array.from(view.payloadBytes), [80, 65, 89]);
+        assert.deepEqual(Array.from(view.responseBytes), [82, 83, 80]);
+        assert.equal(view.serverBinding.ownerId, session.metadata.ownerId);
+        assert.equal(view.serverBinding.credentialVersion, session.metadata.credentialVersion);
+        const binding = manager.binding(session.metadata)!;
+        assert.equal(view.serverBinding.sessionId, binding.id);
+        assert.equal(view.serverBinding.expiresAt, binding.expiresAt);
+        assert.equal(view.candidateExpiresAt, "2026-09-27T10:01:00.000Z");
+        assert.ok(Object.isFrozen(view) && Object.isFrozen(view.tuple) && Object.isFrozen(view.certificateBindingAssertion) && Object.isFrozen(view.serverBinding));
+        assert.equal(Reflect.set(view.tuple, "hostId", "mutated"), false);
+        assert.equal(Reflect.set(view.certificateBindingAssertion, "certificateId", "mutated"), false);
+        assert.equal(Reflect.set(view, "candidateExpiresAt", START), false);
+        view.payloadBytes.fill(0);
+        view.responseBytes.fill(0);
+        return "match";
+      });
+    });
+    assert.deepEqual(result, { ok: true, match: true });
+    assert.ok(Object.isFrozen(result));
+    assert.deepEqual(Object.keys(result as object).sort(), ["match", "ok"]);
+    assert.ok(captured && typeof captured === "object");
+    const capturedView = captured as object;
+    assert.equal("handle" in capturedView, false);
+    assert.equal("token" in capturedView, false);
+    assert.equal("session" in capturedView, false);
+    assert.equal("tx" in capturedView, false);
+    assert.equal("db" in capturedView, false);
+    const serialized = JSON.stringify(capturedView);
+    assert.equal(serialized.includes(prepared.handle), false);
+    assert.equal(serialized.includes(session.sessionToken), false);
+    assert.equal(serialized.includes(session.csrfToken), false);
+    assert.equal(registry.retainedByteCount, 6);
+    let mismatch: unknown;
+    stores.withAuditTransaction(tx => {
+      mismatch = registry.withLeaseView(guard, tx, lease.token, view => {
+        assert.deepEqual(Array.from(view.payloadBytes), [80, 65, 89]);
+        assert.deepEqual(Array.from(view.responseBytes), [82, 83, 80]);
+        return "mismatch";
+      });
+    });
+    assert.deepEqual(mismatch, { ok: true, match: false });
+    assert.deepEqual(registry.releaseLease(guard, lease.token), { ok: true, released: true });
+    const reclaimed = registry.claim(guard, request);
+    assert.equal(reclaimed.ok, true);
+    if (reclaimed.ok) assert.deepEqual(registry.commitLease(guard, reclaimed.token), { ok: true, committed: true });
+  } finally { db.close(); }
+});
+
+test("lease view rejects forged, stale, fake, and foreign transaction authorities before callback", async () => {
+  const { db, owners, manager } = await setup();
+  const foreignDb = openControllerDatabase(":memory:");
+  try {
+    const session = await newSession(manager), otherSession = await newSession(manager), guard = post(manager, session), otherGuard = post(manager, otherSession), stores = createJobStores(db), foreignStores = createJobStores(foreignDb);
+    const foreignManager = new SessionManager(db, owners, { clock: () => START });
+    const foreignManagerGuard = Object.freeze({ ok: true as const, session: foreignManager.authenticate(session.sessionToken)! });
+    const registry = makeRegistry(manager, makeCandidate), another = makeRegistry(manager, makeCandidate);
+    const p = registry.prepare(guard), q = another.prepare(guard);
+    assert.equal(p.ok, true); assert.equal(q.ok, true);
+    if (!p.ok || !q.ok) return;
+    const req = { handle: p.handle, action: OWNER_NATIVE_EVIDENCE_ACTION, disposition: OWNER_NATIVE_EVIDENCE_DISPOSITION };
+    const lease = registry.claim(guard, req), foreignLease = another.claim(guard, { ...req, handle: q.handle });
+    assert.equal(lease.ok, true); assert.equal(foreignLease.ok, true);
+    if (!lease.ok || !foreignLease.ok) return;
+    let stale: unknown;
+    stores.withAuditTransaction(tx => { stale = tx; });
+    let called = 0, metadataTrapCalls = 0;
+    const invoke = (g: unknown, tx: unknown, token: unknown) => registry.withLeaseView(g as GuardResult, tx, token as never, () => { called++; return "match"; });
+    assert.equal(invoke(guard, stale, lease.token).ok, false);
+    assert.equal(invoke({ ...guard, session: { ...session.metadata } }, stale, lease.token).ok, false);
+    assert.equal(invoke(new Proxy(guard, { get() { throw new Error("must not run"); } }), stale, lease.token).ok, false);
+    const metadataProxy = new Proxy(session.metadata, {
+      get() { metadataTrapCalls++; throw new Error("metadata getter must not run"); },
+      ownKeys() { metadataTrapCalls++; throw new Error("metadata reflection must not run"); },
+    });
+    assert.equal(invoke({ ok: true, session: metadataProxy }, stale, lease.token).ok, false);
+    assert.equal(invoke(guard, stale, Object.freeze(Object.create(null))).ok, false);
+    assert.equal(invoke(guard, stale, foreignLease.token).ok, false);
+    assert.equal(called, 0);
+    stores.withAuditTransaction(tx => {
+      assert.equal(invoke(guard, { ...tx }, lease.token).ok, false);
+      assert.equal(invoke(guard, {}, lease.token).ok, false);
+      assert.equal(invoke(otherGuard, tx, lease.token).ok, false);
+      assert.equal(invoke(foreignManagerGuard, tx, lease.token).ok, false);
+      foreignStores.withAuditTransaction(foreignTx => assert.equal(invoke(guard, foreignTx, lease.token).ok, false));
+      assert.equal(invoke(guard, tx, Object.freeze({ ...lease.token })).ok, false);
+      assert.equal(invoke(guard, tx, new Proxy(lease.token, {})).ok, false);
+      assert.equal(called, 0);
+    });
+    assert.deepEqual(registry.releaseLease(guard, lease.token), { ok: true, released: true });
+    stores.withAuditTransaction(tx => assert.equal(invoke(guard, tx, lease.token).ok, false));
+    const spent = registry.claim(guard, req);
+    assert.equal(spent.ok, true);
+    if (spent.ok) {
+      assert.deepEqual(registry.commitLease(guard, spent.token), { ok: true, committed: true });
+      stores.withAuditTransaction(tx => assert.equal(invoke(guard, tx, spent.token).ok, false));
+    }
+    assert.equal(called, 0);
+    assert.equal(metadataTrapCalls, 0);
+    assert.deepEqual(another.releaseLease(guard, foreignLease.token), { ok: true, released: true });
+  } finally { foreignDb.close(); db.close(); }
+});
+
+test("lease view rejects reentry while a preparation callback is active", async () => {
+  const { db, manager } = await setup();
+  try {
+    const session = await newSession(manager), guard = post(manager, session), stores = createJobStores(db);
+    let registry!: OwnerNativeEvidenceCandidateRegistry;
+    let token: Parameters<OwnerNativeEvidenceCandidateRegistry["withLeaseView"]>[2] = Object.freeze(Object.create(null)) as Parameters<OwnerNativeEvidenceCandidateRegistry["withLeaseView"]>[2];
+    let tryNestedView = false;
+    let nestedView: unknown;
+    registry = new OwnerNativeEvidenceCandidateRegistry(manager, {
+      clock: () => START,
+      prepareCandidate: () => {
+        if (tryNestedView) stores.withAuditTransaction(tx => {
+          nestedView = registry.withLeaseView(guard, tx, token, () => "match");
+        });
+        return makeCandidate();
+      },
+      consumeCandidate: () => undefined,
+    });
+    const prepared = registry.prepare(guard);
+    assert.equal(prepared.ok, true);
+    if (!prepared.ok) return;
+    const request = { handle: prepared.handle, action: OWNER_NATIVE_EVIDENCE_ACTION, disposition: OWNER_NATIVE_EVIDENCE_DISPOSITION };
+    const lease = registry.claim(guard, request);
+    assert.equal(lease.ok, true);
+    if (!lease.ok) return;
+    token = lease.token;
+
+    tryNestedView = true;
+    const next = registry.prepare(guard);
+    assert.equal(next.ok, true);
+    assert.deepEqual(nestedView, { ok: false, error: "ERR_NATIVE_EVIDENCE_LEASE" });
+    assert.equal(registry.size, 2);
+    assert.deepEqual(registry.releaseLease(guard, lease.token), { ok: true, released: true });
+  } finally { db.close(); }
+});
+
+test("lease view rejects an already-expired candidate before invoking the callback", async () => {
+  const { db, manager } = await setup();
+  try {
+    let now = START;
+    const session = await newSession(manager), guard = post(manager, session), stores = createJobStores(db);
+    const registry = makeRegistry(manager, makeCandidate, undefined, undefined, () => now);
+    const p = registry.prepare(guard);
+    assert.equal(p.ok, true);
+    if (!p.ok) return;
+    const lease = registry.claim(guard, { handle: p.handle, action: OWNER_NATIVE_EVIDENCE_ACTION, disposition: OWNER_NATIVE_EVIDENCE_DISPOSITION });
+    assert.equal(lease.ok, true);
+    if (!lease.ok) return;
+    now = "2026-09-27T10:01:00.000Z";
+    let calls = 0;
+    stores.withAuditTransaction(tx => assert.equal(registry.withLeaseView(guard, tx, lease.token, () => { calls++; return "match"; }).ok, false));
+    assert.equal(calls, 0);
+  } finally { db.close(); }
+});
+
+test("lease view rejects hostile callback outcomes without probing them and leaves lease unsettled", async () => {
+  const { db, manager } = await setup();
+  try {
+    const session = await newSession(manager), guard = post(manager, session), stores = createJobStores(db);
+    const registry = makeRegistry(manager, makeCandidate), p = registry.prepare(guard);
+    assert.equal(p.ok, true);
+    if (!p.ok) return;
+    const req = { handle: p.handle, action: OWNER_NATIVE_EVIDENCE_ACTION, disposition: OWNER_NATIVE_EVIDENCE_DISPOSITION };
+    const lease = registry.claim(guard, req);
+    assert.equal(lease.ok, true);
+    if (!lease.ok) return;
+    let thenGets = 0;
+    const hostile = Object.defineProperty({}, "then", { get() { thenGets++; throw new Error("must not execute"); } });
+    const outcomes: unknown[] = [
+      Promise.resolve("match"), hostile, {}, [], Symbol("verdict"), 1, undefined, "other", "MATCH",
+    ];
+    for (const outcome of outcomes) stores.withAuditTransaction(tx => {
+      assert.equal(registry.withLeaseView(guard, tx, lease.token, (() => outcome) as never).ok, false);
+    });
+    stores.withAuditTransaction(tx => assert.equal(registry.withLeaseView(guard, tx, lease.token, (() => { throw new Error("expected"); }) as never).ok, false));
+    assert.equal(thenGets, 0);
+    assert.deepEqual(registry.releaseLease(guard, lease.token), { ok: true, released: true });
+  } finally { db.close(); }
+});
+
+test("lease view blocks registry reentrancy and detects irreversible close", async () => {
+  const { db, manager } = await setup();
+  try {
+    const session = await newSession(manager), guard = post(manager, session), stores = createJobStores(db);
+    let active = false, callbackTx: unknown, registry!: OwnerNativeEvidenceCandidateRegistry, clockAttempts: unknown[] = [];
+    const requestFor = (handle: string) => ({ handle, action: OWNER_NATIVE_EVIDENCE_ACTION, disposition: OWNER_NATIVE_EVIDENCE_DISPOSITION });
+    registry = new OwnerNativeEvidenceCandidateRegistry(manager, {
+      clock: () => {
+        if (active && callbackTx) {
+          clockAttempts.push(registry.prepare(guard), registry.inspect(guard, "missing"), registry.consume(guard, requestFor("missing")),
+            registry.claim(guard, requestFor("missing")), registry.commitLease(guard, Object.freeze(Object.create(null))),
+            registry.releaseLease(guard, Object.freeze(Object.create(null))), registry.withLeaseView(guard, callbackTx, Object.freeze(Object.create(null)) as never, () => "match"));
+        }
+        return START;
+      }, id: () => "reentrant", prepareCandidate: () => makeCandidate(), consumeCandidate: () => undefined,
+    });
+    const p = registry.prepare(guard);
+    assert.equal(p.ok, true);
+    if (!p.ok) return;
+    const req = requestFor(p.handle), lease = registry.claim(guard, req);
+    assert.equal(lease.ok, true);
+    if (!lease.ok) return;
+    let nested: unknown[] = [];
+    stores.withAuditTransaction(tx => {
+      callbackTx = tx; active = true;
+      const viewed = registry.withLeaseView(guard, tx, lease.token, () => {
+        nested = [registry.prepare(guard), registry.inspect(guard, p.handle), registry.consume(guard, req), registry.claim(guard, req),
+          registry.withLeaseView(guard, tx, lease.token, () => "match"), registry.commitLease(guard, lease.token), registry.releaseLease(guard, lease.token)];
+        return "match";
+      });
+      assert.deepEqual(viewed, { ok: true, match: true });
+      active = false;
+    });
+    assert.ok(clockAttempts.length >= 7);
+    assert.deepEqual(nested.map(value => (value as { ok: boolean }).ok), Array(7).fill(false));
+    assert.deepEqual(registry.releaseLease(guard, lease.token), { ok: true, released: true });
+
+    const closedRegistry = makeRegistry(manager, makeCandidate), closedPrepared = closedRegistry.prepare(guard);
+    assert.equal(closedPrepared.ok, true);
+    if (!closedPrepared.ok) return;
+    const closedLease = closedRegistry.claim(guard, requestFor(closedPrepared.handle));
+    assert.equal(closedLease.ok, true);
+    if (!closedLease.ok) return;
+    stores.withAuditTransaction(tx => assert.equal(closedRegistry.withLeaseView(guard, tx, closedLease.token, () => {
+      closedRegistry.close(); return "match";
+    }).ok, false));
+    assert.equal(closedRegistry.size, 0);
+    assert.equal(closedRegistry.retainedByteCount, 0);
+    assert.equal(closedRegistry.releaseLease(guard, closedLease.token).ok, false);
+  } finally { db.close(); }
+});
+
+test("lease view clock close after callback overrides an apparent match", async () => {
+  const { db, manager } = await setup();
+  try {
+    const session = await newSession(manager), guard = post(manager, session), stores = createJobStores(db);
+    let registry!: OwnerNativeEvidenceCandidateRegistry;
+    let closeAtNextClock = false;
+    let callbackCalls = 0;
+    registry = new OwnerNativeEvidenceCandidateRegistry(manager, {
+      clock: () => {
+        if (closeAtNextClock) {
+          closeAtNextClock = false;
+          registry.close();
+        }
+        return START;
+      },
+      id: () => "clock-close-candidate",
+      prepareCandidate: () => makeCandidate(),
+      consumeCandidate: () => undefined,
+    });
+    const prepared = registry.prepare(guard);
+    assert.equal(prepared.ok, true);
+    if (!prepared.ok) return;
+    const lease = registry.claim(guard, { handle: prepared.handle, action: OWNER_NATIVE_EVIDENCE_ACTION, disposition: OWNER_NATIVE_EVIDENCE_DISPOSITION });
+    assert.equal(lease.ok, true);
+    if (!lease.ok) return;
+
+    let result: unknown;
+    stores.withAuditTransaction(tx => {
+      result = registry.withLeaseView(guard, tx, lease.token, () => {
+        callbackCalls++;
+        closeAtNextClock = true;
+        return "match";
+      });
+    });
+    assert.equal(callbackCalls, 1);
+    assert.deepEqual(result, { ok: false, error: "ERR_NATIVE_EVIDENCE_LEASE" });
+    assert.equal(registry.size, 0);
+    assert.equal(registry.retainedByteCount, 0);
+    assert.equal(registry.releaseLease(guard, lease.token).ok, false);
+    assert.equal(registry.prepare(guard).ok, false);
+  } finally { db.close(); }
+});
+
+test("lease view rejects a registry-clock close before invoking the callback", async () => {
+  const { db, manager } = await setup();
+  try {
+    const session = await newSession(manager), guard = post(manager, session), stores = createJobStores(db);
+    let registry!: OwnerNativeEvidenceCandidateRegistry;
+    let closeAtNextClock = false, callbackCalls = 0;
+    registry = new OwnerNativeEvidenceCandidateRegistry(manager, {
+      clock: () => {
+        if (closeAtNextClock) {
+          closeAtNextClock = false;
+          registry.close();
+        }
+        return START;
+      },
+      id: () => "clock-close-before-view",
+      prepareCandidate: () => makeCandidate(),
+      consumeCandidate: () => undefined,
+    });
+    const prepared = registry.prepare(guard);
+    assert.equal(prepared.ok, true);
+    if (!prepared.ok) return;
+    const lease = registry.claim(guard, { handle: prepared.handle, action: OWNER_NATIVE_EVIDENCE_ACTION, disposition: OWNER_NATIVE_EVIDENCE_DISPOSITION });
+    assert.equal(lease.ok, true);
+    if (!lease.ok) return;
+    closeAtNextClock = true;
+    let result: unknown;
+    stores.withAuditTransaction(tx => {
+      result = registry.withLeaseView(guard, tx, lease.token, () => { callbackCalls++; return "match"; });
+    });
+    assert.equal(callbackCalls, 0);
+    assert.deepEqual(result, { ok: false, error: "ERR_NATIVE_EVIDENCE_LEASE" });
+    assert.equal(registry.size, 0);
+    assert.equal(registry.retainedByteCount, 0);
+  } finally { db.close(); }
+});
+
+test("lease view rejects a transaction invalidated inside the callback", async () => {
+  const { db, manager } = await setup();
+  try {
+    const session = await newSession(manager), guard = post(manager, session), stores = createJobStores(db);
+    const registry = makeRegistry(manager, makeCandidate);
+    const prepared = registry.prepare(guard);
+    assert.equal(prepared.ok, true);
+    if (!prepared.ok) return;
+    const lease = registry.claim(guard, { handle: prepared.handle, action: OWNER_NATIVE_EVIDENCE_ACTION, disposition: OWNER_NATIVE_EVIDENCE_DISPOSITION });
+    assert.equal(lease.ok, true);
+    if (!lease.ok) return;
+    let result: unknown;
+    assert.throws(() => stores.withAuditTransaction(tx => {
+      result = registry.withLeaseView(guard, tx, lease.token, () => {
+        db.exec("ROLLBACK");
+        return "match";
+      });
+    }));
+    assert.deepEqual(result, { ok: false, error: "ERR_NATIVE_EVIDENCE_LEASE" });
+    assert.equal(registry.size, 1);
+    assert.deepEqual(registry.releaseLease(guard, lease.token), { ok: true, released: true });
+  } finally { db.close(); }
+});
+
+test("lease view post-check rejects revoke, rotation, stale/disabled owner, and either expiry", async () => {
+  const { db, owners, manager, setNow } = await setup();
+  try {
+    const stores = createJobStores(db);
+    for (const mutation of ["revoke", "rotate", "stale-session", "candidate-expiry", "binding-expiry", "owner-disabled"] as const) {
+      let clockNow = START;
+      const session = await newSession(manager), guard = post(manager, session);
+      const registry = makeRegistry(manager, makeCandidate, undefined, undefined, () => clockNow);
+      const p = registry.prepare(guard);
+      assert.equal(p.ok, true);
+      if (!p.ok) continue;
+      const req = { handle: p.handle, action: OWNER_NATIVE_EVIDENCE_ACTION, disposition: OWNER_NATIVE_EVIDENCE_DISPOSITION };
+      const lease = registry.claim(guard, req);
+      assert.equal(lease.ok, true);
+      if (!lease.ok) continue;
+      stores.withAuditTransaction(tx => {
+        const result = registry.withLeaseView(guard, tx, lease.token, view => {
+          if (mutation === "revoke") db.prepare("UPDATE sessions SET revoked_at=? WHERE owner_id=? AND revoked_at IS NULL").run(START, session.metadata.ownerId);
+          if (mutation === "rotate") db.prepare("UPDATE owners SET credential_version=credential_version+1 WHERE owner_id=?").run(session.metadata.ownerId);
+          if (mutation === "stale-session") db.prepare("UPDATE sessions SET session_version=session_version+1 WHERE owner_id=? AND session_version=?").run(session.metadata.ownerId, session.metadata.sessionVersion);
+          if (mutation === "candidate-expiry") clockNow = view.candidateExpiresAt;
+          if (mutation === "binding-expiry") setNow(view.serverBinding.expiresAt);
+          if (mutation === "owner-disabled") db.prepare("UPDATE owners SET disabled=1 WHERE owner_id=?").run(session.metadata.ownerId);
+          return "match";
+        });
+        assert.equal(result.ok, false, mutation);
+      });
+      assert.equal(registry.size, 1, mutation);
+      if (mutation === "revoke" || mutation === "rotate" || mutation === "stale-session" || mutation === "owner-disabled") continue;
+      if (mutation === "binding-expiry") {
+        setNow(START);
+        assert.equal(clockNow, START);
+        assert.ok(registry.inspect(guard, p.handle).ok, "candidate remains unexpired after isolating session-binding expiry");
+      }
+    }
   } finally { db.close(); }
 });
 

@@ -17,6 +17,7 @@ const TUPLE_KEYS = ["domain", "hostId", "jobId", "requestId", "commandSequence",
 const CERTIFICATE_KEYS = ["certificateId", "serial", "fingerprint", "version", "candidateId", "address", "port", "protocolMajor", "protocolMinor", "notBefore", "notAfter", "caId", "caVersion", "spiffeUri"] as const;
 const VIEW_KEYS = ["tuple", "tupleDigest", "payloadBytes", "responseBytes", "certificateBindingAssertion"] as const;
 const SYNC_KEYS = ["ok", "session"] as const;
+const SESSION_KEYS = ["ownerId", "credentialVersion", "sessionVersion", "createdAt", "lastSeenAt", "absoluteExpiresAt", "idleExpiresAt", "revokedAt"] as const;
 const TYPED_ARRAY_PROTO = Object.getPrototypeOf(Uint8Array.prototype) as object;
 const intrinsic = (key: string) => Object.getOwnPropertyDescriptor(TYPED_ARRAY_PROTO, key)?.get;
 const getBuffer = intrinsic("buffer")!;
@@ -105,10 +106,20 @@ export interface LeaseRequest {
 export type LeaseResult = Readonly<{ ok: true; token: CandidateLeaseToken }> | LeaseFailure;
 export type CommitResult = Readonly<{ ok: true; committed: true }> | LeaseFailure;
 export type ReleaseResult = Readonly<{ ok: true; released: true }> | LeaseFailure;
+type CandidateLeaseView = Readonly<{
+  tuple: NativeEvidenceCandidateTuple;
+  tupleDigest: string;
+  payloadBytes: Uint8Array;
+  responseBytes: Uint8Array;
+  certificateBindingAssertion: NativeEvidenceCertificateAssertion;
+  serverBinding: Readonly<{ ownerId: string; sessionId: string; credentialVersion: number; expiresAt: string }>;
+  candidateExpiresAt: string;
+}>;
+type LeaseViewResult = Readonly<{ ok: true; match: boolean }> | LeaseFailure;
 
 type Binding = Readonly<{ id: string; credentialVersion: number; expiresAt: string }>;
 type LeaseRecord = { readonly handle: string; readonly bytes: number };
-type Entry = { readonly ownerId: string; readonly sessionId: string; readonly credentialVersion: number; readonly expiresAt: string; readonly summary: CandidateSummary; readonly candidate: CapturedNativeEvidenceCandidate; readonly integrity: string; readonly bytes: number; lease: LeaseRecord | null };
+type Entry = { readonly ownerId: string; readonly sessionId: string; readonly credentialVersion: number; readonly serverExpiresAt: string; readonly candidateExpiresAt: string; readonly summary: CandidateSummary; readonly candidate: CapturedNativeEvidenceCandidate; readonly integrity: string; readonly bytes: number; lease: LeaseRecord | null };
 const fail = (): CandidateFailure => Object.freeze({ ok: false, error: "ERR_NATIVE_EVIDENCE_CANDIDATE" });
 const failLease = (): LeaseFailure => Object.freeze({ ok: false, error: "ERR_NATIVE_EVIDENCE_LEASE" });
 // Resolves a lease token purely by object identity, independent of its literal contents: a
@@ -186,6 +197,13 @@ function guardSession(input: GuardResult, manager: SessionManager): { session: S
   if (!binding || !boundedText(session.ownerId, 128) || !Number.isSafeInteger(session.credentialVersion) || session.credentialVersion !== binding.credentialVersion) return null;
   return { session, binding };
 }
+function leaseViewSession(input: GuardResult): { session: SessionMetadata; ownerId: string; credentialVersion: number } | null {
+  const g = record(input, SYNC_KEYS);
+  if (!g || g.ok !== true || !g.session || typeof g.session !== "object") return null;
+  const s = record(g.session, SESSION_KEYS);
+  if (!s || !boundedText(s.ownerId, 128) || !Number.isSafeInteger(s.credentialVersion) || (s.credentialVersion as number) < 1) return null;
+  return { session: g.session as SessionMetadata, ownerId: s.ownerId, credentialVersion: s.credentialVersion as number };
+}
 function canonicalTimestamp(value: unknown): value is string {
   // Canonical UTC millisecond instant: exact format, finite, and round-trips through Date.
   if (typeof value !== "string" || !/^\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}\.\d{3}Z$/.test(value)) return false;
@@ -211,6 +229,8 @@ export class OwnerNativeEvidenceCandidateRegistry {
   private readonly instanceNonce = randomBytes(16).toString("hex");
   private closed = false;
   private preparing = false;
+  /** Registry-wide guard while trusted lease-view code or its clock is executing. */
+  private inView = false;
   private readonly clock: () => string;
   private readonly makeId: () => string;
   constructor(private readonly manager: SessionManager, private readonly options: CandidateRegistryOptions) {
@@ -218,14 +238,14 @@ export class OwnerNativeEvidenceCandidateRegistry {
     this.makeId = options.id ?? (() => randomBytes(24).toString("hex"));
   }
   private prune(now: number): void {
-    for (const [handle, entry] of this.entries) if (Date.parse(entry.expiresAt) <= now) this.drop(handle);
+    for (const [handle, entry] of this.entries) if (Date.parse(entry.candidateExpiresAt) <= now) this.drop(handle);
   }
   private drop(handle: string): void {
     const entry = this.entries.get(handle);
     if (entry) { this.retainedBytes -= entry.bytes; this.entries.delete(handle); }
   }
   prepare(guard: GuardResult): CandidateResult {
-    if (this.closed || this.preparing) return fail();
+    if (this.closed || this.preparing || this.inView) return fail();
     this.preparing = true;
     try {
       const auth = guardSession(guard, this.manager);
@@ -261,7 +281,7 @@ export class OwnerNativeEvidenceCandidateRegistry {
         tuple, tupleDigest: capturedTupleDigest, payloadBytes: payloadBytes.length, responseBytes: responseBytes.length, certificateAssertion: certSummary,
         expiresAt, currentHistoryAndCertificateRevalidated: false });
       this.entries.set(handle, { ownerId: auth.session.ownerId, sessionId: auth.binding.id, credentialVersion: auth.binding.credentialVersion,
-        expiresAt, summary, candidate, integrity: integrity(candidate), bytes, lease: null });
+        serverExpiresAt: auth.binding.expiresAt, candidateExpiresAt: expiresAt, summary, candidate, integrity: integrity(candidate), bytes, lease: null });
       this.retainedBytes += bytes;
       return Object.freeze({ ok: true, handle, summary });
     } catch { return fail(); }
@@ -269,26 +289,26 @@ export class OwnerNativeEvidenceCandidateRegistry {
   }
   inspect(guard: GuardResult, handle: unknown): CandidateResult {
     try {
-      if (this.closed) return fail();
+      if (this.inView || this.closed) return fail();
       const auth = guardSession(guard, this.manager);
       if (!auth || !boundedText(handle, 128)) return fail();
       const now = nowMs(this.clock); this.prune(now);
       const entry = this.entries.get(handle);
       if (!entry || entry.ownerId !== auth.session.ownerId || entry.sessionId !== auth.binding.id || entry.credentialVersion !== auth.binding.credentialVersion ||
-          Date.parse(entry.expiresAt) <= now || integrity(entry.candidate) !== entry.integrity) return fail();
+          Date.parse(entry.candidateExpiresAt) <= now || integrity(entry.candidate) !== entry.integrity) return fail();
       return Object.freeze({ ok: true, handle, summary: entry.summary });
     } catch { return fail(); }
   }
   consume(guard: GuardResult, input: unknown): ConsumeResult {
     try {
-      if (this.closed) return fail();
+      if (this.inView || this.closed) return fail();
       const auth = guardSession(guard, this.manager);
       const request = record(input, ["handle", "action", "disposition"]);
       if (!auth || !request || !boundedText(request.handle, 128) || request.action !== OWNER_NATIVE_EVIDENCE_ACTION || request.disposition !== OWNER_NATIVE_EVIDENCE_DISPOSITION) return fail();
       const now = nowMs(this.clock); this.prune(now);
       const handle = request.handle as string, entry = this.entries.get(handle);
       if (!entry || entry.lease || entry.ownerId !== auth.session.ownerId || entry.sessionId !== auth.binding.id || entry.credentialVersion !== auth.binding.credentialVersion ||
-          Date.parse(entry.expiresAt) <= now || integrity(entry.candidate) !== entry.integrity) return fail();
+          Date.parse(entry.candidateExpiresAt) <= now || integrity(entry.candidate) !== entry.integrity) return fail();
       this.drop(handle);
       // Give trusted synchronous callback an owned private copy; never expose retained storage.
       const delivered = Object.freeze({ ...entry.candidate, tuple: entry.candidate.tuple,
@@ -299,6 +319,69 @@ export class OwnerNativeEvidenceCandidateRegistry {
       if (result !== undefined) return fail();
       return Object.freeze({ ok: true, consumed: true });
     } catch { return fail(); }
+  }
+  /**
+   * Synchronously inspect detached copies for an exact live lease while the caller's
+   * existing coupled transaction is active. The callback may retain its detached view
+   * and byte copies; it never receives registry-owned storage, a handle, token, session
+   * token, transaction, or DB object. Only the exact literal verdicts are accepted.
+   * This view validates authority and integrity but never consumes or settles a lease.
+   */
+  withLeaseView(
+    guard: GuardResult,
+    tx: unknown,
+    token: CandidateLeaseToken,
+    inspect: (view: CandidateLeaseView) => "match" | "mismatch",
+  ): LeaseViewResult {
+    if (this.inView || this.preparing || this.closed) return failLease();
+    this.inView = true;
+    try {
+      const auth = leaseViewSession(guard);
+      if (!auth) return failLease();
+      // Establish transaction authority before resolving the token or reading an entry.
+      const beforeBinding = this.manager.bindingInTransaction(tx, auth.session);
+      if (!beforeBinding || beforeBinding.credentialVersion !== auth.credentialVersion ||
+          !canonicalTimestamp(beforeBinding.expiresAt)) return failLease();
+      if (this.closed) return failLease();
+      const lease = leaseToken(this.leases, token);
+      if (!lease || !boundedText(lease.handle, 128)) return failLease();
+      const entry = this.entries.get(lease.handle);
+      if (!entry || entry.lease !== lease || entry.ownerId !== auth.ownerId || entry.sessionId !== beforeBinding.id ||
+          entry.credentialVersion !== beforeBinding.credentialVersion || entry.serverExpiresAt !== beforeBinding.expiresAt ||
+          !canonicalTimestamp(entry.candidateExpiresAt) || integrity(entry.candidate) !== entry.integrity) return failLease();
+      const beforeNow = nowMs(this.clock);
+      if (this.closed || Date.parse(beforeBinding.expiresAt) <= beforeNow || Date.parse(entry.candidateExpiresAt) <= beforeNow ||
+          this.leases.get(token) !== lease || this.entries.get(lease.handle) !== entry || entry.lease !== lease) return failLease();
+      const currentBinding = this.manager.bindingInTransaction(tx, auth.session);
+      if (this.closed || !currentBinding || currentBinding.id !== entry.sessionId ||
+          currentBinding.credentialVersion !== entry.credentialVersion || currentBinding.expiresAt !== entry.serverExpiresAt) return failLease();
+
+      const tuple = cloneTuple(entry.candidate.tuple);
+      const certificateBindingAssertion = cloneCertificate(entry.candidate.certificateBindingAssertion);
+      const payloadBytes = copyBytes(entry.candidate.payloadBytes, MAX_PAYLOAD_BYTES);
+      const responseBytes = copyBytes(entry.candidate.responseBytes, MAX_RESPONSE_BYTES);
+      if (!tuple || !certificateBindingAssertion || !payloadBytes || !responseBytes) return failLease();
+      const serverBinding = Object.freeze({ ownerId: entry.ownerId, sessionId: entry.sessionId,
+        credentialVersion: entry.credentialVersion, expiresAt: entry.serverExpiresAt });
+      const view: CandidateLeaseView = Object.freeze({ tuple, tupleDigest: entry.candidate.tupleDigest,
+        payloadBytes, responseBytes, certificateBindingAssertion, serverBinding, candidateExpiresAt: entry.candidateExpiresAt });
+      let verdict: unknown;
+      try { verdict = inspect(view); } catch { return failLease(); }
+      if (this.closed) return failLease();
+      const matched = verdict === "match" ? true : verdict === "mismatch" ? false : null;
+      if (matched === null) return failLease();
+
+      // Revalidate under the same transaction after all callback code has returned.
+      const afterNow = nowMs(this.clock);
+      if (this.closed || this.entries.get(lease.handle) !== entry || this.leases.get(token) !== lease ||
+          entry.lease !== lease || integrity(entry.candidate) !== entry.integrity ||
+          Date.parse(entry.candidateExpiresAt) <= afterNow || Date.parse(entry.serverExpiresAt) <= afterNow) return failLease();
+      const afterBinding = this.manager.bindingInTransaction(tx, auth.session);
+      if (this.closed || !afterBinding || afterBinding.id !== entry.sessionId || afterBinding.credentialVersion !== entry.credentialVersion ||
+          afterBinding.expiresAt !== entry.serverExpiresAt || auth.ownerId !== entry.ownerId) return failLease();
+      return Object.freeze({ ok: true, match: matched });
+    } catch { return failLease(); }
+    finally { this.inView = false; }
   }
   /**
    * Reserve an already-prepared (available) candidate into a single lease that must be
@@ -319,7 +402,7 @@ export class OwnerNativeEvidenceCandidateRegistry {
    */
   claim(guard: GuardResult, input: unknown): LeaseResult {
     try {
-      if (this.closed) return failLease();
+      if (this.inView || this.closed) return failLease();
       const auth = guardSession(guard, this.manager);
       if (!auth) return failLease();
       const request = record(input, ["handle", "action", "disposition"]);
@@ -329,7 +412,7 @@ export class OwnerNativeEvidenceCandidateRegistry {
       const now = nowMs(this.clock); this.prune(now);
       const entry = this.entries.get(request.handle as string);
       if (!entry || entry.lease || entry.ownerId !== auth.session.ownerId || entry.sessionId !== auth.binding.id ||
-          entry.credentialVersion !== auth.binding.credentialVersion || Date.parse(entry.expiresAt) <= now ||
+          entry.credentialVersion !== auth.binding.credentialVersion || Date.parse(entry.candidateExpiresAt) <= now ||
           integrity(entry.candidate) !== entry.integrity) return failLease();
       const seq = ++this.leaseSequence;
       if (!Number.isSafeInteger(seq) || (seq as number) < 1) return failLease();
@@ -350,7 +433,7 @@ export class OwnerNativeEvidenceCandidateRegistry {
    */
   commitLease(guard: GuardResult, token: unknown): CommitResult {
     try {
-      if (this.closed) return failLease();
+      if (this.inView || this.closed) return failLease();
       const auth = guardSession(guard, this.manager);
       if (!auth) return failLease();
       const lease = leaseToken(this.leases, token);
@@ -358,7 +441,7 @@ export class OwnerNativeEvidenceCandidateRegistry {
       const now = nowMs(this.clock); this.prune(now);
       const entry = this.entries.get(lease.handle);
       if (!entry || entry.lease !== lease || entry.ownerId !== auth.session.ownerId || entry.sessionId !== auth.binding.id ||
-          entry.credentialVersion !== auth.binding.credentialVersion || Date.parse(entry.expiresAt) <= now ||
+          entry.credentialVersion !== auth.binding.credentialVersion || Date.parse(entry.candidateExpiresAt) <= now ||
           integrity(entry.candidate) !== entry.integrity) return failLease();
       this.leases.delete(token as object);
       // Commit is terminal: remove the entry and release its exact accounting once.
@@ -375,7 +458,7 @@ export class OwnerNativeEvidenceCandidateRegistry {
    */
   releaseLease(guard: GuardResult, token: unknown): ReleaseResult {
     try {
-      if (this.closed) return failLease();
+      if (this.inView || this.closed) return failLease();
       const auth = guardSession(guard, this.manager);
       if (!auth) return failLease();
       const lease = leaseToken(this.leases, token);
@@ -383,7 +466,7 @@ export class OwnerNativeEvidenceCandidateRegistry {
       const now = nowMs(this.clock); this.prune(now);
       const entry = this.entries.get(lease.handle);
       if (!entry || entry.lease !== lease || entry.ownerId !== auth.session.ownerId || entry.sessionId !== auth.binding.id ||
-          entry.credentialVersion !== auth.binding.credentialVersion || Date.parse(entry.expiresAt) <= now ||
+          entry.credentialVersion !== auth.binding.credentialVersion || Date.parse(entry.candidateExpiresAt) <= now ||
           integrity(entry.candidate) !== entry.integrity) return failLease();
       this.leases.delete(token as object);
       entry.lease = null;
