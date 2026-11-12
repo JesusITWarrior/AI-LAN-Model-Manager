@@ -71,6 +71,15 @@ function dbSnapshot(db: DatabaseSync): string {
     history: db.prepare("SELECT * FROM job_history ORDER BY history_id").all(),
     commands: db.prepare("SELECT * FROM agent_commands ORDER BY rowid").all() });
 }
+function retainedByteRefs(registry: OwnerNativeEvidenceCandidateRegistry, handle: string): { payload: Uint8Array; response: Uint8Array } | null {
+  const internal = registry as unknown as { entries: Map<string, { candidate: { payloadBytes: Uint8Array; responseBytes: Uint8Array } }> };
+  const candidate = internal.entries.get(handle)?.candidate;
+  return candidate ? { payload: candidate.payloadBytes, response: candidate.responseBytes } : null;
+}
+function assertWiped(bytes: { payload: Uint8Array; response: Uint8Array }): void {
+  assert.ok(bytes.payload.every(value => value === 0));
+  assert.ok(bytes.response.every(value => value === 0));
+}
 
 test("real guarded prepare and redacted inspect consume exactly once without DB mutations", async () => {
   const { db, manager } = await setup();
@@ -286,6 +295,109 @@ test("registry close releases retained bytes and permanently rejects operations"
     assert.equal(registry.prepare(guard).ok, false);
     assert.equal(registry.inspect(guard, candidate.ok ? candidate.handle : "").ok, false);
     assert.equal(registry.consume(guard, { handle: candidate.ok ? candidate.handle : "", action: OWNER_NATIVE_EVIDENCE_ACTION, disposition: OWNER_NATIVE_EVIDENCE_DISPOSITION }).ok, false);
+  } finally { db.close(); }
+});
+
+test("registry-owned bytes are wiped on close, expiry, consume, and lease commit only", async () => {
+  const { db, manager } = await setup();
+  try {
+    const session = await newSession(manager), guard = post(manager, session);
+
+    const closeSource = makeCandidate(), closeRegistry = makeRegistry(manager, () => closeSource);
+    const closePrepared = closeRegistry.prepare(guard);
+    assert.equal(closePrepared.ok, true);
+    if (!closePrepared.ok) return;
+    const closeOwned = retainedByteRefs(closeRegistry, closePrepared.handle)!;
+    closeRegistry.close(); closeRegistry.close();
+    assertWiped(closeOwned);
+    assert.deepEqual(Array.from(closeSource.payloadBytes), [80, 65, 89]);
+    assert.deepEqual(Array.from(closeSource.responseBytes), [82, 83, 80]);
+    assert.equal(closeRegistry.size, 0);
+    assert.equal(closeRegistry.retainedByteCount, 0);
+
+    let now = START;
+    const expirySource = makeCandidate(), expiryRegistry = makeRegistry(manager, () => expirySource, undefined, undefined, () => now);
+    const expiryPrepared = expiryRegistry.prepare(guard);
+    assert.equal(expiryPrepared.ok, true);
+    if (!expiryPrepared.ok) return;
+    const expiryOwned = retainedByteRefs(expiryRegistry, expiryPrepared.handle)!;
+    now = "2026-09-27T10:01:00.000Z";
+    assert.equal(expiryRegistry.inspect(guard, expiryPrepared.handle).ok, false);
+    assertWiped(expiryOwned);
+    assert.equal(expiryRegistry.size, 0);
+    assert.equal(expiryRegistry.retainedByteCount, 0);
+    assert.deepEqual(Array.from(expirySource.payloadBytes), [80, 65, 89]);
+    assert.deepEqual(Array.from(expirySource.responseBytes), [82, 83, 80]);
+
+    const consumeSource = makeCandidate();
+    let consumed: CapturedNativeEvidenceCandidate | undefined;
+    const consumeRegistry = makeRegistry(manager, () => consumeSource, value => { consumed = value as CapturedNativeEvidenceCandidate; });
+    const consumePrepared = consumeRegistry.prepare(guard);
+    assert.equal(consumePrepared.ok, true);
+    if (!consumePrepared.ok) return;
+    const consumeOwned = retainedByteRefs(consumeRegistry, consumePrepared.handle)!;
+    assert.deepEqual(consumeRegistry.consume(guard, { handle: consumePrepared.handle, action: OWNER_NATIVE_EVIDENCE_ACTION,
+      disposition: OWNER_NATIVE_EVIDENCE_DISPOSITION }), { ok: true, consumed: true });
+    assertWiped(consumeOwned);
+    assert.ok(consumed);
+    assert.notEqual(consumed!.payloadBytes, consumeOwned.payload);
+    assert.notEqual(consumed!.responseBytes, consumeOwned.response);
+    assert.deepEqual(Array.from(consumed!.payloadBytes), [80, 65, 89]);
+    assert.deepEqual(Array.from(consumed!.responseBytes), [82, 83, 80]);
+    assert.deepEqual(Array.from(consumeSource.payloadBytes), [80, 65, 89]);
+    assert.deepEqual(Array.from(consumeSource.responseBytes), [82, 83, 80]);
+    assert.equal(consumeRegistry.size, 0);
+    assert.equal(consumeRegistry.retainedByteCount, 0);
+
+    const throwingSource = makeCandidate(), throwingRegistry = makeRegistry(manager, () => throwingSource, () => { throw new Error("expected callback failure"); });
+    const throwingPrepared = throwingRegistry.prepare(guard);
+    assert.equal(throwingPrepared.ok, true);
+    if (!throwingPrepared.ok) return;
+    const throwingOwned = retainedByteRefs(throwingRegistry, throwingPrepared.handle)!;
+    assert.equal(throwingRegistry.consume(guard, { handle: throwingPrepared.handle, action: OWNER_NATIVE_EVIDENCE_ACTION,
+      disposition: OWNER_NATIVE_EVIDENCE_DISPOSITION }).ok, false);
+    assertWiped(throwingOwned);
+    assert.equal(throwingRegistry.size, 0);
+    assert.equal(throwingRegistry.retainedByteCount, 0);
+    assert.deepEqual(Array.from(throwingSource.payloadBytes), [80, 65, 89]);
+    assert.deepEqual(Array.from(throwingSource.responseBytes), [82, 83, 80]);
+
+    const leaseSource = makeCandidate(), leaseRegistry = makeRegistry(manager, () => leaseSource);
+    const leasePrepared = leaseRegistry.prepare(guard);
+    assert.equal(leasePrepared.ok, true);
+    if (!leasePrepared.ok) return;
+    const leaseOwned = retainedByteRefs(leaseRegistry, leasePrepared.handle)!;
+    const request = { handle: leasePrepared.handle, action: OWNER_NATIVE_EVIDENCE_ACTION, disposition: OWNER_NATIVE_EVIDENCE_DISPOSITION };
+    const firstLease = leaseRegistry.claim(guard, request);
+    assert.equal(firstLease.ok, true);
+    if (!firstLease.ok) return;
+    assert.deepEqual(leaseRegistry.releaseLease(guard, firstLease.token), { ok: true, released: true });
+    assert.deepEqual(Array.from(leaseOwned.payload), [80, 65, 89]);
+    assert.deepEqual(Array.from(leaseOwned.response), [82, 83, 80]);
+    assert.equal(leaseRegistry.retainedByteCount, 6);
+
+    const stores = createJobStores(db, { now: () => START });
+    let detachedPayload: Uint8Array | undefined, detachedResponse: Uint8Array | undefined;
+    const secondLease = leaseRegistry.claim(guard, request);
+    assert.equal(secondLease.ok, true);
+    if (!secondLease.ok) return;
+    let viewResult: unknown;
+    stores.withAuditTransaction(tx => {
+      viewResult = leaseRegistry.withLeaseView(guard, tx, secondLease.token, view => {
+        detachedPayload = view.payloadBytes;
+        detachedResponse = view.responseBytes;
+        return "match";
+      });
+    });
+    assert.deepEqual(viewResult, { ok: true, match: true });
+    assert.deepEqual(leaseRegistry.commitLease(guard, secondLease.token), { ok: true, committed: true });
+    assertWiped(leaseOwned);
+    assert.deepEqual(Array.from(detachedPayload!), [80, 65, 89]);
+    assert.deepEqual(Array.from(detachedResponse!), [82, 83, 80]);
+    assert.deepEqual(Array.from(leaseSource.payloadBytes), [80, 65, 89]);
+    assert.deepEqual(Array.from(leaseSource.responseBytes), [82, 83, 80]);
+    assert.equal(leaseRegistry.size, 0);
+    assert.equal(leaseRegistry.retainedByteCount, 0);
   } finally { db.close(); }
 });
 

@@ -4,6 +4,7 @@ import type { DatabaseSync } from "node:sqlite";
 import { guardManagementRequest } from "./guard.js";
 import type { SessionManager } from "./session-manager.js";
 import { createAllowedOrigins } from "./origin.js";
+import type { OriginPolicyOptions } from "./origin.js";
 import {
   canonicalCertificateSerial, sameCertificateSerial, commandAuthorizationDigest, parseCertificateAuthorityMetadata,
   parseCommandRequest, parseCommandResponse, parseHostCertificateMetadata, parseJobSnapshot,
@@ -485,8 +486,9 @@ export class OwnerNativeEvidenceOwnerConfirmService {
   private readonly stores: ReturnType<typeof createJobStores>;
   private readonly origins: readonly string[];
   constructor(private readonly db: DatabaseSync, private readonly registry: OwnerNativeEvidenceCandidateRegistry,
-    private readonly sessions: SessionManager, allowedOrigins: readonly string[], private readonly clock: () => string = () => new Date().toISOString()) {
-    this.origins = createAllowedOrigins([...allowedOrigins]);
+    private readonly sessions: SessionManager, allowedOrigins: readonly string[], private readonly clock: () => string = () => new Date().toISOString(),
+    private readonly originOptions: OriginPolicyOptions = {}) {
+    this.origins = createAllowedOrigins([...allowedOrigins], this.originOptions);
     this.stores = createJobStores(db);
   }
 
@@ -502,7 +504,7 @@ export class OwnerNativeEvidenceOwnerConfirmService {
         typeof body.expectedTupleDigest !== "string" || !/^[a-f0-9]{64}$/.test(body.expectedTupleDigest) ||
         body.action !== EVIDENCE_ONLY_ACTION || body.disposition !== EVIDENCE_ONLY_DISPOSITION) return confirmResult("denied");
     const guard = guardManagementRequest(this.sessions, this.origins, { method: envelope.method, cookieHeader: envelope.cookieHeader,
-      originHeader: envelope.originHeader, csrfHeader: envelope.csrfHeader });
+      originHeader: envelope.originHeader, csrfHeader: envelope.csrfHeader }, this.originOptions);
     if (!guard.ok) return confirmResult("denied");
     const observed = this.registry.inspect(guard, body.candidateHandle);
     if (!observed.ok || observed.summary.tupleDigest !== body.expectedTupleDigest) return confirmResult("stale");

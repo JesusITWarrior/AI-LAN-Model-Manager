@@ -244,7 +244,20 @@ export class OwnerNativeEvidenceCandidateRegistry {
   }
   private drop(handle: string): void {
     const entry = this.entries.get(handle);
-    if (entry) { this.retainedBytes -= entry.bytes; this.entries.delete(handle); }
+    if (!entry) return;
+    // The registry owns these defensive copies. Wipe them while the entry is
+    // still present, then release its exact retained-byte charge exactly once.
+    try {
+      if (types.isUint8Array(entry.candidate.payloadBytes)) {
+        try { Uint8Array.prototype.fill.call(entry.candidate.payloadBytes, 0); } catch { /* still release the entry */ }
+      }
+      if (types.isUint8Array(entry.candidate.responseBytes)) {
+        try { Uint8Array.prototype.fill.call(entry.candidate.responseBytes, 0); } catch { /* still release the entry */ }
+      }
+    } finally {
+      this.retainedBytes -= entry.bytes;
+      this.entries.delete(handle);
+    }
   }
   prepare(guard: GuardResult): CandidateResult {
     if (this.closed || this.preparing || this.inView || this.settling) return fail();
@@ -311,10 +324,13 @@ export class OwnerNativeEvidenceCandidateRegistry {
       const handle = request.handle as string, entry = this.entries.get(handle);
       if (!entry || entry.lease || entry.ownerId !== auth.session.ownerId || entry.sessionId !== auth.binding.id || entry.credentialVersion !== auth.binding.credentialVersion ||
           Date.parse(entry.candidateExpiresAt) <= now || integrity(entry.candidate) !== entry.integrity) return fail();
-      this.drop(handle);
       // Give trusted synchronous callback an owned private copy; never expose retained storage.
+      const payloadBytes = copyBytes(entry.candidate.payloadBytes, MAX_PAYLOAD_BYTES);
+      const responseBytes = copyBytes(entry.candidate.responseBytes, MAX_RESPONSE_BYTES);
+      this.drop(handle);
+      if (!payloadBytes || !responseBytes) return fail();
       const delivered = Object.freeze({ ...entry.candidate, tuple: entry.candidate.tuple,
-        payloadBytes: copyBytes(entry.candidate.payloadBytes, MAX_PAYLOAD_BYTES)!, responseBytes: copyBytes(entry.candidate.responseBytes, MAX_RESPONSE_BYTES)! });
+        payloadBytes, responseBytes });
       const result = this.options.consumeCandidate(delivered);
       // The seam is synchronous-void only. Reject any return value without
       // probing `then`, so hostile accessors are never invoked.
@@ -508,9 +524,9 @@ export class OwnerNativeEvidenceCandidateRegistry {
   /** Drop retained data and permanently disable this volatile registry instance. */
   close(): void {
     if (this.closed) return;
-    for (const handle of this.entries.keys()) this.drop(handle);
+    this.closed = true;
+    for (const handle of [...this.entries.keys()]) this.drop(handle);
     this.leases = new WeakMap();
     this.retainedBytes = 0;
-    this.closed = true;
   }
 }

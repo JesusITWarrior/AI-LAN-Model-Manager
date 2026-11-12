@@ -2,6 +2,7 @@ import { types } from "node:util";
 import { parseStreamWireJSON } from "@lan-model-manager/core";
 import { guardManagementRequest } from "./guard.js";
 import { createAllowedOrigins } from "./origin.js";
+import type { OriginPolicyOptions } from "./origin.js";
 import { createJobStores } from "./jobs-store.js";
 import { OwnerNativeEvidenceCandidateRegistry, OWNER_NATIVE_EVIDENCE_ACTION, OWNER_NATIVE_EVIDENCE_DISPOSITION } from "./owner-native-evidence-candidates.js";
 import type { DatabaseSync } from "node:sqlite";
@@ -97,8 +98,8 @@ export class OwnerNativeEvidenceIntakeService {
   private readonly registry: OwnerNativeEvidenceCandidateRegistry;
 
   constructor(private readonly db: DatabaseSync, private readonly sessions: SessionManager, allowedOrigins: readonly string[],
-    private readonly clock: () => string = () => new Date().toISOString()) {
-    this.origins = createAllowedOrigins([...allowedOrigins]);
+    private readonly clock: () => string = () => new Date().toISOString(), private readonly originOptions: OriginPolicyOptions = {}) {
+    this.origins = createAllowedOrigins([...allowedOrigins], this.originOptions);
     this.stores = createJobStores(db);
     this.registry = new OwnerNativeEvidenceCandidateRegistry(sessions, { clock,
       prepareCandidate: () => this.prepareStagedCandidate(), consumeCandidate: () => undefined });
@@ -119,7 +120,7 @@ export class OwnerNativeEvidenceIntakeService {
           envelope.csrfHeader !== null && (typeof envelope.csrfHeader !== "string" || envelope.csrfHeader.length > 128) ||
           typeof envelope.jobSelector !== "string" || !ID.test(envelope.jobSelector) || types.isProxy(envelope.rawPayloadBytes) || !types.isUint8Array(envelope.rawPayloadBytes)) return fail();
       const guard = guardManagementRequest(this.sessions, this.origins, { method: envelope.method as string,
-        cookieHeader: envelope.cookieHeader, originHeader: envelope.originHeader as string | null, csrfHeader: envelope.csrfHeader as string | null });
+        cookieHeader: envelope.cookieHeader, originHeader: envelope.originHeader as string | null, csrfHeader: envelope.csrfHeader as string | null }, this.originOptions);
       if (!guard.ok) return fail();
 
       // No byte copy or retained reference exists until owner/origin/CSRF auth succeeds.
