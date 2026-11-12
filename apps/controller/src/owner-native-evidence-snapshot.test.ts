@@ -1,5 +1,8 @@
 import assert from "node:assert/strict";
 import { createHash } from "node:crypto";
+import { readFileSync } from "node:fs";
+import { dirname, join } from "node:path";
+import { fileURLToPath } from "node:url";
 import test from "node:test";
 import { commandAuthorizationDigest, commandPolicyOperation, parseCommandRequest, type CommandRequest, type CommandResponse } from "@lan-model-manager/core";
 import { AgentCommandStore } from "./agent-command-channel.js";
@@ -11,7 +14,7 @@ import { createAllowedOrigins } from "./origin.js";
 import { createJobStores } from "./jobs-store.js";
 import { createOwnerBootstrapService } from "./owner-service.js";
 import { OwnerNativeEvidenceCandidateRegistry, OWNER_NATIVE_EVIDENCE_ACTION, OWNER_NATIVE_EVIDENCE_DISPOSITION, type NativeEvidenceCandidateInput } from "./owner-native-evidence-candidates.js";
-import { OwnerNativeEvidenceSnapshotReader } from "./owner-native-evidence-snapshot.js";
+import { OwnerNativeEvidenceMatchedAppendCoordinator, OwnerNativeEvidenceSnapshotReader } from "./owner-native-evidence-snapshot.js";
 import { SessionManager } from "./session-manager.js";
 import { guardManagementRequest } from "./guard.js";
 import { computeTerminalRevision } from "./native-terminal-revision.js";
@@ -37,6 +40,10 @@ function makeInput(tuple: Record<string, unknown>, responseBytes: Uint8Array, ce
 }
 async function fixture(largeRequest = false) {
   const db = openControllerDatabase(":memory:");
+  const testSchema = readFileSync(join(dirname(fileURLToPath(import.meta.url)), "supplemental-native-evidence-test-schema.sql"), "utf8");
+  const marker = "CREATE TABLE evidence_commit_guard";
+  assert.equal(testSchema.split(marker).length - 1, 1, "expected one opt-in evidence schema marker");
+  db.exec(testSchema.slice(testSchema.indexOf(marker)));
   let now = START, random = 0;
   const owners = createOwnerBootstrapService(db, { now: () => now, ownerId: () => "a".repeat(32), crypto: passwordCrypto });
   await owners.bootstrapOwner({ username: "Admin", password: "owner-password-123" });
@@ -84,9 +91,10 @@ async function fixture(largeRequest = false) {
     responseDigest: createHash("sha256").update(responsePrefix).update(responseBytes).digest("hex"), responseByteLength: responseBytes.length,
     evidenceKind: "failed", holdClass: "unknown" };
   let candidate: NativeEvidenceCandidateInput = makeInput(tuple, responseBytes, certificates.getById("c".repeat(64)));
-  const registry = new OwnerNativeEvidenceCandidateRegistry(sessions, { clock: () => now, prepareCandidate: () => candidate, consumeCandidate: () => undefined });
+  let registryClockHook: () => void = () => undefined;
+  const registry = new OwnerNativeEvidenceCandidateRegistry(sessions, { clock: () => { registryClockHook(); return now; }, prepareCandidate: () => candidate, consumeCandidate: () => undefined });
   const reader = new OwnerNativeEvidenceSnapshotReader(db, registry, { clock: () => now });
-  return { db, now, guard, stores, registry, reader, candidate, setCandidate: (x: NativeEvidenceCandidateInput) => { candidate = x; }, tuple, responseBytes, sessions, session, certificates, setNow: (value: string) => { now = value; }, request };
+  return { db, now, guard, stores, registry, reader, candidate, setCandidate: (x: NativeEvidenceCandidateInput) => { candidate = x; }, tuple, responseBytes, sessions, session, certificates, setNow: (value: string) => { now = value; }, setRegistryClockHook: (hook: () => void) => { registryClockHook = hook; }, request };
 }
 function candidateWithResponse(f: Awaited<ReturnType<typeof fixture>>, raw: Uint8Array, patch: Record<string, unknown> = {}): NativeEvidenceCandidateInput {
   const parsed = (() => { try { return JSON.parse(Buffer.from(raw).toString("utf8")); } catch { return null; } })();
@@ -103,6 +111,10 @@ function snapshotDatabase(db: import("node:sqlite").DatabaseSync): string {
     commands: db.prepare("SELECT * FROM agent_commands ORDER BY job_id").all(), audit: db.prepare("SELECT * FROM audit_events ORDER BY seq").all(),
     certificates: db.prepare("SELECT * FROM host_certificates ORDER BY cert_id").all(), authorities: db.prepare("SELECT * FROM certificate_authorities ORDER BY ca_id").all(),
     owners: db.prepare("SELECT * FROM owners ORDER BY owner_id").all(), sessions: db.prepare("SELECT * FROM sessions ORDER BY session_digest").all() });
+}
+function protectedState(db: import("node:sqlite").DatabaseSync): string {
+  const { audit: _audit, ...protectedRows } = JSON.parse(snapshotDatabase(db)) as Record<string, unknown>;
+  return JSON.stringify(protectedRows);
 }
 function withClaim(f: Awaited<ReturnType<typeof fixture>>, run: (token: object) => void) {
   const prepared = f.registry.prepare(f.guard); assert.ok(prepared.ok);
@@ -596,5 +608,152 @@ test("reader clock callbacks run before authoritative snapshot reads", async t =
         assert.deepEqual(f.registry.releaseLease(f.guard, lease.token), { ok: true, released: true });
       } finally { f.db.close(); }
     });
+  }
+});
+
+test("reader converts a throwing clock callback to fixed mismatch and leaves lease unsettled", async () => {
+  const f = await fixture();
+  try {
+    const prepared = f.registry.prepare(f.guard); assert.ok(prepared.ok);
+    const claimed = f.registry.claim(f.guard, { handle: prepared.handle, action: OWNER_NATIVE_EVIDENCE_ACTION, disposition: OWNER_NATIVE_EVIDENCE_DISPOSITION }); assert.ok(claimed.ok);
+    const reader = new OwnerNativeEvidenceSnapshotReader(f.db, f.registry, { clock: () => { throw new Error("synthetic clock failure"); } });
+    let verdict: ReturnType<typeof reader.read> | undefined;
+    f.stores.withAuditTransaction(tx => { verdict = reader.read(f.guard, tx, claimed.token); });
+    assert.deepEqual(verdict, { ok: true, match: false });
+    assert.deepEqual(f.registry.releaseLease(f.guard, claimed.token), { ok: true, released: true });
+  } finally { f.db.close(); }
+});
+
+test("matched append couples one evidence row and audit while leaving the lease provisional", async () => {
+  const f = await fixture();
+  const foreignDb = openControllerDatabase(":memory:");
+  try {
+    const auditBefore = (f.db.prepare("SELECT count(*) AS n FROM audit_events").get() as { n: number }).n;
+    const prepared = f.registry.prepare(f.guard); assert.ok(prepared.ok);
+    const claimed = f.registry.claim(f.guard, { handle: prepared.handle, action: OWNER_NATIVE_EVIDENCE_ACTION, disposition: OWNER_NATIVE_EVIDENCE_DISPOSITION }); assert.ok(claimed.ok);
+    const coordinator = new OwnerNativeEvidenceMatchedAppendCoordinator(f.db, f.registry);
+    let foreign: ReturnType<typeof coordinator.append> | undefined;
+    createJobStores(foreignDb).withAuditTransaction(tx => { foreign = coordinator.append(f.guard, tx, claimed.token,
+      { hostCertificateBindingDigest: "e".repeat(64), consentedAt: START }); });
+    assert.deepEqual(foreign, { ok: false, error: "ERR_NATIVE_EVIDENCE_LEASE" });
+    const protectedBefore = protectedState(f.db);
+    let result: ReturnType<typeof coordinator.append> | undefined;
+    let expectedSessionId: string | undefined;
+    f.stores.withAuditTransaction(tx => {
+      expectedSessionId = f.sessions.bindingInTransaction(tx, f.guard.session)?.id;
+      result = coordinator.append(f.guard, tx, claimed.token, { hostCertificateBindingDigest: "e".repeat(64), consentedAt: START });
+    });
+    assert.equal(result?.ok, true);
+    if (result?.ok) { assert.equal(result.match, true); assert.equal(result.append?.ok, true); }
+    assert.equal((f.db.prepare("SELECT count(*) AS n FROM supplemental_native_evidence").get() as { n: number }).n, 1);
+    assert.equal((f.db.prepare("SELECT count(*) AS n FROM audit_events").get() as { n: number }).n, auditBefore + 1);
+    assert.equal(protectedState(f.db), protectedBefore, "matched append must preserve lifecycle, certificate, owner and session rows");
+    const stored = f.db.prepare("SELECT tuple_digest,owner_id,session_binding_digest,credential_version,host_certificate_binding_digest,consented_at FROM supplemental_native_evidence").get() as Record<string, unknown>;
+    assert.equal(stored.tuple_digest, f.candidate.tupleDigest);
+    assert.equal(stored.owner_id, "a".repeat(32));
+    assert.equal(stored.session_binding_digest, expectedSessionId, "session binding must be copied directly from the live server binding");
+    assert.equal(stored.credential_version, 1);
+    assert.equal(stored.host_certificate_binding_digest, "e".repeat(64));
+    assert.equal(stored.consented_at, START);
+    assert.deepEqual(f.registry.releaseLease(f.guard, claimed.token), { ok: true, released: true });
+  } finally { foreignDb.close(); f.db.close(); }
+});
+
+test("matched append exact duplicate is idempotent and changed assertion conflicts atomically", async () => {
+  const f = await fixture();
+  try {
+    const prepared = f.registry.prepare(f.guard); assert.ok(prepared.ok);
+    const claimed = f.registry.claim(f.guard, { handle: prepared.handle, action: OWNER_NATIVE_EVIDENCE_ACTION, disposition: OWNER_NATIVE_EVIDENCE_DISPOSITION }); assert.ok(claimed.ok);
+    const coordinator = new OwnerNativeEvidenceMatchedAppendCoordinator(f.db, f.registry);
+    const assertion = { hostCertificateBindingDigest: "e".repeat(64), consentedAt: START };
+    let first: ReturnType<typeof coordinator.append> | undefined;
+    f.stores.withAuditTransaction(tx => { first = coordinator.append(f.guard, tx, claimed.token, assertion); });
+    let duplicate: ReturnType<typeof coordinator.append> | undefined;
+    f.stores.withAuditTransaction(tx => { duplicate = coordinator.append(f.guard, tx, claimed.token, assertion); });
+    assert.equal(first?.ok, true); assert.equal(duplicate?.ok, true);
+    if (duplicate?.ok) assert.equal(duplicate.append?.ok && duplicate.append.duplicate, true);
+    const evidenceCount = (f.db.prepare("SELECT count(*) AS n FROM supplemental_native_evidence").get() as { n: number }).n;
+    const auditCount = (f.db.prepare("SELECT count(*) AS n FROM audit_events").get() as { n: number }).n;
+    assert.equal(evidenceCount, 1);
+    assert.throws(() => f.stores.withAuditTransaction(tx => coordinator.append(f.guard, tx, claimed.token,
+      { ...assertion, consentedAt: "2026-09-27T10:00:01.000Z" })), { message: "ERR_NATIVE_EVIDENCE_MATCHED_APPEND_ABORT" });
+    assert.equal((f.db.prepare("SELECT count(*) AS n FROM supplemental_native_evidence").get() as { n: number }).n, evidenceCount);
+    assert.equal((f.db.prepare("SELECT count(*) AS n FROM audit_events").get() as { n: number }).n, auditCount);
+    assert.deepEqual(f.registry.releaseLease(f.guard, claimed.token), { ok: true, released: true });
+  } finally { f.db.close(); }
+});
+
+test("matched append mismatch and hostile consent descriptors do not append or invoke getters", async () => {
+  const f = await fixture();
+  try {
+    const auditBefore = (f.db.prepare("SELECT count(*) AS n FROM audit_events").get() as { n: number }).n;
+    const prepared = f.registry.prepare(f.guard); assert.ok(prepared.ok);
+    const claimed = f.registry.claim(f.guard, { handle: prepared.handle, action: OWNER_NATIVE_EVIDENCE_ACTION, disposition: OWNER_NATIVE_EVIDENCE_DISPOSITION }); assert.ok(claimed.ok);
+    const coordinator = new OwnerNativeEvidenceMatchedAppendCoordinator(f.db, f.registry);
+    let getterCalls = 0;
+    const accessor = Object.defineProperties({}, { hostCertificateBindingDigest: { get() { getterCalls++; return "e".repeat(64); }, enumerable: true }, consentedAt: { value: START, enumerable: true } });
+    let bad: ReturnType<typeof coordinator.append> | undefined;
+    f.stores.withAuditTransaction(tx => { bad = coordinator.append(f.guard, tx, claimed.token, accessor); });
+    assert.deepEqual(bad, { ok: true, match: false, append: null });
+    assert.equal(getterCalls, 0);
+    let proxyTraps = 0;
+    let proxied: ReturnType<typeof coordinator.append> | undefined;
+    f.stores.withAuditTransaction(tx => { proxied = coordinator.append(f.guard, tx, claimed.token, new Proxy({}, { ownKeys() { proxyTraps++; return []; } })); });
+    assert.deepEqual(proxied, { ok: true, match: false, append: null });
+    assert.equal(proxyTraps, 0);
+    f.db.prepare("UPDATE agent_commands SET request_digest=? WHERE job_id=?").run("0".repeat(64), "job-1");
+    let mismatch: ReturnType<typeof coordinator.append> | undefined;
+    f.stores.withAuditTransaction(tx => { mismatch = coordinator.append(f.guard, tx, claimed.token, { hostCertificateBindingDigest: "e".repeat(64), consentedAt: START }); });
+    assert.deepEqual(mismatch, { ok: true, match: false, append: null });
+    assert.equal((f.db.prepare("SELECT count(*) AS n FROM supplemental_native_evidence").get() as { n: number }).n, 0);
+    assert.equal((f.db.prepare("SELECT count(*) AS n FROM audit_events").get() as { n: number }).n, auditBefore);
+    assert.deepEqual(f.registry.releaseLease(f.guard, claimed.token), { ok: true, released: true });
+  } finally { f.db.close(); }
+});
+
+test("real post-callback registry recheck failure forces fixed abort and rolls back evidence", async () => {
+  const f = await fixture();
+  try {
+    const auditBefore = (f.db.prepare("SELECT count(*) AS n FROM audit_events").get() as { n: number }).n;
+    const prepared = f.registry.prepare(f.guard); assert.ok(prepared.ok);
+    const claimed = f.registry.claim(f.guard, { handle: prepared.handle, action: OWNER_NATIVE_EVIDENCE_ACTION, disposition: OWNER_NATIVE_EVIDENCE_DISPOSITION }); assert.ok(claimed.ok);
+    const coordinator = new OwnerNativeEvidenceMatchedAppendCoordinator(f.db, f.registry);
+    let invalidated = false;
+    f.setRegistryClockHook(() => {
+      const rows = (f.db.prepare("SELECT count(*) AS n FROM supplemental_native_evidence").get() as { n: number }).n;
+      if (rows === 1 && !invalidated) {
+        invalidated = true;
+        f.db.prepare("UPDATE owners SET credential_version=credential_version+1").run();
+      }
+    });
+    assert.throws(() => f.stores.withAuditTransaction(tx => coordinator.append(f.guard, tx, claimed.token,
+      { hostCertificateBindingDigest: "e".repeat(64), consentedAt: START })), { message: "ERR_NATIVE_EVIDENCE_MATCHED_APPEND_ABORT" });
+    assert.equal(invalidated, true, "clock hook must run after the callback's evidence INSERT");
+    assert.equal((f.db.prepare("SELECT count(*) AS n FROM supplemental_native_evidence").get() as { n: number }).n, 0);
+    assert.equal((f.db.prepare("SELECT count(*) AS n FROM audit_events").get() as { n: number }).n, auditBefore);
+    assert.equal((f.db.prepare("SELECT credential_version FROM owners").get() as { credential_version: number }).credential_version, 1);
+    f.setRegistryClockHook(() => undefined);
+    assert.deepEqual(f.registry.releaseLease(f.guard, claimed.token), { ok: true, released: true });
+  } finally { f.db.close(); }
+});
+
+test("audit insertion and deferred COMMIT failures roll back evidence without settling the lease", async () => {
+  for (const failure of ["audit", "commit"] as const) {
+    const f = await fixture();
+    try {
+      const prepared = f.registry.prepare(f.guard); assert.ok(prepared.ok);
+      const claimed = f.registry.claim(f.guard, { handle: prepared.handle, action: OWNER_NATIVE_EVIDENCE_ACTION, disposition: OWNER_NATIVE_EVIDENCE_DISPOSITION }); assert.ok(claimed.ok);
+      const coordinator = new OwnerNativeEvidenceMatchedAppendCoordinator(f.db, f.registry);
+      const auditBefore = (f.db.prepare("SELECT count(*) AS n FROM audit_events").get() as { n: number }).n;
+      if (failure === "audit") f.db.exec("CREATE TRIGGER reject_matched_append_audit BEFORE INSERT ON audit_events BEGIN SELECT RAISE(ABORT,'synthetic audit failure'); END");
+      assert.throws(() => f.stores.withAuditTransaction(tx => {
+        coordinator.append(f.guard, tx, claimed.token, { hostCertificateBindingDigest: "e".repeat(64), consentedAt: START });
+        if (failure === "commit") f.db.prepare("DELETE FROM evidence_commit_guard WHERE guard_id=1").run();
+      }));
+      if (f.db.isTransaction) f.db.exec("ROLLBACK");
+      assert.equal((f.db.prepare("SELECT count(*) AS n FROM supplemental_native_evidence").get() as { n: number }).n, 0, failure);
+      assert.equal((f.db.prepare("SELECT count(*) AS n FROM audit_events").get() as { n: number }).n, auditBefore, failure);
+      assert.deepEqual(f.registry.releaseLease(f.guard, claimed.token), { ok: true, released: true }, failure);
+    } finally { f.db.close(); }
   }
 });
