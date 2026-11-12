@@ -1,8 +1,8 @@
-import { createHash } from "node:crypto";
+import { createHash, X509Certificate } from "node:crypto";
 import { types } from "node:util";
 import type { DatabaseSync } from "node:sqlite";
 import {
-  canonicalCertificateSerial, commandAuthorizationDigest, parseCertificateAuthorityMetadata,
+  canonicalCertificateSerial, sameCertificateSerial, commandAuthorizationDigest, parseCertificateAuthorityMetadata,
   parseCommandRequest, parseCommandResponse, parseHostCertificateMetadata, parseJobSnapshot,
   parseStreamWireJSON, parseUtcTimestamp, responseMatches,
 } from "@lan-model-manager/core";
@@ -64,8 +64,123 @@ export class OwnerNativeEvidenceSnapshotReader {
       catch { return "mismatch"; }
     });
   }
+
+  /**
+   * Read-only current DB-backed X.509 enrollment-trust facts. This does not
+   * establish consent, append authority, fresh mTLS, remote-host possession,
+   * historical proof, a native receipt, or an ACK.
+   */
+  readVerified(guard: GuardResult, tx: unknown, token: CandidateLeaseToken): VerifiedCurrentTrustResult {
+    if (!isActiveCoupledContext(tx, this.db)) return Object.freeze({ ok: false, error: "ERR_NATIVE_EVIDENCE_LEASE" });
+    let detached: VerifiedCurrentTrustSnapshot | null = null, authorityView: SnapshotComparisonView | null = null, sampledAt: string | null = null;
+    const lease = this.registry.withLeaseView(guard, tx, token, view => {
+      try {
+        const now = this.options.clock?.() ?? new Date().toISOString();
+        if (!canonicalTime(now) || !isActiveCoupledContext(tx, this.db) || compareCurrentSnapshot(this.db, tx, view, now) !== "match") return "mismatch";
+        detached = verifyCurrentTrust(this.db, view, now);
+        if (!detached) return "mismatch";
+        authorityView = view;
+        sampledAt = now;
+        return "match";
+      } catch { detached = null; authorityView = null; sampledAt = null; return "mismatch"; }
+    });
+    if (!lease.ok) return Object.freeze({ ok: false, error: "ERR_NATIVE_EVIDENCE_LEASE" });
+    if (!lease.match || !detached || !authorityView || !sampledAt) return Object.freeze({ ok: true, match: false });
+    // Registry postchecks invoke its own clock callback. That callback may
+    // synchronously reenter this DB and rotate/revoke trust rows after the
+    // callback's first verification. Re-read and re-verify only after those
+    // postchecks, with no injected callback between this check and exposure.
+    try {
+      if (!isActiveCoupledContext(tx, this.db) || compareCurrentSnapshot(this.db, tx, authorityView, sampledAt) !== "match") return Object.freeze({ ok: true, match: false });
+      const finalSnapshot = verifyCurrentTrust(this.db, authorityView, sampledAt);
+      if (!finalSnapshot || JSON.stringify(finalSnapshot) !== JSON.stringify(detached)) return Object.freeze({ ok: true, match: false });
+      return Object.freeze({ ok: true, match: true, snapshot: finalSnapshot });
+    } catch { return Object.freeze({ ok: true, match: false }); }
+  }
 }
 
+
+export type VerifiedCurrentTrustSnapshot = Readonly<{
+  verdict: "verified_current_trust";
+  verifiedAt: string;
+  hostId: string;
+  jobId: string;
+  requestId: string;
+  terminalRevision: string;
+  hostCertificateId: string;
+  hostCertificateVersion: number;
+  certificateAuthorityId: string;
+  certificateAuthorityVersion: number;
+  hostCertificateBindingDigest: string;
+}>;
+export type VerifiedCurrentTrustResult =
+  | Readonly<{ ok: false; error: "ERR_NATIVE_EVIDENCE_LEASE" }>
+  | Readonly<{ ok: true; match: false }>
+  | Readonly<{ ok: true; match: true; snapshot: VerifiedCurrentTrustSnapshot }>;
+
+const MAX_CERTIFICATE_PEM_BYTES = 16_384;
+const TRUST_DIGEST_DOMAIN = "lanmm-owner-current-trust-snapshot-v1\0";
+function parsedTime(cert: X509Certificate, which: "validFrom" | "validTo"): string {
+  const ms = Date.parse(cert[which]);
+  if (!Number.isFinite(ms)) throw new Error("ERR_TRUST_CERT_TIME");
+  return new Date(ms).toISOString();
+}
+function boundedPem(value: unknown): value is string {
+  return typeof value === "string" && Buffer.byteLength(value, "utf8") <= MAX_CERTIFICATE_PEM_BYTES;
+}
+function verifyCurrentTrust(db: DatabaseSync, view: SnapshotComparisonView, now: string): VerifiedCurrentTrustSnapshot | null {
+  const hostId = view.tuple.hostId;
+  if (typeof hostId !== "string" || !/^[A-Za-z0-9][A-Za-z0-9._:-]{0,127}$/.test(hostId)) return null;
+  const hostRows = all(db, "SELECT cert_id,serial,fingerprint,candidate_id,binding_address,binding_port,protocol_major,protocol_minor,spiffe_uri,certificate,not_before,not_after,ca_id,ca_version,challenge_id,transcript_digest,status,version,issued_at,revoked_at FROM host_certificates WHERE candidate_id=? AND status='active' AND revoked_at IS NULL LIMIT 2", hostId);
+  if (hostRows.length !== 1) return null;
+  const row = hostRows[0]!;
+  if (!boundedPem(row.certificate)) return null;
+  const parsedHost = parseHostCertificateMetadata({ certificateId: row.cert_id, serial: row.serial, fingerprint: row.fingerprint, certificatePem: row.certificate,
+    caId: row.ca_id, caVersion: Number(row.ca_version), binding: { candidateId: row.candidate_id, address: row.binding_address, port: Number(row.binding_port), protocolMajor: Number(row.protocol_major), protocolMinor: Number(row.protocol_minor) },
+    spiffeUri: row.spiffe_uri, challengeId: row.challenge_id, transcriptDigest: row.transcript_digest, notBefore: row.not_before, notAfter: row.not_after,
+    status: row.status, version: Number(row.version), issuedAt: row.issued_at, revokedAt: row.revoked_at });
+  if (!parsedHost.ok || parsedHost.value.binding.candidateId !== hostId) return null;
+  const host = parsedHost.value, assertion = view.certificateBindingAssertion;
+  if (host.certificateId !== assertion.certificateId || !sameCertificateSerial(host.serial, assertion.serial) ||
+      host.fingerprint !== assertion.fingerprint || host.version !== assertion.version || host.binding.address !== assertion.address ||
+      host.binding.port !== assertion.port || host.binding.protocolMajor !== assertion.protocolMajor || host.binding.protocolMinor !== assertion.protocolMinor ||
+      host.notBefore !== assertion.notBefore || host.notAfter !== assertion.notAfter || host.caId !== assertion.caId ||
+      host.caVersion !== assertion.caVersion || host.spiffeUri !== assertion.spiffeUri) return null;
+  const caRows = all(db, "SELECT ca_id,ca_version,serial,fingerprint,subject,certificate,not_before,not_after,created_at FROM certificate_authorities WHERE ca_id=? LIMIT 2", host.caId);
+  if (caRows.length !== 1 || !boundedPem(caRows[0]!.certificate)) return null;
+  const caRow = caRows[0]!;
+  const parsedCa = parseCertificateAuthorityMetadata({ caId: caRow.ca_id, version: Number(caRow.ca_version), serial: caRow.serial,
+    fingerprint: caRow.fingerprint, certificatePem: caRow.certificate, notBefore: caRow.not_before, notAfter: caRow.not_after, createdAt: caRow.created_at });
+  if (!parsedCa.ok || parsedCa.value.version !== host.caVersion || typeof caRow.subject !== "string" || caRow.subject.length > 1024) return null;
+
+  const leaf = new X509Certificate(host.certificatePem), ca = new X509Certificate(parsedCa.value.certificatePem);
+  const nowMs = Date.parse(now), leafFrom = parsedTime(leaf, "validFrom"), leafTo = parsedTime(leaf, "validTo"), caFrom = parsedTime(ca, "validFrom"), caTo = parsedTime(ca, "validTo");
+  const leafFingerprint = createHash("sha256").update(leaf.raw).digest("hex"), caFingerprint = createHash("sha256").update(ca.raw).digest("hex");
+  const leafSerial = canonicalCertificateSerial(leaf.serialNumber.toUpperCase()), caSerial = canonicalCertificateSerial(ca.serialNumber.toUpperCase());
+  const san = leaf.subjectAltName ?? "", expectedUri = `spiffe://lanmodelmanager/host/${host.binding.candidateId}`;
+  const usage = leaf.keyUsage ?? [];
+  if (!ca.ca || ca.issuer !== ca.subject || ca.subject !== caRow.subject || !ca.verify(ca.publicKey) || leaf.ca || !leaf.verify(ca.publicKey) || leaf.issuer !== ca.subject ||
+      caFingerprint !== parsedCa.value.fingerprint || caFingerprint !== parsedCa.value.caId || caSerial === null || !sameCertificateSerial(caSerial, parsedCa.value.serial) ||
+      caFrom !== parsedCa.value.notBefore || caTo !== parsedCa.value.notAfter || nowMs < Date.parse(caFrom) || nowMs >= Date.parse(caTo) ||
+      leafFingerprint !== host.fingerprint || leafFingerprint !== host.certificateId || leafSerial === null || !sameCertificateSerial(leafSerial, host.serial) ||
+      leafFrom !== host.notBefore || leafTo !== host.notAfter || nowMs < Date.parse(leafFrom) || nowMs >= Date.parse(leafTo) ||
+      leaf.subject !== `CN=${host.binding.candidateId}` || san !== `IP Address:${host.binding.address}, URI:${expectedUri}` || host.spiffeUri !== expectedUri ||
+      !usage.includes("1.3.6.1.5.5.7.3.1") || !usage.includes("1.3.6.1.5.5.7.3.2")) return null;
+
+  const projection = {
+    host: { id: host.certificateId, version: host.version, status: host.status, serial: canonicalCertificateSerial(host.serial), fingerprint: host.fingerprint,
+      candidateId: host.binding.candidateId, address: host.binding.address, port: host.binding.port, protocolMajor: host.binding.protocolMajor,
+      protocolMinor: host.binding.protocolMinor, spiffeUri: host.spiffeUri, notBefore: host.notBefore, notAfter: host.notAfter },
+    ca: { id: parsedCa.value.caId, version: parsedCa.value.version, serial: canonicalCertificateSerial(parsedCa.value.serial), fingerprint: parsedCa.value.fingerprint,
+      notBefore: parsedCa.value.notBefore, notAfter: parsedCa.value.notAfter },
+    crypto: { leafSubject: leaf.subject, leafIssuer: leaf.issuer, leafSubjectAltName: san, leafKeyUsage: [...usage].sort(), leafIsCa: leaf.ca,
+      caSubject: ca.subject, caIsCa: ca.ca, caSelfSignatureVerified: true, leafSignatureVerified: true },
+  };
+  const hostCertificateBindingDigest = createHash("sha256").update(TRUST_DIGEST_DOMAIN, "utf8").update(JSON.stringify(projection), "utf8").digest("hex");
+  return Object.freeze({ verdict: "verified_current_trust", verifiedAt: now, hostId: view.tuple.hostId, jobId: view.tuple.jobId,
+    requestId: view.tuple.requestId, terminalRevision: view.tuple.terminalRevision, hostCertificateId: host.certificateId, hostCertificateVersion: host.version,
+    certificateAuthorityId: parsedCa.value.caId, certificateAuthorityVersion: parsedCa.value.version, hostCertificateBindingDigest });
+}
 
 type SnapshotComparisonView = Readonly<{
   tuple: import("./owner-native-evidence-candidates.js").NativeEvidenceCandidateTuple;
