@@ -4,10 +4,11 @@ import { mkdtempSync,rmSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import test from "node:test";
-import { DatabaseSync } from "node:sqlite";
+import { constants as sqliteConstants,DatabaseSync } from "node:sqlite";
 import { clearSessionCookie,parseSessionCookieHeader,serializeSessionCookie } from "./cookie-parser.js";
 import { CONTROLLER_MIGRATIONS,migrateControllerDatabase,openControllerDatabase } from "./database.js";
 import { guardManagementRequest } from "./guard.js";
+import { createJobStores } from "./jobs-store.js";
 import { createAllowedOrigins,originAllowed } from "./origin.js";
 import { createOwnerBootstrapService } from "./owner-service.js";
 import { SessionManager } from "./session-manager.js";
@@ -48,5 +49,45 @@ test("private lifecycle session binding is unique, unforgeable from metadata, re
   assert.equal(JSON.stringify(one.metadata).includes(a.id),false);
   assert.ok(manager.revoke(one.sessionToken));assert.equal(manager.binding(one.metadata),null);
   setNow(two.metadata.idleExpiresAt);assert.equal(manager.binding(two.metadata),null);
+ }finally{db.close();}
+});
+
+
+test("transaction-bound session binding accepts only the live same-connection callback capability",async()=>{
+ const {db,owners,manager}=await setup(),otherDb=openControllerDatabase(":memory:");try{
+  const session=await manager.create({username:"admin",password:"owner-password-123"});assert.ok(session);
+  const stores=createJobStores(db),otherStores=createJobStores(otherDb),before=JSON.stringify({owners:db.prepare("SELECT * FROM owners ORDER BY owner_id").all(),sessions:db.prepare("SELECT * FROM sessions ORDER BY session_digest").all()});
+  let captured:unknown,blockedReads=0;
+  stores.withAuditTransaction(tx=>{
+   captured=tx;
+   db.setAuthorizer((action,arg1)=>{if(action===sqliteConstants.SQLITE_READ&&(arg1==="sessions"||arg1==="owners")){blockedReads++;return sqliteConstants.SQLITE_DENY;}return sqliteConstants.SQLITE_OK;});
+   try{
+    const forged=Object.freeze({jobs:tx.jobs,audit:tx.audit});
+    for(const invalid of [{...tx},forged,new Proxy(tx,{}),null])assert.equal(manager.bindingInTransaction(invalid,session.metadata),null);
+    otherStores.withAuditTransaction(foreignTx=>assert.equal(manager.bindingInTransaction(foreignTx,session.metadata),null));
+    assert.equal(blockedReads,0,"invalid transaction contexts must be rejected before session or owner reads");
+   }finally{db.setAuthorizer(null);}
+   const binding=manager.bindingInTransaction(tx,session.metadata);assert.ok(binding);assert.equal(Object.isFrozen(binding),true);assert.deepEqual(Object.keys(binding).sort(),["credentialVersion","expiresAt","id"]);assert.equal(JSON.stringify(binding).includes(session.sessionToken),false);assert.equal(JSON.stringify(binding).includes(session.csrfToken),false);
+   assert.equal(manager.bindingInTransaction(tx,{...session.metadata}),null);
+   const otherManager=new SessionManager(db,owners,{clock:()=>START});assert.equal(otherManager.bindingInTransaction(tx,session.metadata),null);
+  });
+  db.setAuthorizer((action,arg1)=>{if(action===sqliteConstants.SQLITE_READ&&(arg1==="sessions"||arg1==="owners")){blockedReads++;return sqliteConstants.SQLITE_DENY;}return sqliteConstants.SQLITE_OK;});
+  try{assert.equal(manager.bindingInTransaction(captured,session.metadata),null);assert.equal(blockedReads,0,"expired callback context must be rejected before session reads");}finally{db.setAuthorizer(null);}
+  assert.equal(JSON.stringify({owners:db.prepare("SELECT * FROM owners ORDER BY owner_id").all(),sessions:db.prepare("SELECT * FROM sessions ORDER BY session_digest").all()}),before,"binding revalidation is read-only");
+ }finally{db.close();otherDb.close();}
+});
+
+test("transaction-bound session binding rechecks revocation, owner state, versions, and both expiries",async()=>{
+ const {db,owners,manager,setNow}=await setup();try{
+  const session=await manager.create({username:"admin",password:"owner-password-123"});assert.ok(session);const stores=createJobStores(db);
+  const binding=()=>{const result:Array<ReturnType<SessionManager["bindingInTransaction"]>>=[];stores.withAuditTransaction(tx=>result.push(manager.bindingInTransaction(tx,session.metadata)));return result[0]??null;};
+  assert.ok(binding());
+  const ownerId=owners.getOwner()!.ownerId;
+  db.prepare("UPDATE owners SET credential_version=credential_version+1 WHERE owner_id=?").run(ownerId);assert.equal(binding(),null);db.prepare("UPDATE owners SET credential_version=credential_version-1 WHERE owner_id=?").run(ownerId);
+  db.prepare("UPDATE owners SET disabled=1 WHERE owner_id=?").run(ownerId);assert.equal(binding(),null);db.prepare("UPDATE owners SET disabled=0 WHERE owner_id=?").run(ownerId);
+  db.prepare("UPDATE sessions SET session_version=session_version+1").run();assert.equal(binding(),null);db.prepare("UPDATE sessions SET session_version=session_version-1").run();
+  db.prepare("UPDATE sessions SET revoked_at=?").run("2026-09-27T10:01:00.000Z");assert.equal(binding(),null);db.prepare("UPDATE sessions SET revoked_at=NULL").run();
+  setNow(session.metadata.idleExpiresAt);assert.equal(binding(),null);setNow(START);
+  db.prepare("UPDATE sessions SET idle_expires_at=?").run("2026-09-27T12:00:00.000Z");setNow(session.metadata.absoluteExpiresAt);assert.equal(binding(),null);
  }finally{db.close();}
 });
