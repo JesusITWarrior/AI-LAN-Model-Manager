@@ -5,7 +5,7 @@ import { join } from "node:path";
 import test from "node:test";
 import { DatabaseSync } from "node:sqlite";
 import { CONTROLLER_MIGRATIONS, migrateControllerDatabase, openControllerDatabase } from "./database.js";
-import { JobStoreError, JobStores, createJobStores } from "./jobs-store.js";
+import { isActiveCoupledContext, JobStoreError, JobStores, createJobStores } from "./jobs-store.js";
 
 const t0 = "2026-09-27T05:00:00.000Z";
 const t1 = "2026-09-27T06:00:00.000Z";
@@ -366,6 +366,106 @@ test("coupled transaction commits both on success", () => {
     assert.equal(stores.audit.count(), 1);
     assert.equal(stores.audit.lastSequence(), 1);
   } finally {
+    db.close();
+  }
+});
+
+test("coupled transaction contexts are exact, frozen, connection-bound callback capabilities", () => {
+  const { stores, db } = memoryStores();
+  const otherDb = openControllerDatabase(":memory:");
+  migrateControllerDatabase(otherDb, CONTROLLER_MIGRATIONS);
+  try {
+    const sameConnectionStores = createJobStores(db);
+    let captured: unknown;
+    stores.withAuditTransaction((tx) => {
+      captured = tx;
+      assert.equal(Object.isFrozen(tx), true);
+      assert.equal(Reflect.set(tx, "jobs", sameConnectionStores.jobs), false);
+      assert.equal(Reflect.set(tx, "audit", sameConnectionStores.audit), false);
+      assert.equal(isActiveCoupledContext(tx, db), true);
+      assert.equal(isActiveCoupledContext(tx, otherDb), false);
+      assert.equal(isActiveCoupledContext(tx, ({} as unknown) as DatabaseSync), false);
+      assert.equal(isActiveCoupledContext(Object.freeze({ jobs: tx.jobs, audit: tx.audit }), db), false);
+      assert.equal(isActiveCoupledContext({ ...tx }, db), false);
+      assert.equal(isActiveCoupledContext(new Proxy(tx, {}), db), false);
+      assert.equal(isActiveCoupledContext(null, db), false);
+      assert.equal(isActiveCoupledContext(Object.create(null), db), false);
+      // The exact context is bound to the connection, not to one factory instance.
+      assert.equal(isActiveCoupledContext(tx, db), true);
+    });
+    assert.equal(isActiveCoupledContext(captured, db), false);
+    sameConnectionStores.withAuditTransaction((tx) => assert.equal(isActiveCoupledContext(tx, db), true));
+    let next: unknown;
+    stores.withAuditTransaction((tx) => { next = tx; assert.equal(isActiveCoupledContext(tx, db), true); });
+    assert.notEqual(next, captured);
+    assert.equal(isActiveCoupledContext(next, db), false);
+  } finally {
+    db.close();
+    otherDb.close();
+  }
+});
+
+test("manual transactions are not issued contexts; caught nested transaction rejection preserves outer context", () => {
+  const { stores, db } = memoryStores();
+  try {
+    db.exec("BEGIN IMMEDIATE");
+    assert.equal(db.isTransaction, true);
+    assert.equal(isActiveCoupledContext({ jobs: stores.jobs, audit: stores.audit }, db), false);
+    assert.throws(() => stores.withAuditTransaction(() => {}), JobStoreError);
+    assert.equal(db.isTransaction, true);
+    db.exec("ROLLBACK");
+
+    stores.withAuditTransaction((tx) => {
+      assert.equal(isActiveCoupledContext(tx, db), true);
+      assert.throws(() => stores.withAuditTransaction(() => {}), JobStoreError);
+      assert.equal(isActiveCoupledContext(tx, db), true);
+      // A normal coupled operation still uses the original outer transaction.
+      tx.audit.append(audit({ action: "nested-guard", outcome: "observed" }));
+      assert.equal(isActiveCoupledContext(tx, db), true);
+    });
+    assert.equal(stores.audit.count(), 1);
+  } finally {
+    if (db.isTransaction) db.exec("ROLLBACK");
+    db.close();
+  }
+});
+
+test("captured coupled context is revoked when callback throws and a fresh callback can run", () => {
+  const { stores, db } = memoryStores();
+  try {
+    let captured: unknown;
+    assert.throws(() => stores.withAuditTransaction((tx) => {
+      captured = tx;
+      assert.equal(isActiveCoupledContext(tx, db), true);
+      throw new Error("callback failure");
+    }), /callback failure/);
+    assert.equal(db.isTransaction, false);
+    assert.equal(isActiveCoupledContext(captured, db), false);
+    stores.withAuditTransaction((tx) => assert.equal(isActiveCoupledContext(tx, db), true));
+  } finally { db.close(); }
+});
+
+test("deferred COMMIT failure revokes context while SQLite transaction remains, then fresh callback works after rollback", () => {
+  const { stores, db } = memoryStores();
+  try {
+    db.exec("CREATE TABLE tx_context_parent(id INTEGER PRIMARY KEY)");
+    db.exec("CREATE TABLE tx_context_child(parent_id INTEGER REFERENCES tx_context_parent(id) DEFERRABLE INITIALLY DEFERRED)");
+    let captured: unknown;
+    assert.throws(() => stores.withAuditTransaction((tx) => {
+      captured = tx;
+      assert.equal(isActiveCoupledContext(tx, db), true);
+      db.prepare("INSERT INTO tx_context_child(parent_id) VALUES(?)").run(99);
+    }));
+    // The existing API leaves failed-COMMIT cleanup to its owner; issuance is
+    // nevertheless revoked before this external cleanup, even while SQLite is active.
+    assert.equal(db.isTransaction, true);
+    assert.equal(isActiveCoupledContext(captured, db), false);
+    assert.throws(() => stores.withAuditTransaction(() => {}), JobStoreError);
+    assert.equal(db.isTransaction, true);
+    db.exec("ROLLBACK");
+    stores.withAuditTransaction((tx) => assert.equal(isActiveCoupledContext(tx, db), true));
+  } finally {
+    if (db.isTransaction) db.exec("ROLLBACK");
     db.close();
   }
 });

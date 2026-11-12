@@ -129,6 +129,25 @@ export interface CoupledContext {
   readonly audit: AuditRepository;
 }
 
+type CoupledContextIssue = { readonly db: DatabaseSync; active: boolean };
+const coupledContextIssues = new WeakMap<object, CoupledContextIssue>();
+
+/**
+ * True only while `context` is the exact frozen object issued to an active
+ * `withAuditTransaction` callback for this same connection. `db.isTransaction`
+ * is an additional live-state check, not proof that this API opened it.
+ */
+export function isActiveCoupledContext(context: unknown, db: DatabaseSync): context is CoupledContext {
+  if (typeof context !== "object" || context === null) return false;
+  const issue = coupledContextIssues.get(context);
+  if (!issue || issue.db !== db || !issue.active || !couplingState.get(db)) return false;
+  try {
+    return db.isTransaction;
+  } catch {
+    return false;
+  }
+}
+
 // ---------------------------------------------------------------------------
 // Low-level helpers (non-throwing on bad input; they throw RepositoryError)
 
@@ -821,18 +840,20 @@ export function createJobStores(db: DatabaseSync, options: { readonly now?: () =
   const audit = new AuditRepository(db, now);
   audit.verifyChain();
 
-  const context: CoupledContext = {
-    jobs,
-    audit,
-  };
-
   return {
     jobs,
     audit,
     withAuditTransaction(mutate: (tx: CoupledContext) => void): void {
+      // Check before touching connection-scoped state: a caught nested call must
+      // leave the outer transaction's coupling gate and context alive.
+      if (couplingState.get(db) || db.isTransaction) throw new JobStoreError("ERR_JOB_DATABASE");
+      const context: CoupledContext = Object.freeze({ jobs, audit });
+      const issue: CoupledContextIssue = { db, active: false };
       couplingState.set(db, true);
       try {
         db.exec("BEGIN IMMEDIATE");
+        issue.active = true;
+        coupledContextIssues.set(context, issue);
         try {
           mutate(context);
         } catch (e) {
@@ -845,6 +866,7 @@ export function createJobStores(db: DatabaseSync, options: { readonly now?: () =
         }
         db.exec("COMMIT");
       } finally {
+        issue.active = false;
         couplingState.set(db, false);
       }
     },
