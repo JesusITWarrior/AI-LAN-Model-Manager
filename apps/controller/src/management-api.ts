@@ -11,17 +11,22 @@ import { parseSessionCookieHeader } from "./cookie-parser.js";
 import type { OriginPolicyOptions } from "./origin.js";
 import { OperatorError, type ControllerOperatorService } from "./operator-service.js";
 import { parseJsonWithoutDuplicateKeys } from "./enrollment-api.js";
+import { parseStreamWireJSON } from "@lan-model-manager/core";
+import { types } from "node:util";
+import type { OwnerNativeEvidenceIntakeService } from "./owner-native-evidence-intake.js";
 
 export const MANAGEMENT_BODY_LIMIT = 65_536;
-export interface ManagementHttpRequest { readonly method: string; readonly url: string; readonly headers: unknown; readonly body?: string | null }
+export const OWNER_EVIDENCE_PREPARE_BODY_LIMIT = 786_432;
+const OWNER_EVIDENCE_PREPARE_PATH = "/api/v1/native-evidence/prepare";
+export interface ManagementHttpRequest { readonly method: string; readonly url: string; readonly headers: unknown; readonly body?: string | null; readonly rawBodyBytes?: Uint8Array }
 export interface ManagementHttpResponse { readonly status: number; readonly headers: Readonly<Record<string,string>>; readonly body: Readonly<Record<string,unknown>> }
-export interface ManagementApiDependencies { readonly sessions: SessionManager; readonly allowedOrigins: readonly string[]; readonly fleet: FleetQueryService; readonly jobs: JobStores; readonly policy: PolicyService; readonly inference: InferenceTokenManager; readonly operator?: ControllerOperatorService; readonly lifecycle?: ManagementLifecycleService; readonly proposals?:OwnerLifecycleProposals; readonly originOptions?: OriginPolicyOptions }
+export interface ManagementApiDependencies { readonly sessions: SessionManager; readonly allowedOrigins: readonly string[]; readonly fleet: FleetQueryService; readonly jobs: JobStores; readonly policy: PolicyService; readonly inference: InferenceTokenManager; readonly operator?: ControllerOperatorService; readonly lifecycle?: ManagementLifecycleService; readonly proposals?:OwnerLifecycleProposals; readonly originOptions?: OriginPolicyOptions; readonly ownerEvidenceIntake?: OwnerNativeEvidenceIntakeService }
 
 type Headers = Readonly<Record<string,string>>;
 const ID=/^[A-Za-z0-9][A-Za-z0-9._:-]{0,127}$/;
 const STATES=new Set(["submitted","validated","authorized","dispatched","accepted","running","succeeded","failed","timed-out","cancelled"]);
 const RESPONSE_HEADERS=Object.freeze(Object.assign(Object.create(null),{"content-type":"application/json; charset=utf-8","cache-control":"no-store"})) as Headers;
-function ownRecord(value:unknown):Record<string,PropertyDescriptor>|null{try{if(typeof value!=="object"||value===null||Array.isArray(value))return null;const p=Object.getPrototypeOf(value);if(p!==Object.prototype&&p!==null)return null;const d=Object.getOwnPropertyDescriptors(value);if(Reflect.ownKeys(value).some(k=>{if(typeof k!=="string")return true;const descriptor=d[k];return !descriptor||!("value" in descriptor);} ))return null;return d;}catch{return null;}}
+function ownRecord(value:unknown):Record<string,PropertyDescriptor>|null{try{if(typeof value!=="object"||value===null||types.isProxy(value)||Array.isArray(value))return null;const p=Object.getPrototypeOf(value);if(p!==Object.prototype&&p!==null)return null;const d=Object.getOwnPropertyDescriptors(value);if(Reflect.ownKeys(value).some(k=>{if(typeof k!=="string")return true;const descriptor=d[k];return !descriptor||!("value" in descriptor);} ))return null;return d;}catch{return null;}}
 function headers(value:unknown):Headers|null{const d=ownRecord(value);if(!d)return null;const out=Object.create(null) as Record<string,string>;for(const [raw,v] of Object.entries(d)){if(!/^[!#$%&'*+.^_`|~0-9A-Za-z-]+$/.test(raw)||typeof v.value!=="string"||/[\u0000-\u001f\u007f]/u.test(v.value))return null;const key=raw.toLowerCase();if(key in out)return null;out[key]=v.value;}return Object.freeze(out);}
 function deep(value:unknown,seen=new Set<object>()):unknown{if(value===null||typeof value==="string"||typeof value==="boolean"||typeof value==="number")return value;if(typeof value!=="object")return null;if(seen.has(value))return null;seen.add(value);if(Array.isArray(value))return Object.freeze(value.map(v=>deep(v,seen)));const out=Object.create(null) as Record<string,unknown>;for(const key of Object.keys(value as object).sort()){if(key!=="tokenId"&&/(?:token|cookie|authorization|certificatePem|digest|snapshot|endpoint|private)/i.test(key))continue;let item:unknown;try{item=(value as Record<string,unknown>)[key];}catch{continue;}out[key]=deep(item,seen);}return Object.freeze(out);}
 function response(status:number,ok:boolean,value?:unknown,code?:string):ManagementHttpResponse{const payload=ok?{ok:true,value:deep(value)}:{ok:false,error:Object.freeze(Object.assign(Object.create(null),{code:code??"INTERNAL_ERROR",message:message(code)}))};return Object.freeze({status,headers:RESPONSE_HEADERS,body:Object.freeze(Object.assign(Object.create(null),payload))});}
@@ -38,10 +43,56 @@ function publicToken(row:any){return{tokenId:row.tokenId,label:row.label,scopes:
 function issuedToken(value:any):ManagementHttpResponse{if(!value||typeof value.token!=="string"||! /^[A-Za-z0-9_-]{43}$/.test(value.token)||!value.metadata)return response(500,false,undefined,"INTERNAL_ERROR");return Object.freeze({status:200,headers:RESPONSE_HEADERS,body:Object.freeze(Object.assign(Object.create(null),{ok:true,value:Object.freeze(Object.assign(Object.create(null),{token:value.token,metadata:deep(publicToken(value.metadata))}))}))});}
 function operatorFailure(error:unknown):ManagementHttpResponse{if(!(error instanceof OperatorError))return response(500,false,undefined,"INTERNAL_ERROR");if(error.code==="ERR_OPERATOR_INPUT")return response(400,false,undefined,"INVALID_REQUEST");if(error.code==="ERR_OPERATOR_NOT_FOUND")return response(404,false,undefined,"NOT_FOUND");if(error.code==="ERR_OPERATOR_CONFLICT")return response(409,false,undefined,"CONFLICT");if(error.code==="ERR_OPERATOR_UNAVAILABLE")return response(503,false,undefined,"UNAVAILABLE");return response(500,false,undefined,"INTERNAL_ERROR");}
 async function operatorCall(action:()=>unknown|Promise<unknown>):Promise<ManagementHttpResponse>{try{return response(200,true,await action());}catch(error){return operatorFailure(error);}}
+function evidencePreview(value:unknown):Record<string,unknown>|null {
+ const keys=["candidateHandle","expectedTupleDigest","jobId","hostId","requestId","terminalState","terminalRevision","evidenceKind","payloadBytes","responseBytes","expiresAt","action","disposition","label"] as const;
+ const d=ownRecord(value);if(!d||Reflect.ownKeys(value as object).length!==keys.length||keys.some(k=>!d[k]||!("value" in d[k]!)))return null;
+ const out=Object.create(null) as Record<string,unknown>;
+ for(const key of keys){const v=d[key]!.value;if(key==="payloadBytes"||key==="responseBytes"){if(typeof v!=="number")return null;}else if(typeof v!=="string")return null;out[key]=v;}
+ if(!/^[A-Za-z0-9._:-]{1,128}$/.test(String(out.candidateHandle))||! /^[a-f0-9]{64}$/.test(String(out.expectedTupleDigest))||![out.jobId,out.hostId,out.requestId].every(v=>typeof v==="string"&&ID.test(v))||
+    !["succeeded","failed","cancelled"].includes(String(out.terminalState))||! /^[A-Za-z0-9._:-]{1,128}$/.test(String(out.terminalRevision))||
+    !["succeeded","failed","cancelled"].includes(String(out.evidenceKind))||!Number.isSafeInteger(out.payloadBytes)||Number(out.payloadBytes)<1||Number(out.payloadBytes)>OWNER_EVIDENCE_PREPARE_BODY_LIMIT||
+    !Number.isSafeInteger(out.responseBytes)||Number(out.responseBytes)<1||Number(out.responseBytes)>512*1024||typeof out.expiresAt!=="string"||!Number.isFinite(Date.parse(out.expiresAt))||
+    out.label!=="Owner-provided unsigned evidence; source not independently proven"||out.action!=="append-supplemental-native-evidence"||out.disposition!=="evidence-only")return null;
+ return out;
+}
+function ownerEvidenceResult(value:unknown):ManagementHttpResponse {
+ try { const d=ownRecord(value);if(!d||Reflect.ownKeys(value as object).length!==2||d.ok?.value!==true)return response(400,false,undefined,"INVALID_REQUEST");const preview=evidencePreview(d.preview?.value);if(!preview)return response(400,false,undefined,"INVALID_REQUEST");return Object.freeze({status:200,headers:RESPONSE_HEADERS,body:Object.freeze(Object.assign(Object.create(null),{ok:true,value:Object.freeze(preview)}))}); }
+ catch{return response(400,false,undefined,"INVALID_REQUEST");}
+}
+function exactFields(value:unknown,keys:readonly string[]):Record<string,PropertyDescriptor>|null{const d=ownRecord(value);if(!d||Reflect.ownKeys(value as object).length!==keys.length||keys.some(k=>!d[k]||!("value" in d[k]!)))return null;return d;}
 
 /** Pure, dependency-injected management router. It never starts a listener. */
 export async function routeManagementRequest(deps:ManagementApiDependencies,input:unknown):Promise<ManagementHttpResponse>{
- const d=ownRecord(input);if(!d)return response(400,false,undefined,"INVALID_REQUEST");const allowed=["method","url","headers","body"];if(Reflect.ownKeys(input as object).some(k=>typeof k!=="string"||!allowed.includes(k as string))||!d.method||!d.url||!d.headers)return response(400,false,undefined,"INVALID_REQUEST");const method=d.method.value,urlText=d.url.value;if(typeof method!=="string"||!/^[A-Z]+$/.test(method)||typeof urlText!=="string")return response(400,false,undefined,"INVALID_REQUEST");const h=headers(d.headers.value);if(!h)return response(400,false,undefined,"INVALID_REQUEST");let url:URL;try{url=new URL(urlText,"http://127.0.0.1");}catch{return response(400,false,undefined,"INVALID_REQUEST");}if(url.origin!=="http://127.0.0.1"||!url.pathname.startsWith("/api/v1/"))return response(404,false,undefined,"NOT_FOUND");
+ const d=ownRecord(input);if(!d)return response(400,false,undefined,"INVALID_REQUEST");const allowed=["method","url","headers","body","rawBodyBytes"];if(Reflect.ownKeys(input as object).some(k=>typeof k!=="string"||!allowed.includes(k as string))||!d.method||!d.url||!d.headers)return response(400,false,undefined,"INVALID_REQUEST");const method=d.method.value,urlText=d.url.value;if(typeof method!=="string"||!/^[A-Z]+$/.test(method)||typeof urlText!=="string")return response(400,false,undefined,"INVALID_REQUEST");const exactPrepare=method==="POST"&&urlText===OWNER_EVIDENCE_PREPARE_PATH;
+ const bodyLimit=exactPrepare?OWNER_EVIDENCE_PREPARE_BODY_LIMIT:MANAGEMENT_BODY_LIMIT;if(typeof d.body?.value==="string"&&Buffer.byteLength(d.body.value)>bodyLimit)return response(413,false,undefined,"PAYLOAD_TOO_LARGE");
+ if(d.rawBodyBytes&&!exactPrepare){const raw=d.rawBodyBytes.value;if(types.isUint8Array(raw)&&!types.isProxy(raw)){const length=Object.getOwnPropertyDescriptor(Object.getPrototypeOf(Uint8Array.prototype),"byteLength")!.get!.call(raw) as number;if(length>MANAGEMENT_BODY_LIMIT)return response(413,false,undefined,"PAYLOAD_TOO_LARGE");}return response(400,false,undefined,"INVALID_REQUEST");}
+ const h=headers(d.headers.value);if(!h)return response(400,false,undefined,"INVALID_REQUEST");
+ if(exactPrepare){
+  if(d.body?.value!==undefined&&d.body.value!==null)return response(400,false,undefined,"INVALID_REQUEST");
+  if(h.authorization!==undefined)return response(401,false,undefined,"UNAUTHORIZED");
+  const guard=guardManagementRequest(deps.sessions,deps.allowedOrigins,{method,cookieHeader:h.cookie??"",originHeader:h.origin??null,csrfHeader:h["x-csrf-token"]??null},deps.originOptions);
+  if(!guard.ok)return response(guard.status,false,undefined,guard.code);
+  if(h["content-encoding"]!==undefined||h["transfer-encoding"]!==undefined&&h["transfer-encoding"].toLowerCase()!=="chunked"||h["content-length"]!==undefined&&h["transfer-encoding"]!==undefined)return response(400,false,undefined,"INVALID_REQUEST");
+  const type=h["content-type"]??"";if(!/^application\/json(?:\s*;\s*charset\s*=\s*(?:utf-8|"utf-8"))?$/i.test(type))return response(415,false,undefined,"UNSUPPORTED_MEDIA_TYPE");
+  const raw=d.rawBodyBytes?.value;
+  if(!raw||types.isProxy(raw)||!types.isUint8Array(raw)||(Object.getPrototypeOf(raw)!==Uint8Array.prototype&&Object.getPrototypeOf(raw)!==Buffer.prototype))return response(400,false,undefined,"INVALID_REQUEST");
+  let rawLength:number;
+  try{
+   if(["buffer","byteLength","byteOffset",Symbol.iterator].some(key=>Object.getOwnPropertyDescriptor(raw,key)!==undefined))return response(400,false,undefined,"INVALID_REQUEST");
+   const slots=Object.getPrototypeOf(Uint8Array.prototype),bufferGetter=Object.getOwnPropertyDescriptor(slots,"buffer")!.get!,lengthGetter=Object.getOwnPropertyDescriptor(slots,"byteLength")!.get!,offsetGetter=Object.getOwnPropertyDescriptor(slots,"byteOffset")!.get!;
+   const backing=Reflect.apply(bufferGetter,raw,[]) as ArrayBuffer,offset=Reflect.apply(offsetGetter,raw,[]) as number;rawLength=Reflect.apply(lengthGetter,raw,[]) as number;
+   if(!types.isArrayBuffer(backing)||types.isSharedArrayBuffer(backing)||!Number.isSafeInteger(offset)||offset<0||!Number.isSafeInteger(rawLength)||rawLength<1)return response(400,false,undefined,"INVALID_REQUEST");
+  }catch{return response(400,false,undefined,"INVALID_REQUEST");}
+  if(rawLength>OWNER_EVIDENCE_PREPARE_BODY_LIMIT)return response(413,false,undefined,"PAYLOAD_TOO_LARGE");
+  if(h["content-length"]!==undefined){if(!/^\d+$/.test(h["content-length"])||!Number.isSafeInteger(Number(h["content-length"])))return response(400,false,undefined,"INVALID_REQUEST");if(Number(h["content-length"])>OWNER_EVIDENCE_PREPARE_BODY_LIMIT)return response(413,false,undefined,"PAYLOAD_TOO_LARGE");if(Number(h["content-length"])!==rawLength)return response(400,false,undefined,"INVALID_REQUEST");}
+  if(!deps.ownerEvidenceIntake)return response(503,false,undefined,"UNAVAILABLE");
+  let parsed:any;try{parsed=parseStreamWireJSON(raw,OWNER_EVIDENCE_PREPARE_BODY_LIMIT);}catch{return response(400,false,undefined,"INVALID_REQUEST");}
+  const top=exactFields(parsed,["domain","kind","version","disposition","tuple","responseBase64","evidenceSource"]),tuple=top&&exactFields(top.tuple!.value,["domain","hostId","jobId","requestId","commandSequence","idempotencyKey","authorizationRequestDigest","storedQueueDigest","terminalState","terminalRevision","responseDigest","responseByteLength","evidenceKind","holdClass"]),jobId=tuple?.jobId?.value;
+  if(typeof jobId!=="string"||!ID.test(jobId))return response(400,false,undefined,"INVALID_REQUEST");
+  try{return ownerEvidenceResult(deps.ownerEvidenceIntake.prepare({method,path:OWNER_EVIDENCE_PREPARE_PATH,cookieHeader:h.cookie??"",originHeader:h.origin??null,csrfHeader:h["x-csrf-token"]??null,jobSelector:jobId,rawPayloadBytes:raw}));}
+  catch{return response(400,false,undefined,"INVALID_REQUEST");}
+ }
+ if(d.rawBodyBytes)return response(400,false,undefined,"INVALID_REQUEST");let url:URL;try{url=new URL(urlText,"http://127.0.0.1");}catch{return response(400,false,undefined,"INVALID_REQUEST");}if(url.origin!=="http://127.0.0.1"||!url.pathname.startsWith("/api/v1/"))return response(404,false,undefined,"NOT_FOUND");
  if(h.authorization!==undefined)return response(401,false,undefined,"UNAUTHORIZED");const guard=guardManagementRequest(deps.sessions,deps.allowedOrigins,{method,cookieHeader:h.cookie??"",originHeader:h.origin??null,csrfHeader:h["x-csrf-token"]??null},deps.originOptions);if(!guard.ok)return response(guard.status,false,undefined,guard.code);
  const q=query(url);if(!q)return response(400,false,undefined,"INVALID_REQUEST");const path=url.pathname;if(/^\/api\/v1\/lifecycle\/proposals\/(prepare|approve|submit|cancel|status)$/.test(path)){if(method!=="POST"||!deps.proposals)return response(405,false,undefined,"METHOD_NOT_ALLOWED");if(url.search)return response(400,false,undefined,"INVALID_REQUEST");const parsed=jsonBody(input as ManagementHttpRequest,h);if(!parsed.ok)return parsed.response;const action=path.split("/").at(-1) as "prepare"|"approve"|"submit"|"cancel"|"status";try{return result(deps.proposals[action](parsed.value,guard));}catch{return response(500,false,undefined,"INTERNAL_ERROR");}}if(path==="/api/v1/lifecycle/operations"||path==="/api/v1/lifecycle/cancel"){if(method!=="POST"||!deps.lifecycle)return response(405,false,undefined,"METHOD_NOT_ALLOWED");const parsed=jsonBody(input as ManagementHttpRequest,h);if(!parsed.ok)return parsed.response;try{return result(path.endsWith("/cancel")?deps.lifecycle.cancel(parsed.value,guard):await deps.lifecycle.submit(parsed.value,guard));}catch{return response(500,false,undefined,"INTERNAL_ERROR");}}
  try{
