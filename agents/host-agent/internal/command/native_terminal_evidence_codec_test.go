@@ -182,13 +182,36 @@ func TestNativeEvidenceBoundsBase64AndQueuePreimageAreStrict(t *testing.T) {
 	}
 }
 
+// Go excludes *_test.go from production builds; other .go consumers remain forbidden.
+func nativeEvidenceProductionSource(name string) bool {
+	return strings.HasSuffix(name, ".go") && !strings.HasSuffix(name, "_test.go") && name != "native_terminal_evidence_codec.go"
+}
+
+func TestNativeEvidenceProductionSourceClassification(t *testing.T) {
+	for _, tc := range []struct {
+		name       string
+		production bool
+	}{
+		{"native_terminal_evidence_codec.go", false},
+		{"native_terminal_evidence_codec_test.go", false},
+		{"native_terminal_evidence_transport_size_test.go", false},
+		{"command_runner.go", true},
+		{"future_evidence_handler.go", true},
+		{"handler_test.go.backup", false},
+	} {
+		if got := nativeEvidenceProductionSource(tc.name); got != tc.production {
+			t.Errorf("%s: production=%v, want %v", tc.name, got, tc.production)
+		}
+	}
+}
+
 func TestNativeEvidenceCodecHasNoProductionImporter(t *testing.T) {
 	entries, err := os.ReadDir(".")
 	if err != nil {
 		t.Fatal("package listing unavailable")
 	}
 	for _, entry := range entries {
-		if entry.IsDir() || !strings.HasSuffix(entry.Name(), ".go") || entry.Name() == "native_terminal_evidence_codec.go" || entry.Name() == "native_terminal_evidence_codec_test.go" {
+		if entry.IsDir() || !nativeEvidenceProductionSource(entry.Name()) {
 			continue
 		}
 		raw, e := os.ReadFile(entry.Name())
