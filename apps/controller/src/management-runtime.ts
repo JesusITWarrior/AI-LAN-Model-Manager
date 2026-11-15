@@ -6,7 +6,7 @@ import type { OriginPolicyOptions } from "./origin.js";
 import type { ManagementApiDependencies } from "./management-api.js";
 import { ControllerOperatorService, type OperatorServiceOptions } from "./operator-service.js";
 
-export type ReadManagementApiDependencies = ManagementApiDependencies;
+export type ReadManagementApiDependencies = Omit<ManagementApiDependencies, "ownerEvidenceIntake">;
 
 export function createReadManagementDependencies(
   runtime: ControllerRuntimeHandle,
@@ -36,5 +36,6 @@ export function createManagementDependencies(
   clock: () => string = () => new Date().toISOString(),
 ): ManagementApiDependencies {
   const lifecycle=new ManagementLifecycleService(runtime,clock);
-  return { ...createReadManagementDependencies(runtime, allowedOrigins, originOptions, operatorOptions), lifecycle, proposals:new OwnerLifecycleProposals(runtime,lifecycle,clock) };
+  const evidence=runtime.services.ownerEvidence;
+  return { ...createReadManagementDependencies(runtime, allowedOrigins, originOptions, operatorOptions), lifecycle, proposals:new OwnerLifecycleProposals(runtime,lifecycle,clock), ...(evidence ? { ownerEvidenceIntake: evidence } : {}) };
 }

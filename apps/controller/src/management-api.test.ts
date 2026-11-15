@@ -77,6 +77,41 @@ test("settings routes expose metadata, issue raw inference token once, and mutat
 const preview={candidateHandle:"b".repeat(48),expectedTupleDigest:"a".repeat(64),jobId:"job-1",hostId:"host-1",requestId:"request-1",terminalState:"succeeded",terminalRevision:"rev-1",evidenceKind:"succeeded",payloadBytes:100,responseBytes:20,expiresAt:"2099-01-01T00:00:00.000Z",action:"append-supplemental-native-evidence",disposition:"evidence-only",label:"Owner-provided unsigned evidence; source not independently proven"};
 const evidencePayload=JSON.stringify({domain:"lan-model-manager.native-terminal-evidence",kind:"native-terminal-evidence",version:1,disposition:"evidence-only",tuple:{domain:"lan-model-manager.native-terminal-evidence-tuple",hostId:"host-1",jobId:"job-1",requestId:"request-1",commandSequence:1,idempotencyKey:"key-1",authorizationRequestDigest:"a".repeat(64),storedQueueDigest:"b".repeat(64),terminalState:"succeeded",terminalRevision:"rev-1",responseDigest:"c".repeat(64),responseByteLength:20,evidenceKind:"succeeded",holdClass:"none"},responseBase64:"e30=",evidenceSource:"owner supplied"});
 const evidenceReq=(bytes:Uint8Array,url="/api/v1/native-evidence/prepare",headers:any={cookie:`__Host-lanmm_session=${TOKEN}`,origin:"https://manager.test","x-csrf-token":"csrf","content-type":"application/json"})=>({method:"POST",url,headers,rawBodyBytes:bytes});
+const confirmBody=JSON.stringify({candidateHandle:"candidate-1",expectedTupleDigest:"a".repeat(64),action:"append-supplemental-native-evidence",disposition:"evidence-only"});
+const confirmReq=(url="/api/v1/native-evidence/confirm",body=confirmBody,headers:any={cookie:`__Host-lanmm_session=${TOKEN}`,origin:"https://manager.test","x-csrf-token":"csrf","content-type":"application/json"})=>({method:"POST",url,headers,body});
+test("owner evidence confirm maps only the fixed seven outcomes and calls the facade once",async()=>{
+ const outcomes=[
+  ["stored",201,{ok:true,outcome:"stored"}],
+  ["already_stored",200,{ok:true,outcome:"already_stored"}],
+  ["conflict",409,{ok:false,error:{code:"CONFLICT",message:"Request conflicts with current state."}}],
+  ["stale",409,{ok:false,error:{code:"STALE_CANDIDATE",message:"Candidate is no longer current."}}],
+  ["denied",403,{ok:false,error:{code:"FORBIDDEN",message:"Request forbidden."}}],
+  ["transaction_unknown",503,{ok:false,error:{code:"OUTCOME_UNKNOWN",message:"Confirmation outcome is unknown; intake again before another explicit confirmation."}}],
+  ["committed_unsettled",503,{ok:false,error:{code:"COMMITTED_UNSETTLED",message:"Evidence was recorded, but confirmation could not be finalized."}}],
+ ] as const;
+ for(const [outcome,status,body] of outcomes){let calls=0;let seen="";const digestOutcomes=new Set(["stored","already_stored","committed_unsettled"]);const deps=dependencies({ownerEvidenceIntake:{prepare:()=>({ok:false,error:"ERR_OWNER_NATIVE_EVIDENCE_INTAKE"}),confirm:(input:unknown)=>{calls++;seen=(input as any).body;return digestOutcomes.has(outcome)?{outcome,tupleDigest:"d".repeat(64)}:{outcome};}} as never});const result=await routeManagementRequest(deps,confirmReq());assert.equal(result.status,status,outcome);assert.equal(JSON.stringify(result.body),JSON.stringify(body),outcome);assert.equal(calls,1,outcome);assert.equal(seen,confirmBody,outcome);assert.equal(JSON.stringify(result.body).includes("d".repeat(64)),false,outcome);}
+ const hostileResults: unknown[]=[
+  {outcome:"future",tupleDigest:"secret"},
+  {outcome:"stored",tupleDigest:"d".repeat(64),extra:"secret"},
+  {outcome:"stored",tupleDigest:"not-a-digest"},
+  Object.create({outcome:"stored",tupleDigest:"d".repeat(64)}),
+  new Proxy({outcome:"stored",tupleDigest:"d".repeat(64)},{ownKeys(){throw new Error("private");}}),
+ ];
+ const accessor=Object.create(null);Object.defineProperty(accessor,"outcome",{value:"stored"});Object.defineProperty(accessor,"tupleDigest",{get(){throw new Error("private");}});hostileResults.push(accessor);
+ for(const hostile of hostileResults){const deps=dependencies({ownerEvidenceIntake:{prepare:()=>({ok:false,error:"ERR_OWNER_NATIVE_EVIDENCE_INTAKE"}),confirm:()=>hostile} as never});const rejected=await routeManagementRequest(deps,confirmReq());assert.equal(rejected.status,500);assert.equal(JSON.stringify(rejected.body),JSON.stringify({ok:false,error:{code:"INTERNAL_ERROR",message:"Request failed."}}));assert.equal(JSON.stringify(rejected.body).includes("secret"),false);}
+});
+test("owner evidence confirm is exact, bounded, and unavailable without the optional facade",async()=>{
+ let calls=0;const deps=dependencies({ownerEvidenceIntake:{prepare:()=>({ok:false,error:"ERR_OWNER_NATIVE_EVIDENCE_INTAKE"}),confirm:()=>{calls++;return{outcome:"stored"};}} as never});
+ assert.equal((await routeManagementRequest(dependencies(),confirmReq())).status,503);
+ for(const url of ["/api/v1/native-evidence/confirm?x=1","/api/v1/native-evidence/%63onfirm","/api/v1/native-evidence/confirm/","http://127.0.0.1/api/v1/native-evidence/confirm"]){assert.notEqual((await routeManagementRequest(deps,confirmReq(url))).status,201,url);}
+ assert.equal((await routeManagementRequest(deps,{...confirmReq(),method:"GET"})).status!==201,true);
+ assert.equal((await routeManagementRequest(deps,{...confirmReq(),rawBodyBytes:Buffer.from(confirmBody)})).status,400);
+ assert.equal((await routeManagementRequest(deps,confirmReq("/api/v1/native-evidence/confirm",confirmBody,{...confirmReq().headers,"content-type":"text/plain"}))).status,415);
+ assert.equal((await routeManagementRequest(deps,confirmReq("/api/v1/native-evidence/confirm",confirmBody,{...confirmReq().headers,"content-encoding":"gzip"}))).status,400);
+ assert.equal((await routeManagementRequest(deps,confirmReq("/api/v1/native-evidence/confirm",confirmBody+"x",{...confirmReq().headers,"content-length":String(Buffer.byteLength(confirmBody))}))).status,400);
+ assert.equal((await routeManagementRequest(deps,confirmReq("/api/v1/native-evidence/confirm","x".repeat(4097)))).status,413);
+ assert.equal(calls,0);
+});
 test("owner evidence prepare requires exact raw route and independently caps its bytes",async()=>{
  let calls=0;const service={prepare:(input:any)=>{calls++;assert.equal(input.jobSelector,"job-1");assert.equal(input.path,"/api/v1/native-evidence/prepare");if(Buffer.byteLength(evidencePayload)===input.rawPayloadBytes.byteLength)assert.equal(Buffer.compare(Buffer.from(input.rawPayloadBytes),Buffer.from(evidencePayload)),0);return{ok:true,preview};}};
  const deps=dependencies({ownerEvidenceIntake:service as never});const bytes=Buffer.from(evidencePayload);

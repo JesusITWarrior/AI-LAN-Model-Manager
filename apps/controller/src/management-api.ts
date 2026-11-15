@@ -14,13 +14,19 @@ import { parseJsonWithoutDuplicateKeys } from "./enrollment-api.js";
 import { parseStreamWireJSON } from "@lan-model-manager/core";
 import { types } from "node:util";
 import type { OwnerNativeEvidenceIntakeService } from "./owner-native-evidence-intake.js";
+import type { OwnerConfirmResult } from "./owner-native-evidence-snapshot.js";
 
 export const MANAGEMENT_BODY_LIMIT = 65_536;
 export const OWNER_EVIDENCE_PREPARE_BODY_LIMIT = 786_432;
 const OWNER_EVIDENCE_PREPARE_PATH = "/api/v1/native-evidence/prepare";
+const OWNER_EVIDENCE_CONFIRM_PATH = "/api/v1/native-evidence/confirm";
+const OWNER_EVIDENCE_CONFIRM_BODY_LIMIT = 4_096;
 export interface ManagementHttpRequest { readonly method: string; readonly url: string; readonly headers: unknown; readonly body?: string | null; readonly rawBodyBytes?: Uint8Array }
 export interface ManagementHttpResponse { readonly status: number; readonly headers: Readonly<Record<string,string>>; readonly body: Readonly<Record<string,unknown>> }
-export interface ManagementApiDependencies { readonly sessions: SessionManager; readonly allowedOrigins: readonly string[]; readonly fleet: FleetQueryService; readonly jobs: JobStores; readonly policy: PolicyService; readonly inference: InferenceTokenManager; readonly operator?: ControllerOperatorService; readonly lifecycle?: ManagementLifecycleService; readonly proposals?:OwnerLifecycleProposals; readonly originOptions?: OriginPolicyOptions; readonly ownerEvidenceIntake?: OwnerNativeEvidenceIntakeService }
+export interface OwnerEvidenceManagementDependency extends Pick<OwnerNativeEvidenceIntakeService, "prepare"> {
+ readonly confirm?: (input: unknown) => OwnerConfirmResult;
+}
+export interface ManagementApiDependencies { readonly sessions: SessionManager; readonly allowedOrigins: readonly string[]; readonly fleet: FleetQueryService; readonly jobs: JobStores; readonly policy: PolicyService; readonly inference: InferenceTokenManager; readonly operator?: ControllerOperatorService; readonly lifecycle?: ManagementLifecycleService; readonly proposals?:OwnerLifecycleProposals; readonly originOptions?: OriginPolicyOptions; readonly ownerEvidenceIntake?: OwnerEvidenceManagementDependency }
 
 type Headers = Readonly<Record<string,string>>;
 const ID=/^[A-Za-z0-9][A-Za-z0-9._:-]{0,127}$/;
@@ -59,12 +65,43 @@ function ownerEvidenceResult(value:unknown):ManagementHttpResponse {
  try { const d=ownRecord(value);if(!d||Reflect.ownKeys(value as object).length!==2||d.ok?.value!==true)return response(400,false,undefined,"INVALID_REQUEST");const preview=evidencePreview(d.preview?.value);if(!preview)return response(400,false,undefined,"INVALID_REQUEST");return Object.freeze({status:200,headers:RESPONSE_HEADERS,body:Object.freeze(Object.assign(Object.create(null),{ok:true,value:Object.freeze(preview)}))}); }
  catch{return response(400,false,undefined,"INVALID_REQUEST");}
 }
+function ownerEvidenceConfirmResult(value: unknown): ManagementHttpResponse {
+ try {
+  if (!value || typeof value !== "object" || Array.isArray(value) || types.isProxy(value)) return response(500, false, undefined, "INTERNAL_ERROR");
+  const prototype = Object.getPrototypeOf(value);
+  if (prototype !== Object.prototype && prototype !== null) return response(500, false, undefined, "INTERNAL_ERROR");
+  const keys = Reflect.ownKeys(value), descriptors = Object.getOwnPropertyDescriptors(value);
+  if (keys.some(key => typeof key !== "string")) return response(500, false, undefined, "INTERNAL_ERROR");
+  const outcomeDescriptor = descriptors.outcome;
+  if (!outcomeDescriptor || !("value" in outcomeDescriptor)) return response(500, false, undefined, "INTERNAL_ERROR");
+  const outcome = outcomeDescriptor.value as OwnerConfirmResult["outcome"];
+  const digestOutcomes: readonly OwnerConfirmResult["outcome"][] = ["stored", "already_stored", "committed_unsettled"];
+  const requiresDigest = digestOutcomes.includes(outcome);
+  const expectedKeys = requiresDigest ? ["outcome", "tupleDigest"] : ["outcome"];
+  if (keys.length !== expectedKeys.length || keys.some(key => !expectedKeys.includes(key as string))) return response(500, false, undefined, "INTERNAL_ERROR");
+  if (requiresDigest) {
+   const digestDescriptor = descriptors.tupleDigest;
+   if (!digestDescriptor || !("value" in digestDescriptor) || typeof digestDescriptor.value !== "string" || !/^[a-f0-9]{64}$/.test(digestDescriptor.value)) return response(500, false, undefined, "INTERNAL_ERROR");
+  }
+  switch (outcome) {
+   case "stored": return Object.freeze({ status: 201, headers: RESPONSE_HEADERS, body: Object.freeze({ ok: true, outcome: "stored" }) });
+   case "already_stored": return Object.freeze({ status: 200, headers: RESPONSE_HEADERS, body: Object.freeze({ ok: true, outcome: "already_stored" }) });
+   case "conflict": return response(409, false, undefined, "CONFLICT");
+   case "stale": return Object.freeze({ status: 409, headers: RESPONSE_HEADERS, body: Object.freeze({ ok: false, error: Object.freeze({ code: "STALE_CANDIDATE", message: "Candidate is no longer current." }) }) });
+   case "denied": return response(403, false, undefined, "FORBIDDEN");
+   case "transaction_unknown": return Object.freeze({ status: 503, headers: RESPONSE_HEADERS, body: Object.freeze({ ok: false, error: Object.freeze({ code: "OUTCOME_UNKNOWN", message: "Confirmation outcome is unknown; intake again before another explicit confirmation." }) }) });
+   case "committed_unsettled": return Object.freeze({ status: 503, headers: RESPONSE_HEADERS, body: Object.freeze({ ok: false, error: Object.freeze({ code: "COMMITTED_UNSETTLED", message: "Evidence was recorded, but confirmation could not be finalized." }) }) });
+   default: return response(500, false, undefined, "INTERNAL_ERROR");
+  }
+ } catch { return response(500, false, undefined, "INTERNAL_ERROR"); }
+}
 function exactFields(value:unknown,keys:readonly string[]):Record<string,PropertyDescriptor>|null{const d=ownRecord(value);if(!d||Reflect.ownKeys(value as object).length!==keys.length||keys.some(k=>!d[k]||!("value" in d[k]!)))return null;return d;}
 
 /** Pure, dependency-injected management router. It never starts a listener. */
 export async function routeManagementRequest(deps:ManagementApiDependencies,input:unknown):Promise<ManagementHttpResponse>{
  const d=ownRecord(input);if(!d)return response(400,false,undefined,"INVALID_REQUEST");const allowed=["method","url","headers","body","rawBodyBytes"];if(Reflect.ownKeys(input as object).some(k=>typeof k!=="string"||!allowed.includes(k as string))||!d.method||!d.url||!d.headers)return response(400,false,undefined,"INVALID_REQUEST");const method=d.method.value,urlText=d.url.value;if(typeof method!=="string"||!/^[A-Z]+$/.test(method)||typeof urlText!=="string")return response(400,false,undefined,"INVALID_REQUEST");const exactPrepare=method==="POST"&&urlText===OWNER_EVIDENCE_PREPARE_PATH;
- const bodyLimit=exactPrepare?OWNER_EVIDENCE_PREPARE_BODY_LIMIT:MANAGEMENT_BODY_LIMIT;if(typeof d.body?.value==="string"&&Buffer.byteLength(d.body.value)>bodyLimit)return response(413,false,undefined,"PAYLOAD_TOO_LARGE");
+ const exactConfirm=method==="POST"&&urlText===OWNER_EVIDENCE_CONFIRM_PATH;
+ const bodyLimit=exactPrepare?OWNER_EVIDENCE_PREPARE_BODY_LIMIT:exactConfirm?OWNER_EVIDENCE_CONFIRM_BODY_LIMIT:MANAGEMENT_BODY_LIMIT;if(typeof d.body?.value==="string"&&Buffer.byteLength(d.body.value)>bodyLimit)return response(413,false,undefined,"PAYLOAD_TOO_LARGE");
  if(d.rawBodyBytes&&!exactPrepare){const raw=d.rawBodyBytes.value;if(types.isUint8Array(raw)&&!types.isProxy(raw)){const length=Object.getOwnPropertyDescriptor(Object.getPrototypeOf(Uint8Array.prototype),"byteLength")!.get!.call(raw) as number;if(length>MANAGEMENT_BODY_LIMIT)return response(413,false,undefined,"PAYLOAD_TOO_LARGE");}return response(400,false,undefined,"INVALID_REQUEST");}
  const h=headers(d.headers.value);if(!h)return response(400,false,undefined,"INVALID_REQUEST");
  if(exactPrepare){
@@ -92,6 +129,16 @@ export async function routeManagementRequest(deps:ManagementApiDependencies,inpu
   try{return ownerEvidenceResult(deps.ownerEvidenceIntake.prepare({method,path:OWNER_EVIDENCE_PREPARE_PATH,cookieHeader:h.cookie??"",originHeader:h.origin??null,csrfHeader:h["x-csrf-token"]??null,jobSelector:jobId,rawPayloadBytes:raw}));}
   catch{return response(400,false,undefined,"INVALID_REQUEST");}
  }
+ if(exactConfirm){
+  if(d.body?.value===undefined||d.body.value===null||typeof d.body.value!=="string")return response(400,false,undefined,"INVALID_REQUEST");
+  if(h.authorization!==undefined)return response(401,false,undefined,"UNAUTHORIZED");
+  if(h["content-encoding"]!==undefined||h["transfer-encoding"]!==undefined&&h["transfer-encoding"].toLowerCase()!=="chunked"||h["content-length"]!==undefined&&h["transfer-encoding"]!==undefined)return response(400,false,undefined,"INVALID_REQUEST");
+  const type=h["content-type"]??"";if(!/^application\/json(?:\s*;\s*charset\s*=\s*(?:utf-8|"utf-8"))?$/i.test(type))return response(415,false,undefined,"UNSUPPORTED_MEDIA_TYPE");
+  const bytes=Buffer.byteLength(d.body.value,"utf8");if(bytes>OWNER_EVIDENCE_CONFIRM_BODY_LIMIT)return response(413,false,undefined,"PAYLOAD_TOO_LARGE");
+  if(h["content-length"]!==undefined&&(!/^\d+$/.test(h["content-length"])||Number(h["content-length"])!==bytes))return response(400,false,undefined,"INVALID_REQUEST");
+  if(!deps.ownerEvidenceIntake||typeof deps.ownerEvidenceIntake.confirm!=="function")return response(503,false,undefined,"UNAVAILABLE");
+  try{return ownerEvidenceConfirmResult(deps.ownerEvidenceIntake.confirm({method,path:OWNER_EVIDENCE_CONFIRM_PATH,cookieHeader:h.cookie??"",originHeader:h.origin??null,csrfHeader:h["x-csrf-token"]??null,body:d.body.value}));}catch{return response(500,false,undefined,"INTERNAL_ERROR");}
+ }
  if(d.rawBodyBytes)return response(400,false,undefined,"INVALID_REQUEST");let url:URL;try{url=new URL(urlText,"http://127.0.0.1");}catch{return response(400,false,undefined,"INVALID_REQUEST");}if(url.origin!=="http://127.0.0.1"||!url.pathname.startsWith("/api/v1/"))return response(404,false,undefined,"NOT_FOUND");
  if(h.authorization!==undefined)return response(401,false,undefined,"UNAUTHORIZED");const guard=guardManagementRequest(deps.sessions,deps.allowedOrigins,{method,cookieHeader:h.cookie??"",originHeader:h.origin??null,csrfHeader:h["x-csrf-token"]??null},deps.originOptions);if(!guard.ok)return response(guard.status,false,undefined,guard.code);
  const q=query(url);if(!q)return response(400,false,undefined,"INVALID_REQUEST");const path=url.pathname;if(/^\/api\/v1\/lifecycle\/proposals\/(prepare|approve|submit|cancel|status)$/.test(path)){if(method!=="POST"||!deps.proposals)return response(405,false,undefined,"METHOD_NOT_ALLOWED");if(url.search)return response(400,false,undefined,"INVALID_REQUEST");const parsed=jsonBody(input as ManagementHttpRequest,h);if(!parsed.ok)return parsed.response;const action=path.split("/").at(-1) as "prepare"|"approve"|"submit"|"cancel"|"status";try{return result(deps.proposals[action](parsed.value,guard));}catch{return response(500,false,undefined,"INTERNAL_ERROR");}}if(path==="/api/v1/lifecycle/operations"||path==="/api/v1/lifecycle/cancel"){if(method!=="POST"||!deps.lifecycle)return response(405,false,undefined,"METHOD_NOT_ALLOWED");const parsed=jsonBody(input as ManagementHttpRequest,h);if(!parsed.ok)return parsed.response;try{return result(path.endsWith("/cancel")?deps.lifecycle.cancel(parsed.value,guard):await deps.lifecycle.submit(parsed.value,guard));}catch{return response(500,false,undefined,"INTERNAL_ERROR");}}
@@ -117,6 +164,6 @@ export async function routeManagementRequest(deps:ManagementApiDependencies,inpu
   const operatorPosts=new Set(["/api/v1/operator/ca/initialize","/api/v1/operator/discovery/refresh","/api/v1/operator/pairing/begin","/api/v1/operator/pairing/confirm","/api/v1/operator/pairing/cancel","/api/v1/operator/certificates/revoke","/api/v1/operator/certificates/re-enroll","/api/v1/operator/hosts/rename","/api/v1/operator/package/upgrade","/api/v1/operator/package/rollback","/api/v1/operator/backups/export","/api/v1/operator/restore/preflight"]);
   if(deps.operator&&method==="POST"&&operatorPosts.has(path)){const parsed=jsonBody(input as ManagementHttpRequest,h);if(!parsed.ok)return parsed.response;const bd=ownRecord(parsed.value);if(!bd)return response(400,false,undefined,"INVALID_REQUEST");if(path==="/api/v1/operator/ca/initialize"){if(Reflect.ownKeys(parsed.value as object).length!==0)return response(400,false,undefined,"INVALID_REQUEST");return operatorCall(()=>deps.operator!.initializeCa());}if(path==="/api/v1/operator/discovery/refresh"){if(Reflect.ownKeys(parsed.value as object).length!==0)return response(400,false,undefined,"INVALID_REQUEST");return operatorCall(()=>deps.operator!.candidates(true));}if(path==="/api/v1/operator/pairing/begin")return operatorCall(()=>deps.operator!.beginPairing(parsed.value));if(path==="/api/v1/operator/pairing/confirm")return operatorCall(()=>deps.operator!.confirmPairing(parsed.value));if(path==="/api/v1/operator/pairing/cancel")return operatorCall(()=>deps.operator!.cancelPairing(parsed.value));if(path==="/api/v1/operator/certificates/revoke")return operatorCall(()=>deps.operator!.revokeCertificate(parsed.value));if(path==="/api/v1/operator/certificates/re-enroll")return operatorCall(()=>deps.operator!.reEnroll(parsed.value));if(path==="/api/v1/operator/hosts/rename")return operatorCall(()=>deps.operator!.renameHost(parsed.value));if(path==="/api/v1/operator/package/upgrade")return operatorCall(()=>deps.operator!.upgrade(parsed.value));if(path==="/api/v1/operator/package/rollback")return operatorCall(()=>deps.operator!.rollback(parsed.value));if(path==="/api/v1/operator/backups/export")return operatorCall(()=>deps.operator!.exportBackup(parsed.value));return operatorCall(()=>deps.operator!.restorePreflight(parsed.value));}
   const knownPost=new Set(["/api/v1/policy/settings","/api/v1/policy/install","/api/v1/policy/evaluate","/api/v1/policy/approve","/api/v1/policy/convenience","/api/v1/inference/tokens","/api/v1/inference/tokens/revoke","/api/v1/inference/tokens/revoke-all"]);if(method==="POST"&&knownPost.has(path)){const parsed=jsonBody(input as ManagementHttpRequest,h);if(!parsed.ok)return parsed.response;const bd=ownRecord(parsed.value);if(!bd)return response(400,false,undefined,"INVALID_REQUEST");if(path==="/api/v1/policy/settings"){if(url.search)return response(400,false,undefined,"INVALID_REQUEST");return result(deps.policy.updateSettings(parsed.value,guard));}if(path==="/api/v1/policy/install")return result(deps.policy.install(parsed.value,guard));if(path==="/api/v1/policy/convenience")return result(deps.policy.setConvenience(parsed.value,guard));if(path==="/api/v1/inference/tokens"){const issued=await deps.inference.issue(sessionToken,parsed.value);return issued?issuedToken(issued):response(401,false,undefined,"UNAUTHORIZED");}if(path==="/api/v1/inference/tokens/revoke"){if(Reflect.ownKeys(parsed.value as object).length!==1||typeof bd.tokenId?.value!=="string"||!ID.test(bd.tokenId.value))return response(400,false,undefined,"INVALID_REQUEST");return response(200,true,{revoked:await deps.inference.revoke(sessionToken,bd.tokenId.value)});}if(path==="/api/v1/inference/tokens/revoke-all"){if(Reflect.ownKeys(parsed.value as object).length!==0)return response(400,false,undefined,"INVALID_REQUEST");return response(200,true,{revoked:await deps.inference.revokeAll(sessionToken)});}if(path==="/api/v1/policy/evaluate")return result(deps.policy.authorize(actorBound(parsed.value,guard)));if(path==="/api/v1/policy/approve"){if(Reflect.ownKeys(parsed.value as object).length!==1||typeof bd.requestId?.value!=="string")return response(400,false,undefined,"INVALID_REQUEST");return result(deps.policy.approve(bd.requestId.value,guard));}}
-  const operatorKnown=["/api/v1/operator/setup/status","/api/v1/operator/ca","/api/v1/operator/discovery/candidates","/api/v1/operator/certificates","/api/v1/operator/package","/api/v1/operator/diagnostics",...operatorPosts];const known=["/api/v1/fleet/hosts","/api/v1/fleet/summary","/api/v1/jobs","/api/v1/audit","/api/v1/policy/approvals","/api/v1/policy/settings","/api/v1/inference/tokens",...knownPost,...(deps.operator?operatorKnown:[])];if(known.includes(path)||deps.operator&&/^\/api\/v1\/operator\/pairing\/[a-f0-9]{64}$/.test(path)||/^\/api\/v1\/fleet\/hosts\/[^/]+(?:\/(?:providers|models))?$/.test(path)||/^\/api\/v1\/jobs\/[^/]+\/history$/.test(path))return response(405,false,undefined,"METHOD_NOT_ALLOWED");return response(404,false,undefined,"NOT_FOUND");
+  const operatorKnown=["/api/v1/operator/setup/status","/api/v1/operator/ca","/api/v1/operator/discovery/candidates","/api/v1/operator/certificates","/api/v1/operator/package","/api/v1/operator/diagnostics",...operatorPosts];const known=["/api/v1/fleet/hosts","/api/v1/fleet/summary","/api/v1/jobs","/api/v1/audit","/api/v1/policy/approvals","/api/v1/policy/settings","/api/v1/inference/tokens",OWNER_EVIDENCE_CONFIRM_PATH,...knownPost,...(deps.operator?operatorKnown:[])];if(known.includes(path)||deps.operator&&/^\/api\/v1\/operator\/pairing\/[a-f0-9]{64}$/.test(path)||/^\/api\/v1\/fleet\/hosts\/[^/]+(?:\/(?:providers|models))?$/.test(path)||/^\/api\/v1\/jobs\/[^/]+\/history$/.test(path))return response(405,false,undefined,"METHOD_NOT_ALLOWED");return response(404,false,undefined,"NOT_FOUND");
  }catch{return response(500,false,undefined,"INTERNAL_ERROR");}
 }
