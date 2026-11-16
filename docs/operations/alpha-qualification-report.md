@@ -1,4 +1,4 @@
-# Phase 18.13 Alpha qualification report
+# Phase 18 Alpha qualification report
 
 **Qualification date:** 2026-09-29 (America/Chicago)
 
@@ -8,9 +8,49 @@
 
 **Scope:** qualification and fixable-gap repair only; no production deployment
 
-**Verdict:** **NO-SHIP**
+## Historical qualification snapshot (September checkpoint `3e131b1`)
 
-The implementation has strong loopback, cross-language, packaging, recovery, and rootless-install evidence. Three in-repository qualification defects were repaired, reviewed, committed at `3e131b1`, and all available local gates pass. Clean-source package bytes were rebuilt twice at that exact commit and matched. Release shipment remains blocked because packages are unsigned, PowerShell 7.2 (`pwsh`) was unavailable on Windows qualification host for the required native `-WhatIf` service-script run, and no real installed service or native two-host lifecycle/chat drill was performed. No service, host configuration, firewall rule, hosted workflow, or unrelated runtime was changed.
+> Preserved as historical evidence. The September 2026 qualification below was performed **only** at commit `3e131b1` and was **not** rerun at later commits. Every figure that follows describes what was executed at the September host; the counts are **not** current-commit evidence and do not establish anything at `e6695cb`.
+
+**Verdict (September checkpoint `3e131b1`):** **NO-SHIP**
+
+The implementation had strong loopback, cross-language, packaging, recovery, and rootless-install evidence at `3e131b1`. Three in-repository qualification defects were repaired, reviewed, committed at `3e131b1`, and all available local gates passed. Clean-source package bytes were rebuilt twice at that exact commit and matched. Release shipment was blocked because packages were unsigned, PowerShell 7.2 (`pwsh`) was unavailable on the Windows qualification host for the required native `-WhatIf` service-script run, and no real installed service or native two-host lifecycle/chat drill was performed. No service, host configuration, firewall rule, hosted workflow, or unrelated runtime was changed.
+
+**September command/result summary (historical, not rerun):**
+- Clean base: `npm ci --ignore-scripts` → 27 packages, 0 vulnerabilities.
+- Clean base: `make check` → build pass; TS 589/589; Go all packages pass; supply-chain 25/25; `release-readiness:ok`.
+- Reproducibility: two `node scripts/packaging/build.js artifacts/alpha-repro` runs → `built 7 unsigned package(s)` each; complete output hash diff empty; seven archive checksums OK.
+- Linux fixture: installer dry-run reported `changed:false`; install `changed:true`; native smoke timeout rc 124; rejected configuration rc 2; uninstall preserved state.
+- Windows qualification parser: `WINDOWS_PS_PARSE_OK tokens=651` under Windows PowerShell 5.1.
+- Windows qualification installer: first 7/9 exposed portability gaps; repaired rerun 9/9.
+- Windows qualification rootless package: dry-run/install/uninstall succeeded; `PERSIST_ME` remained after uninstall.
+- TS soak: 10 × 43 = 430 passes, zero failures.
+- Go repaired timeout: 50 repeats pass; full race suite pass; focused 10x repeat pass.
+- UI/static: Vite build pass; 39/39 tests pass; static accessibility/deep-link checks pass.
+- Repaired fixture release artifacts: `provenance:ok:6:unsigned`; `sbom:ok:84`; seven checksums OK; secret scan clean.
+- Clean candidate `3e131b1`: two independent package builds produced nine matching output hashes; all seven archive checksums passed.
+- Post-repair full gate: `make check` pass; `release-readiness:ok`.
+- **Historical blocker (September host only):** Windows PowerShell 7.2 (`pwsh`) was unavailable on the September Windows qualification host; the script's declared `#Requires -Version 7.2` could not be satisfied. This is a September-host limitation, not a confirmed project boundary at later commits.
+
+## Current accepted source checkpoint (`e6695cb`)
+
+The source tree at `e6695cb0cfefea24269add6401f95490017d1200` was accepted as the exact evidence baseline before this documentation update — this documentation source line corrects only the documentation slice and does not re-qualify the build. At this exact accepted baseline the following build/source/release-gate evidence holds (source only — **not** package or native qualification):
+
+- Repository build passed (`npm run build`).
+- Focused owner-documentation regression (`scripts/packaging/tests/audit.test.ts`) passed 9/9.
+- Supply-chain checks passed 33 (one intentional skip) plus Fedora 10/10 (`npm run supply-chain`).
+- Release audit `release-readiness:ok` via `node scripts/packaging/audit.js . --allow-dirty --run-gates`.
+- Serial full repository suite reported 1060/1060 (from prior sibling runs at this same commit; see **Limits**).
+- Remote equality prior to this documentation update: HEAD equaled `origin/main` equaled `e6695cb`, with a clean tracked worktree, and `git diff --check` clean.
+
+This section attests only that the source tree builds and passes source/build/release-gate tests at `e6695cb`. It does **not** establish package, native, lifecycle, signing, or macOS qualification.
+
+**Explicitly not claimed at `e6695cb`:** no clean reproducible package double-build, no native service qualification, no two-host lifecycle/inference/transfer drill, no macOS native qualification or explicit first-Alpha exclusion, no signing, no publication, and no deployment were performed at this commit.
+
+## Verdict
+
+- **Source test-stage:** suitable for continued bounded Alpha review at `e6695cb`, subject to the exact limits stated above (build/source/release-gate evidence only; no package/native lifecycle claim).
+- **Ship/release:** **NO-SHIP.** Do not publish or install this Alpha as a production release at `e6695cb`.
 
 ## Hosts and tools
 
@@ -80,25 +120,13 @@ All changes below were independently reviewed and committed at `3e131b115c336aea
    - Repair: accept native separators and use a Windows directory junction for the ancestor-redirection fixture.
    - Evidence: Windows qualification host rerun 9/9; Linux supply-chain installer tests 9/9 inside the 25/25 gate.
 
-## Exact command/result summary
+## Exact command/result summary — historical September checkpoint (`3e131b1`)
 
-- Clean base: `npm ci --ignore-scripts` → 27 packages, 0 vulnerabilities.
-- Clean base: `make check` → build pass; TS 589/589; Go all packages pass; supply-chain 25/25; `release-readiness:ok`.
-- Reproducibility: two `node scripts/packaging/build.js artifacts/alpha-repro` runs → `built 7 unsigned package(s)` each; complete output hash diff empty; seven archive checksums OK.
-- Linux fixture: installer dry-run reported `changed:false`; install `changed:true`; native smoke timeout rc 124; rejected configuration rc 2; uninstall preserved state.
-- Windows qualification parser: `WINDOWS_PS_PARSE_OK tokens=651` under Windows PowerShell 5.1.
-- Windows qualification installer: first 7/9 exposed portability gaps; repaired rerun 9/9.
-- Windows qualification rootless package: dry-run/install/uninstall succeeded; `PERSIST_ME` remained after uninstall.
-- TS soak: 10 × 43 = 430 passes, zero failures.
-- Go repaired timeout: 50 repeats pass; full race suite pass; focused 10x repeat pass.
-- UI/static: Vite build pass; 39/39 tests pass; static accessibility/deep-link checks pass.
-- Repaired fixture release artifacts: `provenance:ok:6:unsigned`; `sbom:ok:84`; seven checksums OK; secret scan clean.
-- Clean candidate `3e131b1`: two independent package builds produced nine matching output hashes; all seven archive checksums passed.
-- Post-repair full gate: `make check` pass; `release-readiness:ok`.
+All September command/result figures for the `3e131b1` checkpoint are recorded in the **Historical qualification snapshot** section above and did not execute at e6695cb; they describe only the September checkpoint, not any current-commit evidence. The `e6695cb` build/source/release-gate figures are recorded in the **Current accepted source checkpoint** section.
 
 ## Named skips and blockers
 
-1. **PowerShell 7.2 service script `-WhatIf`: BLOCKED.** The Windows qualification host lacks `pwsh`; Windows PowerShell 5.1 cannot satisfy the script's declared runtime. Static/native parser evidence is not represented as pwsh execution evidence.
+1. **PowerShell 7.2 service script `-WhatIf`: BLOCKED (September host only).** The September Windows qualification host lacked `pwsh`; Windows PowerShell 5.1 could not satisfy the script's declared runtime. Static/native parser evidence is not represented as pwsh execution evidence. This was a September-host limitation; it is not claimed to be the current project boundary (not executed there).
 2. **Live service install/start/stop/SCM/ACL validation: SKIPPED BY SAFETY.** The qualification explicitly prohibited enabling or installing real services and any host/firewall mutation. No suitable isolated Windows VM/service sandbox was available.
 3. **Native Linux system package/service smoke: SKIPPED BY SAFETY.** Rootless extraction/installer/binary evidence was used; no systemd/sysusers/tmpfiles invocation occurred.
 4. **Physical two-host production flow: NOT RUN.** The requirement allowed two-host **or two-process** evidence. Real TS/Go processes over loopback mTLS fulfilled the safe branch. This does not prove physical LAN outage/reconnect, Windows service behavior, or large-model transfer.
@@ -114,6 +142,19 @@ All changes below were independently reviewed and committed at `3e131b115c336aea
 - UI accessibility has strong semantic/static evidence but lacks dynamic assistive-technology evidence.
 - The candidate source is committed and reproducibly packaged, but every generated artifact remains explicitly unsigned.
 
+## Current release-closure conditions (retain all)
+
+Release closure at `e6695cb` (or any later release candidate) retains every minimum condition below. None is closed by this documentation source line; each requires evidence generated at the eventual release candidate.
+
+1. **Exact-same-commit packaged Alpha 1 and Alpha 2 native gates.** Reproducible clean-source double-build at the exact same commit; Alpha 1 and Alpha 2 native packages built and passed at that commit (`Hat Trick`/`JarJar`).
+2. **Current Windows SCM / service / ACL / reconnect / upgrade evidence.** Live Windows SCM query, ACL application, service health activation, reconnect, and clean-install/upgrade evidence at the current commit.
+3. **Clean-install / upgrade / recovery evidence.** Fresh-install, in-place upgrade, and recovery paths qualified at the current commit.
+4. **macOS native qualification, or explicit first-Alpha exclusion.** macOS native package qualification, or an explicit, documented first-Alpha exclusion on the macOS track.
+5. **Deterministic unsigned RC / SBOM / checksums / provenance rerun.** Deterministic unsigned release-candidate package, CycloneDX SBOM, archive checksums, and provenance rerun at the eventual candidate.
+6. **Approved signing process and material.** An approved signing process and signing material in place; signing/publication remain separately authorized.
+7. **Documentation and support matrix.** Current documentation and support/release matrix.
+8. **Explicit owner go/no-go.** A documented owner go/no-go before any publication or deployment.
+
 ## Ship decision
 
-**NO-SHIP.** Do not publish or install this Alpha as a production release. The code is suitable for continued Alpha review at committed candidate `3e131b1`. The accepted repairs and clean-source reproducibility condition are closed. Remaining minimum closure conditions are: provide PowerShell 7.2 on the Windows qualification host and pass native parse plus `-WhatIf`; add release signing; and either explicitly accept the documented fixture-only residual risks or complete native service/provider/two-host qualification in an isolated sandbox.
+**NO-SHIP.** Do not publish or install this Alpha as a production release. The September repairs and clean-source reproducibility condition remain closed as historical evidence. At the current source line, release closure must instead retain all minimum conditions enumerated under **Current release-closure conditions (retain all)**; the single PowerShell-7.2 boundary recorded for the September checkpoint is not, by itself, the project boundary at `e6695cb`.

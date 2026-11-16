@@ -142,3 +142,77 @@ test("threat model documents owner evidence as untrusted ingress",()=>{
     "threat-model.md must not claim the lane attests provenance at prepare time"
   );
 });
+
+// ---- Alpha-qualification report regression ----
+
+const alphaDocName = "docs/operations/alpha-qualification-report.md";
+const alphaDoc = doc(alphaDocName);
+
+// The historical snapshot contains truthful negated markers: they describe only what
+// executed at the September checkpoint, never at the current HEAD. Only positive
+// current-execution claims are rejected — the honest "not" markers are required.
+test("alpha-qualification report is a current-status, non-unit report", () => {
+  // Requirement 1: non-unit title (no Phase-18.13 unit heading).
+  mustNotContain(["Phase 18.13"], [alphaDoc], "alpha-qualification report");
+  mustContain(["Phase 18 Alpha qualification report"], [alphaDoc], "alpha-qualification report title");
+
+  // Requirement 2: preserved historical snapshot clearly separated from current work.
+  mustContain(["Historical qualification snapshot"], [alphaDoc], "alpha-qualification report");
+  // Truthful negated historical markers REQUIRE present; these describe what executed
+  // at the September checkpoint, never at the current HEAD.
+  mustContain(
+    ["was **not** rerun at later commits", "did not execute at e6695cb"],
+    [alphaDoc],
+    "alpha-qualification report historical separation",
+  );
+  // Only positive current-execution claims are rejected (never the honest "not" markers).
+  mustNotContain(
+    ["was rerun", "rebuilt at e6695cb"],
+    [alphaDoc],
+    "alpha-qualification report positive-execution claims",
+  );
+
+  // Requirement 3: current accepted source checkpoint named exactly (baseline before this update).
+  mustContain(
+    ["e6695cb0cfefea24269add6401f95490017d1200"],
+    [alphaDoc],
+    "alpha-qualification report",
+  );
+  mustContain(["Current accepted source checkpoint"], [alphaDoc], "alpha-qualification report");
+
+  // Requirement 4: explicit source-vs-ship verdict split.
+  mustContain(["Source test-stage"], [alphaDoc], "alpha-qualification report verdict");
+  mustContain(["Ship/release"], [alphaDoc], "alpha-qualification report verdict");
+
+  // Requirement 5: NO-SHIP for ship/release.
+  mustContain(["NO-SHIP"], [alphaDoc], "alpha-qualification report NO-SHIP");
+
+  // Requirement 6: the current checkpoint is described as source only — not package or native qualification.
+  mustContain(["**not** package or native qualification"], [alphaDoc], "alpha-qualification report source-only");
+
+  // Requirement 7: current release-closure gates enumerated (retain all).
+  mustContain(
+    ["Current release-closure conditions (retain all)"],
+    [alphaDoc],
+    "alpha-qualification report",
+  );
+  mustContain(["Exact-same-commit packaged Alpha 1 and Alpha 2 native gates"], [alphaDoc], "alpha-qualification report");
+  mustContain(["macOS native qualification, or explicit first-Alpha exclusion"], [alphaDoc], "alpha-qualification report");
+  mustContain(["Deterministic unsigned RC / SBOM / checksums / provenance rerun"], [alphaDoc], "alpha-qualification report");
+
+  // Requirement 8: the honest residual states these were NOT performed at e6695cb
+  // (negated on the report). Assert the negated residual is present, and never assert
+  // any positive current double-build / native-service / two-host drill claim.
+  mustContain(
+    ["no clean reproducible package double-build", "no native service qualification", "no two-host lifecycle/inference/transfer drill"],
+    [alphaDoc],
+    "alpha-qualification report no-current-execution residual",
+  );
+
+  // Stale (historical/closed) sentences must be rejected.
+  mustNotContain(
+    ["continued Alpha review is at `3e131b1`", "provide PowerShell 7.2 on the Windows qualification host"],
+    [alphaDoc],
+    "stale current-review and closure sentences",
+  );
+});
