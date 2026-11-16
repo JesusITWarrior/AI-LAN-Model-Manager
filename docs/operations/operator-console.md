@@ -42,6 +42,21 @@ Restore is deliberately split:
 3. Stop the controller and use the offline native restore procedure. A live management request never replaces the database underneath the running process.
 4. Restart, sign in, and inspect diagnostics and fleet state.
 
+## Owner evidence
+
+Prepare and attach owner-provided unsigned evidence through a separate management workflow. Selecting a local JSON file does not send anything: the browser checks that the raw body is between 1 and 786,432 bytes and holds the bytes only until you explicitly choose **Prepare**. Preparation is authenticated (owner session plus CSRF) but **not** authorizing.
+
+1. Select a local JSON evidence file. The browser bounds the raw body to 1..786,432 bytes and sends nothing until **Prepare**.
+2. **Prepare** (authenticated, non-authorizing) returns a short-lived — 60 seconds —, redacted preview bound to the current owner/session/credential/job history/current X.509 enrollment state. The preview shows the fixed label `Owner-provided unsigned evidence; source not independently proven` together with the exact job/host/request/terminal revision/kind, byte counts, and expiry.
+3. A separate explicit **Attach evidence only** click sends only the candidate handle, the expected tuple digest, the fixed action `append-supplemental-native-evidence`, and the `evidence-only` disposition. It does not carry the evidence bytes.
+4. The response states one of `stored`, `already_stored`, `conflict`, `stale`, `denied`, `transaction_unknown`, or `committed_unsettled`.
+
+Unknown or unsettled outcomes (`stale`, `transaction_unknown`, `committed_unsettled`) never auto-retry and never re-run the command. They require fresh explicit re-intake before another confirmation. `stored` persists one append-only row to `supplemental_native_evidence` plus a matching audit row, while `supplemental_native_evidence_audit` records the event; it does **not** modify jobs, history, commands, replay, or holds. `already_stored` means an identical tuple already exists; `conflict` means the same tuple was presented with different owner-supplied bytes; `denied` means an authentication or bound check failed.
+
+Data hygiene: the browser does not persist raw bytes, the candidate handle, or the tuple digest to local or session storage; a selection change, reset, or new intake invalidates the previous review. Application caps — prepare raw body max 786,432 bytes, response bytes max 524,288, volatile candidate registry max 16 entries / 8 MiB retained bytes / 60-second candidate TTL, confirm body max 4,096 — are application limits, not evidence authenticity.
+
+Attachment never executes or retries a command, rewrites job/history/result/replay, proves host origin or fresh mTLS, ACKs a command, clears uncertainty, or releases a hold. It attaches only candidate evidence for later manual review.
+
 ## Redacted diagnostics
 
 Diagnostics contain only generated time, schema version, runtime state, aggregate host/provider/model/certificate/pairing counts, and coarse database/CA/package checks. They intentionally omit:

@@ -39,6 +39,21 @@ The OpenAI-compatible inference gateway and management API use separate routes,
 credentials, scopes, rate limits, and audit categories. Sending prompts never
 grants authority to alter hosts or models.
 
+### Owner evidence lane
+
+Owner-provided unsigned evidence travels a separate management lane that
+attaches candidate evidence only, never authorizing the mutation:
+
+1. Untrusted owner-provided JSON bytes (raw body bounded 1..786,432 bytes).
+2. Bounded decode (strict UTF-8/JSON/duplicate-key/shape/cap) against a server-built current snapshot.
+3. A volatile owner/session/credential-bound candidate registry (max 16 entries, 8 MiB retained bytes, 60-second candidate TTL) with a redacted preview; the browser keeps no raw bytes, candidate handle, or tuple digest in local/session storage.
+4. Explicit owner POST confirmation sending only the candidate handle, expected tuple digest, fixed action `append-supplemental-native-evidence`, and `evidence-only` disposition (confirm body max 4,096 bytes).
+5. Fresh same-transaction job/history/queue/current X.509 enrollment checks; `committed_unsettled`/`transaction_unknown` outcomes require fresh explicit re-intake and never auto-retry.
+6. The transaction appends supplemental evidence (one append-only row to `supplemental_native_evidence`) plus its audit event to `supplemental_native_evidence_audit`, while the queue remains authoritative input and is left unchanged (response bytes max 524,288).
+7. Post-commit lease settlement and truthful uncertain outcomes (`stale`, `denied`, etc.).
+
+Authority boundaries in this lane: the redacted preview is **not** permission; current enrolled certificate validation is **not** remote possession/fresh mTLS; stored evidence is **not** a native ACK, receipt, or hold release. Management and inference planes remain separate.
+
 ## State machines
 
 - Host: `discovered -> pairing_pending -> paired -> active -> degraded/offline -> revoked`

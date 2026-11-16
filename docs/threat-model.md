@@ -13,6 +13,7 @@ Protected assets include the controller database, owner and inference credential
 3. **Controller/agent transport is authenticated.** Enrolled hosts use TLS 1.3 mutual authentication and signed envelopes. Certificate status, endpoint binding, request/body binding, timestamps, and persistent monotonic replay state are checked before fleet mutation.
 4. **Management and inference are separate.** Management uses owner sessions and CSRF checks. The OpenAI-compatible inference surface uses separately issued bearer tokens; inference credentials cannot authorize management operations.
 5. **Provider data is untrusted.** Native and custom adapters apply strict schemas, size/cardinality limits, freshness checks, stable errors, and normalized outputs.
+6. **Owner evidence bytes are untrusted ingress.** A prepared evidence payload is decoded under strict UTF-8/JSON/duplicate-key/shape/cap bounds, then a redacted public DTO (fixed label, job/host/request/terminal revision/kind, byte counts, expiry) never includes raw evidence bytes. A separate explicit owner confirmation carries only the candidate handle and expected tuple digest; the confirmation body is bounded at 4,096 bytes. Raw bytes, the candidate handle, and the tuple digest are not persisted in local or session storage.
 
 ## Mutation and command controls
 
@@ -49,6 +50,7 @@ The checked-in release tooling performs offline npm lock integrity checks, an al
 | Eviction races with inference | Admission accounting, leases, pins, reservations, and pre-delete revalidation. |
 | Database or backup tampering | Migration ledger, audit hash chain, backup digest, integrity check, fail-closed open/restore. |
 | Dependency or release drift | Lock/license/secret gates, deterministic artifacts, SBOM and digest-bound provenance. |
+| Owner-supplied unsigned evidence | Strict UTF-8/JSON/duplicate-key/shape/cap decode against a server current snapshot; evidence-only confirmation (candidate handle + expected tuple digest + fixed action + evidence-only disposition); redacted public DTOs carry no raw bytes; same-origin session + CSRF; 60s candidate TTL and capacity; immutable append-only evidence plus audit commit; callback/revocation/transaction rechecks; raw evidence never returned in responses, logs, or UI after prepare. |
 
 ## Residual risks
 
@@ -60,6 +62,10 @@ The checked-in release tooling performs offline npm lock integrity checks, an al
 - Cross-platform packages are cross-compiled and fixture-tested, but final release qualification still requires native-host validation.
 - Advisory vulnerability data is not fetched by the offline gate; a future release process should add an explicitly networked review step.
 - Release signing and publication are not operational.
+- Owner-provided evidence bytes may be false or benign; prepare records only the owner-provided source assertion and compares it against the current database/trust state, but it does **not** attest remote origin, remote possession, fresh mTLS, host provenance, or the evidence's truthfulness. Stored candidate evidence does not prove the evidence is authentic or trustworthy.
+- Current enrolled-certificate validation is trust based, not a proof of remote possession, host origin, fresh mTLS, or the uploader's or host's provenance.
+- No native receipt, ACK, or durability claim is satisfied by attachment; stored candidate evidence is not a hold release.
+- Loss of the HTTP response yields explicit `transaction_unknown`/`committed_unsettled` states that require fresh manual re-intake before another confirmation; such outcomes are not automatically retried.
 
 ## Public repository boundary
 
