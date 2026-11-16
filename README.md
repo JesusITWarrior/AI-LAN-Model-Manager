@@ -5,11 +5,16 @@ unloading, placing, and routing to AI models across authorized machines on a
 LAN. It is designed around safe hot-swapping, resource-aware placement, and a
 provider-neutral inventory spanning runtimes such as Ollama and LM Studio.
 
-> **Status:** Pre-release implementation. The controller remains loopback-only.
+> **Status:** Pre-release · **NO-SHIP**. The controller remains loopback-only.
 > Authentication, pairing, authenticated agent transport, inventory, lifecycle
 > policy, inference routing, artifact handling, recovery, and release-audit
 > foundations are implemented and tested; native-host qualification, release
 > signing, and publication are not complete.
+>
+> No platform is production-supported or publication-ready. Source build, unsigned
+> packaging, and install/upgrade foundations exist for Linux and Windows; macOS
+> native qualification is absent. This is source/qualification-stage review, not a
+> support claim — see the [Alpha support and qualification matrix](docs/operations/alpha-support-matrix.md).
 
 Installation and upgrade packaging foundations are documented in [docs/operations/installation-and-upgrades.md](docs/operations/installation-and-upgrades.md). First-run trust, pairing, certificate recovery, backup, and redacted diagnostics are documented in [docs/operations/operator-console.md](docs/operations/operator-console.md).
 

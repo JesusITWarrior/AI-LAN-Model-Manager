@@ -1,6 +1,6 @@
 import test from"node:test";
 import assert from"node:assert/strict";
-import{readFileSync}from"node:fs";
+import{readFileSync,existsSync}from"node:fs";
 import{fileURLToPath}from"node:url";
 import{resolve}from"node:path";
 import{evaluateReleaseAudit,REQUIRED_DOCS,REQUIRED_GATES,REQUIRED_SCRIPT_FILES,REQUIRED_TEST_FILES}from"../audit.js";
@@ -214,5 +214,152 @@ test("alpha-qualification report is a current-status, non-unit report", () => {
     ["continued Alpha review is at `3e131b1`", "provide PowerShell 7.2 on the Windows qualification host"],
     [alphaDoc],
     "stale current-review and closure sentences",
+  );
+});
+
+// ---- Public Alpha support matrix regression ----
+
+const matrixDocName = "docs/operations/alpha-support-matrix.md";
+const matrixDoc = doc(matrixDocName);
+
+// The public support matrix must not misrepresent platform status. It encodes a
+// strict source-vs-support split, keeps all three platform boundaries, records the
+// macOS owner-decision-pending state, and references the major release gates.
+test("public alpha support matrix encodes NO-SHIP and source-vs-support split", () => {
+  // NO-SHIP present, and explicit source-vs-support distinction.
+  mustContain(["NO-SHIP"], [matrixDoc], "alpha support matrix");
+  mustContain(["Source-stage review"], [matrixDoc], "alpha support matrix");
+
+  // All three platform boundaries present.
+  mustContain(["**Linux**", "**Windows**", "**macOS**"], [matrixDoc], "alpha support matrix platform boundaries");
+
+  // macOS inclusion/exclusion semantics: corrected wording, not the malformed
+  // "enters ... by explicit exclusion" which reverses exclusion meaning.
+  mustContain(
+    ["included in the first Alpha only after native qualification",
+     "explicitly excluded from the first Alpha by owner decision"],
+    [matrixDoc],
+    "alpha support matrix macOS inclusion/exclusion semantics"
+  );
+
+  // Major release gates referenced.
+  mustContain(
+    ["Exact-same-commit packaged Alpha 1 and Alpha 2 native gates",
+     "macOS native qualification, or explicit first-Alpha exclusion",
+     "Deterministic unsigned RC / SBOM / checksums / provenance rerun",
+     "Current release gates"],
+    [matrixDoc],
+    "alpha support matrix release gates"
+  );
+
+  // The following misleading statuses must NOT be present: all three platforms
+  // qualified/supported, macOS qualified, or any platform production-ready.
+  // Markers are chosen to fire only on *affirmative* claims (never on correct
+  // "not X"/"NO-SHIP" negations), matching the matrix as written.
+  mustNotContain(
+    [
+      "are all three platforms",
+      "all three platforms are qualified",
+      "all three platforms are supported",
+      "macOS Alpha support is qualified",
+      "macOS is qualified",
+      "are all three platforms qualified",
+      "is production-ready",
+    ],
+    [matrixDoc],
+    "alpha support matrix must not claim platform qualification/support"
+  );
+
+  // The malformed exclusion-reversal phrase must NOT be present.
+  mustNotContain(
+    [
+      "enters the first Alpha by explicit exclusion",
+      "by explicit exclusion, or is included",
+      "first-Alpha inclusion versus explicit exclusion",
+    ],
+    [matrixDoc],
+    "alpha support matrix must not reverse macOS exclusion semantics"
+  );
+});
+
+// ---- Public alpha support matrix link resolution regression ----
+
+const matrixDir = resolve(DOC_BASE, "docs", "operations");
+// Markdown link hrefs only (text inside [...] is not matched; only href inside (...)).
+const matrixLinkRegex = /\]\(([^)^\s]+)\)/g;
+
+test("public alpha support matrix links resolve to existing same-directory docs", () => {
+  // b) Extract every markdown link href from the matrix.
+  const hrefs = [...matrixDoc.matchAll(matrixLinkRegex)].map(m => m[1]);
+
+  // c) Both documented link targets must appear as hrefs.
+  assert.ok(
+    hrefs.includes("alpha-qualification-report.md"),
+    "matrix must link alpha-qualification-report.md (same directory)"
+  );
+  assert.ok(
+    hrefs.includes("installation-and-upgrades.md"),
+    "matrix must link installation-and-upgrades.md (same directory)"
+  );
+
+  // The links must not use a broken ../ escape: both targets live in the same
+  // directory (docs/operations/), so no parent-directory traversal is allowed.
+  assert.ok(
+    !hrefs.some(h => h.startsWith("../")),
+    "matrix must not use ../ escaped links; targets live in the same directory"
+  );
+
+  // d) Resolve each relative to the matrix document's directory and assert it exists.
+  for (const target of ["alpha-qualification-report.md", "installation-and-upgrades.md"]) {
+    const resolved = resolve(matrixDir, target);
+    assert.ok(existsSync(resolved), `${target} resolves to an existing file relative to docs/operations/`);
+  }
+
+  // e) Re-verify all prior positive markers after the link correction.
+  mustContain(["NO-SHIP"], [matrixDoc], "alpha support matrix");
+  mustContain(["Source-stage review"], [matrixDoc], "alpha support matrix");
+  mustContain(["**Linux**", "**Windows**", "**macOS**"], [matrixDoc], "alpha support matrix platform boundaries");
+
+  // macOS inclusion/exclusion semantics: corrected wording, not the malformed
+  // "enters ... by explicit exclusion" which reverses exclusion meaning.
+  mustContain(
+    ["included in the first Alpha only after native qualification",
+     "explicitly excluded from the first Alpha by owner decision"],
+    [matrixDoc],
+    "alpha support matrix macOS inclusion/exclusion semantics"
+  );
+  mustContain(
+    ["Exact-same-commit packaged Alpha 1 and Alpha 2 native gates",
+     "macOS native qualification, or explicit first-Alpha exclusion",
+     "Deterministic unsigned RC / SBOM / checksums / provenance rerun",
+     "Current release gates"],
+    [matrixDoc],
+    "alpha support matrix release gates"
+  );
+
+  // f) Re-verify all prior negative markers still reject misleading claims.
+  mustNotContain(
+    [
+      "are all three platforms",
+      "all three platforms are qualified",
+      "all three platforms are supported",
+      "macOS Alpha support is qualified",
+      "macOS is qualified",
+      "are all three platforms qualified",
+      "is production-ready",
+    ],
+    [matrixDoc],
+    "alpha support matrix must not claim platform qualification/support"
+  );
+
+  // The malformed exclusion-reversal phrase must NOT be present.
+  mustNotContain(
+    [
+      "enters the first Alpha by explicit exclusion",
+      "by explicit exclusion, or is included",
+      "first-Alpha inclusion versus explicit exclusion",
+    ],
+    [matrixDoc],
+    "alpha support matrix must not reverse macOS exclusion semantics"
   );
 });
