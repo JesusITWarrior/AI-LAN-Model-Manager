@@ -143,6 +143,13 @@ test("threat model documents owner evidence as untrusted ingress",()=>{
   );
 });
 
+test("operator console does not strand a newline before the prepare sentence", () => {
+  // Stray newline-period form must NOT be present: `**Prepare**` must be followed
+  // on the same paragraph by `. Preparation`, never split across two paragraphs.
+  mustNotContain(["**Prepare**\n. Preparation"], [operatorConsoleDoc],
+    "operator-console.md must not contain a newline before the prepare sentence");
+});
+
 // ---- Alpha-qualification report regression ----
 
 const alphaDocName = "docs/operations/alpha-qualification-report.md";
@@ -361,5 +368,82 @@ test("public alpha support matrix links resolve to existing same-directory docs"
     ],
     [matrixDoc],
     "alpha support matrix must not reverse macOS exclusion semantics"
+  );
+});
+
+// ---- Operator console consumer-journey regression ----
+
+const operatorConsoleDocName = "docs/operations/operator-console.md";
+const operatorConsoleDoc = doc(operatorConsoleDocName);
+
+// The operator console must present a truthful consumer journey for an unsigned
+// internal Alpha: topology/current status, install+first start linking the
+// existing guide, pairing/revoke/re-enroll, loopback inference client config with
+// a separate bearer (no management-cookie reuse), backup/restore boundaries,
+// bounded troubleshooting linking enrollment-diagnosis.md, and a known-limits /
+// NO-SHIP section linking alpha-support-matrix.md. It must NOT claim any platform
+// is production-ready or that port 7341 serves inference.
+test("operator console presents an honest consumer journey and NO-SHIP limits", () => {
+  // Topology / current-status section present.
+  mustContain(
+    ["Topology / current status"],
+    [operatorConsoleDoc],
+    "operator console topology/current-status"
+  );
+
+  // Install + first start point at the existing guide; nothing invented.
+  mustContain(
+    ["installation-and-upgrades.md"],
+    [operatorConsoleDoc],
+    "operator console install-first-start link"
+  );
+
+  // Pairing / revoke / re-enroll content preserved.
+  mustContain(
+    ["Pair and enroll a host", "Rename, revoke, and re-enroll"],
+    [operatorConsoleDoc],
+    "operator console pairing/revoke/re-enroll"
+  );
+
+  // Inference client configured via loopback URL with a separate bearer token.
+  mustContain(
+    ["http://127.0.0.1:7340/v1"],
+    [operatorConsoleDoc],
+    "operator console inference-client loopback URL"
+  );
+
+  // Backup / restore boundary preserved.
+  mustContain(
+    ["Backup and restore"],
+    [operatorConsoleDoc],
+    "operator console backup/restore boundary"
+  );
+
+  // Troubleshooting links to enrollment-diagnosis.md.
+  mustContain(
+    ["enrollment-diagnosis.md"],
+    [operatorConsoleDoc],
+    "operator console troubleshooting link"
+  );
+
+  // Known-limits / NO-SHIP section linking alpha-support-matrix.md.
+  mustContain(
+    ["Known limits / qualification", "alpha-support-matrix.md"],
+    [operatorConsoleDoc],
+    "operator console known-limits / alpha-matrix link"
+  );
+
+  // Negative / misleading claims must NOT be present (affirmative only, never
+  // the honest "not X" / "NO-SHIP" negations).
+  mustNotContain(
+    [
+      "is production-ready",
+      "serving inference on port 7341",
+      "binds a second listener on port 7341",
+      "management cookie",
+      "reuse the management",
+    ],
+    [operatorConsoleDoc],
+    "operator console must not claim production-ready / second 7341 listener / management-cookie reuse"
   );
 });
