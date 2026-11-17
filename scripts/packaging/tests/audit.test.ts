@@ -168,24 +168,53 @@ test("alpha-qualification report is a current-status, non-unit report", () => {
   // Truthful negated historical markers REQUIRE present; these describe what executed
   // at the September checkpoint, never at the current HEAD.
   mustContain(
-    ["was **not** rerun at later commits", "did not execute at e6695cb"],
+    ["was **not** rerun at later commits", "did not execute at `f7e40ae3a365459ddf0dc5264a3f1155b34b2a5c`"],
     [alphaDoc],
     "alpha-qualification report historical separation",
   );
   // Only positive current-execution claims are rejected (never the honest "not" markers).
   mustNotContain(
-    ["was rerun", "rebuilt at e6695cb"],
+    ["was rerun", "rebuilt at f7e40ae3a365459ddf0dc5264a3f1155b34b2a5c"],
     [alphaDoc],
     "alpha-qualification report positive-execution claims",
   );
 
-  // Requirement 3: current accepted source checkpoint named exactly (baseline before this update).
+  // Requirement 3: current accepted source checkpoint named exactly (f7e40ae3a365459ddf0dc5264a3f1155b34b2a5c).
   mustContain(
-    ["e6695cb0cfefea24269add6401f95490017d1200"],
+    ["f7e40ae3a365459ddf0dc5264a3f1155b34b2a5c"],
     [alphaDoc],
     "alpha-qualification report",
   );
   mustContain(["Current accepted source checkpoint"], [alphaDoc], "alpha-qualification report");
+
+  // Requirement 3b: current checkpoint evidence numbers (source only, not package/native qualification).
+  // Focused owner-documentation regression 14/14; supply-chain 38 pass / 0 fail / 1 intentional Windows native-fixture skip; Fedora 10/10; full suite 1060/1060.
+  mustContain(["14/14"], [alphaDoc], "alpha-qualification report focused audit");
+  mustContain(["38 (pass)"], [alphaDoc], "alpha-qualification report supply-chain");
+  mustContain(["0 fail"], [alphaDoc], "alpha-qualification report supply-chain");
+  mustContain(["intentional Windows native-fixture skip"], [alphaDoc], "alpha-qualification report");
+  mustContain(["Fedora 10/10"], [alphaDoc], "alpha-qualification report");
+  mustContain(["1060/1060"], [alphaDoc], "alpha-qualification report");
+  // The report must link the current related documents.
+  mustContain(["operator-console.md"], [alphaDoc], "alpha-qualification report operator-console link");
+  mustContain(["[alpha-support-matrix.md](alpha-support-matrix.md)"], [alphaDoc], "alpha-qualification report support-matrix link");
+  mustNotContain(
+    ["[alpha-support-matrix.md](alpha-qualification-report.md)"],
+    [alphaDoc],
+    "alpha-qualification report must not self-link as the support matrix",
+  );
+  // Reject affirmative current package/native/signing/publication claims; NO-SHIP must remain.
+  mustNotContain(
+    ["is production-ready", "native service qualification performed", "signed as a release"],
+    [alphaDoc],
+    "alpha-qualification report must not affirmatively claim native/package/signing/publication",
+  );
+  // Stale current-checkpoint reference (e6695cb) must be rejected.
+  mustNotContain(
+    ["e6695cb0cfefea24269add6401f95490017d1200", "at e6695cb"],
+    [alphaDoc],
+    "alpha-qualification report must not reference stale e6695cb current checkpoint",
+  );
 
   // Requirement 4: explicit source-vs-ship verdict split.
   mustContain(["Source test-stage"], [alphaDoc], "alpha-qualification report verdict");

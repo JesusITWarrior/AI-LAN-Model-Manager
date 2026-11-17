@@ -10,7 +10,7 @@
 
 ## Historical qualification snapshot (September checkpoint `3e131b1`)
 
-> Preserved as historical evidence. The September 2026 qualification below was performed **only** at commit `3e131b1` and was **not** rerun at later commits. Every figure that follows describes what was executed at the September host; the counts are **not** current-commit evidence and do not establish anything at `e6695cb`.
+> Preserved as historical evidence. The September 2026 qualification below was performed **only** at commit `3e131b1` and was **not** rerun at later commits. Every figure that follows describes what was executed at the September host; the counts are **not** current-commit evidence and do not establish anything at the current checkpoint.
 
 **Verdict (September checkpoint `3e131b1`):** **NO-SHIP**
 
@@ -32,25 +32,32 @@ The implementation had strong loopback, cross-language, packaging, recovery, and
 - Post-repair full gate: `make check` pass; `release-readiness:ok`.
 - **Historical blocker (September host only):** Windows PowerShell 7.2 (`pwsh`) was unavailable on the September Windows qualification host; the script's declared `#Requires -Version 7.2` could not be satisfied. This is a September-host limitation, not a confirmed project boundary at later commits.
 
-## Current accepted source checkpoint (`e6695cb`)
+## Current accepted source checkpoint (`f7e40ae3a365459ddf0dc5264a3f1155b34b2a5c`)
 
-The source tree at `e6695cb0cfefea24269add6401f95490017d1200` was accepted as the exact evidence baseline before this documentation update — this documentation source line corrects only the documentation slice and does not re-qualify the build. At this exact accepted baseline the following build/source/release-gate evidence holds (source only — **not** package or native qualification):
+The source tree at `f7e40ae3a365459ddf0dc5264a3f1155b34b2a5c` (`docs(alpha): complete operator console journey`) is the **current** exact source checkpoint. This report was produced at that commit and records only the build/source/release-gate evidence that actually holds at that source tree; it does **not** requalify or rerun any native, package, lifecycle, signing, or macOS work. At this exact accepted checkpoint the following evidence holds (source only — **not** package or native qualification):
 
 - Repository build passed (`npm run build`).
-- Focused owner-documentation regression (`scripts/packaging/tests/audit.test.ts`) passed 9/9.
-- Supply-chain checks passed 33 (one intentional skip) plus Fedora 10/10 (`npm run supply-chain`).
+- Focused owner-documentation regression (`scripts/packaging/tests/audit.test.ts`) passed 14/14.
+- Supply-chain checks passed 38 (pass), 0 fail, 1 intentional Windows native-fixture skip (`npm run supply-chain`); Fedora 10/10.
 - Release audit `release-readiness:ok` via `node scripts/packaging/audit.js . --allow-dirty --run-gates`.
-- Serial full repository suite reported 1060/1060 (from prior sibling runs at this same commit; see **Limits**).
-- Remote equality prior to this documentation update: HEAD equaled `origin/main` equaled `e6695cb`, with a clean tracked worktree, and `git diff --check` clean.
+- Serial full repository suite reported 1060/1060 at this commit.
+- Remote equality prior to this report update: HEAD equaled `origin/main` equaled `f7e40ae3a365459ddf0dc5264a3f1155b34b2a5c`, with a clean tracked worktree, and `git diff --check` clean.
 
-This section attests only that the source tree builds and passes source/build/release-gate tests at `e6695cb`. It does **not** establish package, native, lifecycle, signing, or macOS qualification.
+This section attests only that the source tree builds and passes build/source/release-gate tests at `f7e40ae3a365459ddf0dc5264a3f1155b34b2a5c`. It does **not** establish package, native, lifecycle, signing, or macOS qualification.
 
-**Explicitly not claimed at `e6695cb`:** no clean reproducible package double-build, no native service qualification, no two-host lifecycle/inference/transfer drill, no macOS native qualification or explicit first-Alpha exclusion, no signing, no publication, and no deployment were performed at this commit.
+**Explicitly not claimed at `f7e40ae3a365459ddf0dc5264a3f1155b34b2a5c`:** no clean reproducible package double-build, no native service qualification, no two-host lifecycle/inference/transfer drill, no macOS native qualification or explicit first-Alpha exclusion, no signing, no publication, and no deployment were performed at this commit.
+
+## Related current documentation
+
+- [operator-console.md](operator-console.md) — current operator console journey (source/loopback status, install + first start, pairing, bounded troubleshooting, known-limits / NO-SHIP).
+- [alpha-support-matrix.md](alpha-support-matrix.md) — public source-stage support/qualification matrix (NO-SHIP, source-vs-support split, all three platform boundaries, macOS owner-decision-pending).
+
+Both link back to this report. They are current documentation only: any later **native** evidence can require another documentation refresh, and Phase 18.38 / owner go/no-go remains open (see *Current release-closure conditions*).
 
 ## Verdict
 
-- **Source test-stage:** suitable for continued bounded Alpha review at `e6695cb`, subject to the exact limits stated above (build/source/release-gate evidence only; no package/native lifecycle claim).
-- **Ship/release:** **NO-SHIP.** Do not publish or install this Alpha as a production release at `e6695cb`.
+- **Source test-stage:** suitable for continued bounded Alpha review at `f7e40ae3a365459ddf0dc5264a3f1155b34b2a5c`, subject to the exact limits stated above (build/source/release-gate evidence only; no package/native lifecycle claim).
+- **Ship/release:** **NO-SHIP.** Do not publish or install this Alpha as a production release at `f7e40ae3a365459ddf0dc5264a3f1155b34b2a5c`.
 
 ## Hosts and tools
 
@@ -122,7 +129,7 @@ All changes below were independently reviewed and committed at `3e131b115c336aea
 
 ## Exact command/result summary — historical September checkpoint (`3e131b1`)
 
-All September command/result figures for the `3e131b1` checkpoint are recorded in the **Historical qualification snapshot** section above and did not execute at e6695cb; they describe only the September checkpoint, not any current-commit evidence. The `e6695cb` build/source/release-gate figures are recorded in the **Current accepted source checkpoint** section.
+All September command/result figures for the `3e131b1` checkpoint are recorded in the **Historical qualification snapshot** section above and did not execute at `f7e40ae3a365459ddf0dc5264a3f1155b34b2a5c`; they describe only the September checkpoint, not any current-commit evidence. The `f7e40ae3a365459ddf0dc5264a3f1155b34b2a5c` build/source/release-gate figures are recorded in the **Current accepted source checkpoint** section.
 
 ## Named skips and blockers
 
@@ -144,7 +151,7 @@ All September command/result figures for the `3e131b1` checkpoint are recorded i
 
 ## Current release-closure conditions (retain all)
 
-Release closure at `e6695cb` (or any later release candidate) retains every minimum condition below. None is closed by this documentation source line; each requires evidence generated at the eventual release candidate.
+Release closure at `f7e40ae3a365459ddf0dc5264a3f1155b34b2a5c` (or any later release candidate) retains every minimum condition below. None is closed by this documentation source line; each requires evidence generated at the eventual release candidate.
 
 1. **Exact-same-commit packaged Alpha 1 and Alpha 2 native gates.** Reproducible clean-source double-build at the exact same commit; Alpha 1 and Alpha 2 native packages built and passed at that commit (`Hat Trick`/`JarJar`).
 2. **Current Windows SCM / service / ACL / reconnect / upgrade evidence.** Live Windows SCM query, ACL application, service health activation, reconnect, and clean-install/upgrade evidence at the current commit.
@@ -157,4 +164,4 @@ Release closure at `e6695cb` (or any later release candidate) retains every mini
 
 ## Ship decision
 
-**NO-SHIP.** Do not publish or install this Alpha as a production release. The September repairs and clean-source reproducibility condition remain closed as historical evidence. At the current source line, release closure must instead retain all minimum conditions enumerated under **Current release-closure conditions (retain all)**; the single PowerShell-7.2 boundary recorded for the September checkpoint is not, by itself, the project boundary at `e6695cb`.
+**NO-SHIP.** Do not publish or install this Alpha as a production release. The September repairs and clean-source reproducibility condition remain closed as historical evidence. At the current source line, release closure must instead retain all minimum conditions enumerated under **Current release-closure conditions (retain all)**; the single PowerShell-7.2 boundary recorded for the September checkpoint is not, by itself, the project boundary at `f7e40ae3a365459ddf0dc5264a3f1155b34b2a5c`.
