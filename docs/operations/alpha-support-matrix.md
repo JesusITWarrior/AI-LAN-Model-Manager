@@ -21,6 +21,8 @@ The deterministic, unsigned Linux/Windows packaging and installation/upgrade
 foundations these platforms build on are documented in
 [docs/operations/installation-and-upgrades.md](installation-and-upgrades.md).
 
+At the exact current checkpoint `8a3fc510f7a3b9ccb86dc9d090dfc4aaad978461`, the unsigned reproducibility/dependency evidence gate is **COMPLETE**: two clean trees produced deterministic seven-package outputs, with an 84-component SBOM, six unsigned provenance statements, 14/14 checksum validations, and npm production audit at 0 vulnerabilities. This does not close any native, signing, publication, macOS, installation-recommendation, or owner go/no-go gate.
+
 ---
 
 ## Platform overview
@@ -93,9 +95,13 @@ retains **every** minimum condition below. None is closed by this document; each
 requires evidence generated at the eventual release candidate, restated exactly
 from the current qualification report:
 
-1. **Exact-same-commit packaged Alpha 1 and Alpha 2 native gates.** Reproducible
-   clean-source double-build at the exact same commit; Alpha 1 and Alpha 2
-   native packages built and passed at that commit (`Hat Trick`/`JarJar`).
+1. **Exact-same-commit packaged Alpha 1 and Alpha 2 native gates — OPEN.**
+   **Unsigned reproducibility/dependency evidence is COMPLETE at the current
+   checkpoint.** Two clean trees produced deterministic seven-package unsigned
+   outputs, with the 84-component SBOM, six unsigned provenance statements,
+   14/14 checksum validations, and npm production audit at 0 vulnerabilities.
+   The exact-same-commit packaged Alpha 1 and Alpha 2 native gates at
+   `Hat Trick`/`JarJar` remain open; no native service lifecycle is claimed.
 2. **Current Windows SCM / service / ACL / reconnect / upgrade evidence.** Live
    Windows SCM query, ACL application, service health activation, reconnect, and
    clean-install/upgrade evidence at the current commit.

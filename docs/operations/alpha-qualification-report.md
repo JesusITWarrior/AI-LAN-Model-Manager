@@ -32,20 +32,34 @@ The implementation had strong loopback, cross-language, packaging, recovery, and
 - Post-repair full gate: `make check` pass; `release-readiness:ok`.
 - **Historical blocker (September host only):** Windows PowerShell 7.2 (`pwsh`) was unavailable on the September Windows qualification host; the script's declared `#Requires -Version 7.2` could not be satisfied. This is a September-host limitation, not a confirmed project boundary at later commits.
 
-## Current accepted source checkpoint (`f7e40ae3a365459ddf0dc5264a3f1155b34b2a5c`)
+## Current accepted source checkpoint (`8a3fc510f7a3b9ccb86dc9d090dfc4aaad978461`)
 
-The source tree at `f7e40ae3a365459ddf0dc5264a3f1155b34b2a5c` (`docs(alpha): complete operator console journey`) is the **current** exact source checkpoint. This report was produced at that commit and records only the build/source/release-gate evidence that actually holds at that source tree; it does **not** requalify or rerun any native, package, lifecycle, signing, or macOS work. At this exact accepted checkpoint the following evidence holds (source only — **not** package or native qualification):
+The current accepted checkpoint is exactly `8a3fc510f7a3b9ccb86dc9d090dfc4aaad978461`. The September checkpoint above remains historical evidence and is not current proof. This section records only evidence actually established at the current checkpoint; it does not claim native service, lifecycle, model, macOS, signing, publication, deployment, installation recommendation, or owner go/no-go evidence.
 
-- Repository build passed (`npm run build`).
-- Focused owner-documentation regression (`scripts/packaging/tests/audit.test.ts`) passed 14/14.
-- Supply-chain checks passed 38 (pass), 0 fail, 1 intentional Windows native-fixture skip (`npm run supply-chain`); Fedora 10/10.
-- Release audit `release-readiness:ok` via `node scripts/packaging/audit.js . --allow-dirty --run-gates`.
-- Serial full repository suite reported 1060/1060 at this commit.
-- Remote equality prior to this report update: HEAD equaled `origin/main` equaled `f7e40ae3a365459ddf0dc5264a3f1155b34b2a5c`, with a clean tracked worktree, and `git diff --check` clean.
+### Current source and dependency gates
 
-This section attests only that the source tree builds and passes build/source/release-gate tests at `f7e40ae3a365459ddf0dc5264a3f1155b34b2a5c`. It does **not** establish package, native, lifecycle, signing, or macOS qualification.
+At the current checkpoint:
 
-**Explicitly not claimed at `f7e40ae3a365459ddf0dc5264a3f1155b34b2a5c`:** no clean reproducible package double-build, no native service qualification, no two-host lifecycle/inference/transfer drill, no macOS native qualification or explicit first-Alpha exclusion, no signing, no publication, and no deployment were performed at this commit.
+- The local full suite reported **1060/1060**.
+- The repository build, installer aggregate, `release-readiness`, and whitespace gates passed.
+- The focused owner-documentation audit passed **16/16**.
+- The source/dependency supply-chain gate reported **40 (pass)**, **0 fail**, and **1 expected platform skip**; Fedora **10/10** (Fedora 10/10).
+- `npm run supply-chain` passed its applicable source/dependency checks.
+- `npm audit --omit=dev --audit-level=high` reported **0 vulnerabilities**.
+
+### Current JarJar clean-clone and unsigned artifact evidence
+
+JarJar's clean-clone evidence is limited to disposable, non-mutating qualification work. Go **1.24.13** was used only through a temporary (`TEMP`-only) tool setup. Windows installer tests passed **15/15**. The Fedora-on-Windows run had **1 pass** and **9 honest Linux-only skips**; the skips were not converted into passes, and no live host, service, SCM, ACL, firewall, registry, or other system state was mutated.
+
+Two independent clean trees produced deterministic **seven-package unsigned** outputs. The associated evidence includes an **84-component SBOM**, **six unsigned provenance statements**, and **14/14 checksum validations**. These are dependency/reproducibility and unsigned-artifact evidence only; they do not establish release signing or shipment readiness.
+
+The current source-gate record is **not** package or native qualification. For historical separation, the earlier source-only record had **no clean reproducible package double-build**, **no native service qualification**, and **no two-host lifecycle/inference/transfer drill** at that earlier checkpoint; the current JarJar evidence above is the separately bounded unsigned dependency/reproducibility result and does not change those limits.
+
+### Current limits and verdict
+
+Current evidence does **not** claim native service lifecycle, SCM/ACL/reconnect, real model lifecycle/inference/transfer, macOS qualification, signing, publication, deployment, an installation recommendation, or an owner go/no-go. The current qualification state remains **NO-SHIP**.
+
+The September evidence did not execute at `f7e40ae3a365459ddf0dc5264a3f1155b34b2a5c`; that older checkpoint is historical context only, not current proof.
 
 ## Related current documentation
 
@@ -56,8 +70,8 @@ Both link back to this report. They are current documentation only: any later **
 
 ## Verdict
 
-- **Source test-stage:** suitable for continued bounded Alpha review at `f7e40ae3a365459ddf0dc5264a3f1155b34b2a5c`, subject to the exact limits stated above (build/source/release-gate evidence only; no package/native lifecycle claim).
-- **Ship/release:** **NO-SHIP.** Do not publish or install this Alpha as a production release at `f7e40ae3a365459ddf0dc5264a3f1155b34b2a5c`.
+- **Source test-stage:** suitable for continued bounded Alpha review at `8a3fc510f7a3b9ccb86dc9d090dfc4aaad978461`, subject to the exact limits stated above (build/source/release-gate evidence only; no package/native lifecycle claim).
+- **Ship/release:** **NO-SHIP.** Do not publish or install this Alpha as a production release at `8a3fc510f7a3b9ccb86dc9d090dfc4aaad978461`.
 
 ## Hosts and tools
 
@@ -129,7 +143,7 @@ All changes below were independently reviewed and committed at `3e131b115c336aea
 
 ## Exact command/result summary — historical September checkpoint (`3e131b1`)
 
-All September command/result figures for the `3e131b1` checkpoint are recorded in the **Historical qualification snapshot** section above and did not execute at `f7e40ae3a365459ddf0dc5264a3f1155b34b2a5c`; they describe only the September checkpoint, not any current-commit evidence. The `f7e40ae3a365459ddf0dc5264a3f1155b34b2a5c` build/source/release-gate figures are recorded in the **Current accepted source checkpoint** section.
+All September command/result figures for the `3e131b1` checkpoint are recorded in the **Historical qualification snapshot** section above and did not execute at `8a3fc510f7a3b9ccb86dc9d090dfc4aaad978461`; they describe only the September checkpoint, not any current-commit evidence. The `8a3fc510f7a3b9ccb86dc9d090dfc4aaad978461` build/source/release-gate figures are recorded in the **Current accepted source checkpoint** section.
 
 ## Named skips and blockers
 
@@ -151,7 +165,7 @@ All September command/result figures for the `3e131b1` checkpoint are recorded i
 
 ## Current release-closure conditions (retain all)
 
-Release closure at `f7e40ae3a365459ddf0dc5264a3f1155b34b2a5c` (or any later release candidate) retains every minimum condition below. None is closed by this documentation source line; each requires evidence generated at the eventual release candidate.
+Release closure at `8a3fc510f7a3b9ccb86dc9d090dfc4aaad978461` (or any later release candidate) retains every minimum condition below. None is closed by this documentation source line; each requires evidence generated at the eventual release candidate.
 
 1. **Exact-same-commit packaged Alpha 1 and Alpha 2 native gates.** Reproducible clean-source double-build at the exact same commit; Alpha 1 and Alpha 2 native packages built and passed at that commit (`Hat Trick`/`JarJar`).
 2. **Current Windows SCM / service / ACL / reconnect / upgrade evidence.** Live Windows SCM query, ACL application, service health activation, reconnect, and clean-install/upgrade evidence at the current commit.
@@ -164,4 +178,4 @@ Release closure at `f7e40ae3a365459ddf0dc5264a3f1155b34b2a5c` (or any later rele
 
 ## Ship decision
 
-**NO-SHIP.** Do not publish or install this Alpha as a production release. The September repairs and clean-source reproducibility condition remain closed as historical evidence. At the current source line, release closure must instead retain all minimum conditions enumerated under **Current release-closure conditions (retain all)**; the single PowerShell-7.2 boundary recorded for the September checkpoint is not, by itself, the project boundary at `f7e40ae3a365459ddf0dc5264a3f1155b34b2a5c`.
+**NO-SHIP.** Do not publish or install this Alpha as a production release. The September repairs and clean-source reproducibility condition remain closed as historical evidence. At the current source line, release closure must instead retain all minimum conditions enumerated under **Current release-closure conditions (retain all)**; the single PowerShell-7.2 boundary recorded for the September checkpoint is not, by itself, the project boundary at `8a3fc510f7a3b9ccb86dc9d090dfc4aaad978461`.

@@ -188,11 +188,11 @@ test("alpha-qualification report is a current-status, non-unit report", () => {
   mustContain(["Current accepted source checkpoint"], [alphaDoc], "alpha-qualification report");
 
   // Requirement 3b: current checkpoint evidence numbers (source only, not package/native qualification).
-  // Focused owner-documentation regression 14/14; supply-chain 38 pass / 0 fail / 1 intentional Windows native-fixture skip; Fedora 10/10; full suite 1060/1060.
-  mustContain(["14/14"], [alphaDoc], "alpha-qualification report focused audit");
-  mustContain(["38 (pass)"], [alphaDoc], "alpha-qualification report supply-chain");
+  // Focused owner-documentation regression 16/16; supply-chain 40 pass / 0 fail / 1 expected platform skip; Fedora 10/10; full suite 1060/1060.
+  mustContain(["16/16"], [alphaDoc], "alpha-qualification report focused audit");
+  mustContain(["40 (pass)"], [alphaDoc], "alpha-qualification report supply-chain");
   mustContain(["0 fail"], [alphaDoc], "alpha-qualification report supply-chain");
-  mustContain(["intentional Windows native-fixture skip"], [alphaDoc], "alpha-qualification report");
+  mustContain(["expected platform skip"], [alphaDoc], "alpha-qualification report");
   mustContain(["Fedora 10/10"], [alphaDoc], "alpha-qualification report");
   mustContain(["1060/1060"], [alphaDoc], "alpha-qualification report");
   // The report must link the current related documents.
