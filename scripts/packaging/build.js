@@ -1,6 +1,7 @@
 import {spawnSync} from "node:child_process";
 import {mkdir,readFile,readdir,rm,stat,writeFile} from "node:fs/promises";
 import {dirname,resolve} from "node:path";
+import * as path from "node:path";
 import {fileURLToPath,pathToFileURL} from "node:url";
 import {archiveName,binaryName,checksumManifest,createTarGz,orderedPlatforms,sanitizeTarget,sha256} from "./agents.js";
 import {packageInventory} from "./package-inventory.js";
@@ -8,7 +9,7 @@ import {createManifest} from "../install/core.js";
 
 const here=dirname(fileURLToPath(import.meta.url)),root=resolve(here,"../.."),moduleDir=resolve(root,"agents/host-agent"),templateDir=resolve(root,"scripts/install/templates");
 function targets(env){const raw=env.LAN_BUILD_TARGETS?.split(",").filter(Boolean)??orderedPlatforms().map(p=>`${p.os}-${p.arch}`);if(raw.length<1)throw new Error("ERR_BUILD_TARGETS");const unique=[...new Set(raw)];if(unique.some(t=>!sanitizeTarget(t)))throw new Error("ERR_BUILD_TARGETS");return unique.sort();}
-function contained(base,value){const prefix=resolve(base)+"/";return resolve(value).startsWith(prefix);}
+export function contained(base,value,api=path){const baseR=api.resolve(base),valueR=api.resolve(value);if(baseR===valueR)return false;return valueR.startsWith(`${baseR}${api.sep}`);}
 function run(command,args,options={}){const result=spawnSync(command,args,{...options,encoding:"utf8"});if(result.status!==0)throw new Error(options.error??"ERR_BUILD_COMMAND");return typeof result.stdout==="string"?result.stdout.trim():"";}
 function runGo(os,arch,out,version){run("go",["build","-trimpath","-buildvcs=false",`-ldflags=-s -w -X main.version=${version}`,"-o",out,"./cmd/lan-model-agent"],{cwd:moduleDir,stdio:"inherit",env:{...process.env,CGO_ENABLED:"0",GOOS:os,GOARCH:arch},error:"ERR_GO_BUILD"});}
 function sourceCommit(env){const dirty=run("git",["status","--porcelain","--untracked-files=all"],{cwd:root,error:"ERR_SOURCE_STATUS"});if(dirty&&env.LAN_ALLOW_DIRTY!=="1")throw new Error("ERR_DIRTY_SOURCE");const value=env.SOURCE_COMMIT??run("git",["rev-parse","HEAD"],{cwd:root,error:"ERR_SOURCE_COMMIT"});if(!/^[a-f0-9]{40}$/.test(value))throw new Error("ERR_SOURCE_COMMIT");return value;}

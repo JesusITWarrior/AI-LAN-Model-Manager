@@ -476,3 +476,48 @@ test("operator console presents an honest consumer journey and NO-SHIP limits", 
     "operator console must not claim production-ready / second 7341 listener / management-cookie reuse"
   );
 });
+
+
+// ---- Cross-platform output-path containment regression ----
+//
+// The production `contained(base, value, api = node:path)` helper (exported from
+// build.js) uses a fail-closed descendant test: `value` is contained only when
+// `api.resolve(value)` is strictly nested under `api.resolve(base)` using the same
+// path API. It takes an explicit `api` parameter (default native `node:path`) so
+// the same logic can be proven under both POSIX and Windows path semantics on a
+// single Linux runner. The helper is asserted directly here (rather than through
+// the full `buildPackages()` build, which invokes the Go toolchain and would
+// attempt an out-of-repo `rm`) so these are fast, mutation-free negative tests.
+//
+// Both `path.posix` and `path.win32` are invoked to prove the fix is
+// cross-platform, not merely true on this Linux host.
+test("package output path is a strict descendant under posix and win32 semantics",async()=>{const{contained}=await import("../build.js").then(m=>{if(typeof m.contained!="function")throw new Error("contained must be exported from build.js");return m;});const{posix,win32}=await import("node:path");const root=resolve(import.meta.dirname,"../../..");
+// Native default (node:path) is fail-closed for a strict child:
+assert.equal(contained(root,"artifacts/host-agent"),true);
+// posix: strict children accepted; root, parent escape, traversal, sibling-prefix rejected:
+assert.equal(contained(root,"artifacts",posix),true);
+assert.equal(contained(root,root,posix),false);
+assert.equal(contained(root,"..",posix),false);
+assert.equal(contained(root,"../outside",posix),false);
+assert.equal(contained(root,"../repo/target",posix),false);
+assert.equal(contained(posix.resolve(root,"artifacts"),posix.resolve(root,"artifacts-host"),posix),false);
+// posix cross-root input is not contained:
+assert.equal(contained(root,"/out",posix),false);
+// win32: same-drive descendant accepted; parent escape / cross-drive / sibling-prefix rejected:
+assert.equal(contained("C:\\\\repo","C:\\\\repo\\\\artifacts\\\\x",win32),true);
+assert.equal(contained("C:\\\\repo","C:\\\\..\\\\out",win32),false);
+assert.equal(contained("C:\\\\repo","D:\\\\out",win32),false);
+assert.equal(contained("C:\\\\repo","C:\\\\repo-evil",win32),false);
+});
+
+// buildPackages must reject any output path that is the repo root, escapes it, or is
+// only a sibling-prefix — before any Go build or filesystem mutation runs. All three
+// values resolve strictly outside the repo root, so each short-circuits with
+// ERR_OUTPUT_PATH before any rm()/Go/npm work runs.
+test("buildPackages rejects out-of-repo, repo-root, and sibling-prefix output paths before mutation",async()=>{const {buildPackages}=await import("../build.js").then(m=>{if(typeof m.buildPackages!="function")throw new Error("buildPackages must be exported from build.js");return m;});const root=resolve(import.meta.dirname,"../../..");
+for (const value of [".","..","../outside","../repo-evil"]) {
+  let message = "";
+  try { await buildPackages(value); } catch (e) { message = e instanceof Error ? e.message : String(e); }
+  assert.equal(message, "ERR_OUTPUT_PATH", `expected buildPackages(${JSON.stringify(value)}) to fail with ERR_OUTPUT_PATH`);
+}
+});
