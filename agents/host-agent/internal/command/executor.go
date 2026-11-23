@@ -10,6 +10,7 @@ import (
 	"io"
 	"os"
 	"path/filepath"
+	"reflect"
 	"regexp"
 	"strconv"
 	"sync"
@@ -22,6 +23,7 @@ var ErrCommand = errors.New("command rejected")
 // was rejected before the adapter ran. A non-empty returned Response retains
 // the known outcome, but must not be interpreted as durably persisted.
 var ErrReplayPersistence = errors.New("command replay persistence uncertain")
+var ErrReplayLookup = errors.New("invalid replay lookup")
 var identifier = regexp.MustCompile(`^[A-Za-z0-9][A-Za-z0-9._:-]{0,127}$`)
 var digestPattern = regexp.MustCompile(`^[a-f0-9]{64}$`)
 
@@ -62,6 +64,210 @@ type Adapter interface {
 type entry struct {
 	Digest   string   `json:"digest"`
 	Response Response `json:"response"`
+}
+
+// ReplayLookupState describes a side-effect-free replay lookup.
+type ReplayLookupState string
+
+const (
+	ReplayMissing   ReplayLookupState = "missing"
+	ReplayTerminal  ReplayLookupState = "terminal"
+	ReplayRunning   ReplayLookupState = "running"
+	ReplayDivergent ReplayLookupState = "divergent"
+	ReplayUncertain ReplayLookupState = "persistence-uncertain"
+)
+
+type ReplayLookup struct {
+	State          ReplayLookupState
+	Digest         string
+	Response       Response
+	PersistenceErr error
+}
+
+type cloneVisit struct {
+	typ reflect.Type
+	ptr uintptr
+}
+
+func cloneReflect(v reflect.Value, seen map[cloneVisit]bool) (reflect.Value, error) {
+	if !v.IsValid() {
+		return reflect.Value{}, nil
+	}
+	switch v.Kind() {
+	case reflect.Interface:
+		if v.IsNil() {
+			return reflect.Zero(v.Type()), nil
+		}
+		x, err := cloneReflect(v.Elem(), seen)
+		if err != nil {
+			return reflect.Value{}, err
+		}
+		out := reflect.New(v.Type()).Elem()
+		out.Set(x)
+		return out, nil
+	case reflect.Ptr:
+		if v.IsNil() {
+			return reflect.Zero(v.Type()), nil
+		}
+		key := cloneVisit{v.Type(), v.Pointer()}
+		if seen[key] {
+			return reflect.Value{}, ErrReplayLookup
+		}
+		seen[key] = true
+		x, err := cloneReflect(v.Elem(), seen)
+		if err != nil {
+			return reflect.Value{}, err
+		}
+		out := reflect.New(v.Type().Elem())
+		out.Elem().Set(x)
+		return out, nil
+	case reflect.Map:
+		if v.IsNil() {
+			return reflect.Zero(v.Type()), nil
+		}
+		key := cloneVisit{v.Type(), v.Pointer()}
+		if seen[key] {
+			return reflect.Value{}, ErrReplayLookup
+		}
+		seen[key] = true
+		out := reflect.MakeMapWithSize(v.Type(), v.Len())
+		it := v.MapRange()
+		for it.Next() {
+			k, err := cloneReflect(it.Key(), seen)
+			if err != nil {
+				return reflect.Value{}, err
+			}
+			x, err := cloneReflect(it.Value(), seen)
+			if err != nil {
+				return reflect.Value{}, err
+			}
+			out.SetMapIndex(k, x)
+		}
+		return out, nil
+	case reflect.Slice:
+		if v.IsNil() {
+			return reflect.Zero(v.Type()), nil
+		}
+		key := cloneVisit{v.Type(), v.Pointer()}
+		if seen[key] {
+			return reflect.Value{}, ErrReplayLookup
+		}
+		seen[key] = true
+		out := reflect.MakeSlice(v.Type(), v.Len(), v.Len())
+		for i := 0; i < v.Len(); i++ {
+			x, err := cloneReflect(v.Index(i), seen)
+			if err != nil {
+				return reflect.Value{}, err
+			}
+			out.Index(i).Set(x)
+		}
+		return out, nil
+	case reflect.Array:
+		out := reflect.New(v.Type()).Elem()
+		for i := 0; i < v.Len(); i++ {
+			x, err := cloneReflect(v.Index(i), seen)
+			if err != nil {
+				return reflect.Value{}, err
+			}
+			out.Index(i).Set(x)
+		}
+		return out, nil
+	case reflect.Struct:
+		out := reflect.New(v.Type()).Elem()
+		for i := 0; i < v.NumField(); i++ {
+			if v.Type().Field(i).PkgPath != "" {
+				return reflect.Value{}, ErrReplayLookup
+			}
+			x, err := cloneReflect(v.Field(i), seen)
+			if err != nil {
+				return reflect.Value{}, err
+			}
+			out.Field(i).Set(x)
+		}
+		return out, nil
+	case reflect.Func, reflect.Chan, reflect.UnsafePointer:
+		return reflect.Value{}, ErrReplayLookup
+	default:
+		return v, nil
+	}
+}
+func cloneValue(value any) (any, error) {
+	x, err := cloneReflect(reflect.ValueOf(value), make(map[cloneVisit]bool))
+	if err != nil {
+		return nil, err
+	}
+	if !x.IsValid() {
+		return nil, nil
+	}
+	return x.Interface(), nil
+}
+func detachedResponse(response Response) (Response, error) {
+	out := response
+	if response.Progress != nil {
+		x := *response.Progress
+		out.Progress = &x
+	}
+	if response.ErrorCode != nil {
+		x := *response.ErrorCode
+		out.ErrorCode = &x
+	}
+	var err error
+	out.Observation, err = cloneValue(response.Observation)
+	if err != nil {
+		return Response{}, err
+	}
+	return out, nil
+}
+
+// LookupReplay returns a detached replay binding snapshot without executing or persisting.
+func (e *Executor) LookupReplay(r Request) (ReplayLookup, error) {
+	if e == nil || r.HostID != e.hostID || !validLookupRequest(r) {
+		return ReplayLookup{}, ErrReplayLookup
+	}
+	digest, err := authorizationDigest(r)
+	if err != nil || r.Capability.RequestDigest != digest {
+		return ReplayLookup{}, ErrReplayLookup
+	}
+	e.mu.Lock()
+	defer e.mu.Unlock()
+	prior, found := e.seen[r.IdempotencyKey]
+	if !found {
+		return ReplayLookup{State: ReplayMissing}, nil
+	}
+	if prior.Digest != digest {
+		return ReplayLookup{State: ReplayDivergent, Digest: prior.Digest}, nil
+	}
+	response, err := detachedResponse(prior.Response)
+	if err != nil {
+		return ReplayLookup{}, err
+	}
+	result := ReplayLookup{Digest: prior.Digest, Response: response}
+	if e.persistenceErr != nil {
+		result.State, result.PersistenceErr = ReplayUncertain, e.persistenceErr
+		return result, nil
+	}
+	if response.Status == "running" {
+		result.State = ReplayRunning
+	} else {
+		result.State = ReplayTerminal
+	}
+	return result, nil
+}
+func validLookupRequest(r Request) bool {
+	policy, ok := allowed[r.Operation]
+	if r.Operation == StreamOperation {
+		policy, ok = "model-inference", true
+	}
+	if !ok || r.HostID == "" || !identifier.MatchString(r.RequestID) || !identifier.MatchString(r.JobID) || !identifier.MatchString(r.IdempotencyKey) || r.Sequence == 0 || r.Sequence > maxSafeInteger || r.Capability.Operation != policy || r.Capability.HostID != r.HostID || !identifier.MatchString(r.Capability.TargetKind) || !identifier.MatchString(r.Capability.TargetID) || !digestPattern.MatchString(r.Capability.RequestDigest) || !targetMatches(r) {
+		return false
+	}
+	if _, err := time.Parse(time.RFC3339Nano, r.Deadline); err != nil {
+		return false
+	}
+	if _, err := time.Parse(time.RFC3339Nano, r.Capability.ExpiresAt); err != nil {
+		return false
+	}
+	return true
 }
 
 const maxReplayEntries = 256

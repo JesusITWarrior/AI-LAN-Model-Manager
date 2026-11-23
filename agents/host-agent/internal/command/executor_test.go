@@ -185,3 +185,112 @@ func TestReplayStoreIsBoundedAndFailedPersistenceRetainsExecutedOutcome(t *testi
 		t.Fatalf("executed outcome was repeated: calls=%d", a.calls)
 	}
 }
+
+func TestLookupReplayStatesAndDetachedResponse(t *testing.T) {
+	e := New("host-1", &adapter{}, func() time.Time { return time.Date(2026, 9, 28, 8, 0, 0, 0, time.UTC) })
+	r := req()
+	if got, err := e.LookupReplay(r); err != nil || got.State != ReplayMissing {
+		t.Fatalf("missing = %#v, %v", got, err)
+	}
+	n := uint8(50)
+	code := "x"
+	nested := map[string]any{"items": []any{map[string]any{"n": &n}}}
+	e.seen[r.IdempotencyKey] = entry{Digest: r.Capability.RequestDigest, Response: Response{Status: "running", Observation: nested, Progress: &n, ErrorCode: &code}}
+	got, err := e.LookupReplay(r)
+	if err != nil || got.State != ReplayRunning {
+		t.Fatalf("running = %#v, %v", got, err)
+	}
+	got.Response.Progress = nil
+	got.Response.ErrorCode = nil
+	clonedPointer := got.Response.Observation.(map[string]any)["items"].([]any)[0].(map[string]any)["n"].(*uint8)
+	*clonedPointer = 0
+	if e.seen[r.IdempotencyKey].Response.Progress == nil || *e.seen[r.IdempotencyKey].Response.Progress != 50 {
+		t.Fatal("lookup leaked pointer state")
+	}
+	changed := r
+	changed.Params = json.RawMessage(`{"x":1}`)
+	changed.Capability.RequestDigest, _ = authorizationDigest(changed)
+	if got, err := e.LookupReplay(changed); err != nil || got.State != ReplayDivergent {
+		t.Fatalf("divergent = %#v, %v", got, err)
+	}
+	e.persistenceErr = ErrReplayPersistence
+	if got, err := e.LookupReplay(r); err != nil || got.State != ReplayUncertain || got.PersistenceErr != ErrReplayPersistence {
+		t.Fatalf("uncertain = %#v, %v", got, err)
+	}
+}
+
+func TestLookupReplayRejectsNilForeignMalformedAndForgedRequests(t *testing.T) {
+	e := New("host-1", &adapter{}, func() time.Time { return time.Date(2026, 9, 28, 8, 0, 0, 0, time.UTC) })
+	r := req()
+	for name, bad := range map[string]Request{
+		"foreign host": func() Request { x := r; x.HostID = "host-2"; return x }(),
+		"forged digest": func() Request {
+			x := r
+			x.Capability.RequestDigest = "0000000000000000000000000000000000000000000000000000000000000000"
+			return x
+		}(),
+		"malformed request id": func() Request { x := r; x.RequestID = "!"; return x }(),
+		"malformed deadline":   func() Request { x := r; x.Deadline = "bad"; return x }(),
+	} {
+		if got, err := e.LookupReplay(bad); !errors.Is(err, ErrReplayLookup) || got != (ReplayLookup{}) {
+			t.Fatalf("%s: got %#v err=%v", name, got, err)
+		}
+	}
+	var nilExecutor *Executor
+	if got, err := nilExecutor.LookupReplay(r); !errors.Is(err, ErrReplayLookup) || got != (ReplayLookup{}) {
+		t.Fatalf("nil: got %#v err=%v", got, err)
+	}
+}
+
+func TestLookupReplayPreservesPersistentFileAndTerminalState(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "command-replay.json")
+	now := func() time.Time { return time.Date(2026, 9, 28, 8, 0, 0, 0, time.UTC) }
+	a := &adapter{}
+	e, err := NewPersistent("host-1", a, now, path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	r := req()
+	if _, err = e.Execute(context.Background(), r); err != nil {
+		t.Fatal(err)
+	}
+	before, err := os.ReadFile(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	infoBefore, err := os.Stat(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	got, err := e.LookupReplay(r)
+	if err != nil || got.State != ReplayTerminal || a.calls != 1 {
+		t.Fatalf("lookup=%#v err=%v calls=%d", got, err, a.calls)
+	}
+	after, err := os.ReadFile(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	infoAfter, err := os.Stat(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if string(before) != string(after) || infoBefore.Size() != infoAfter.Size() || !infoBefore.ModTime().Equal(infoAfter.ModTime()) || infoBefore.Mode() != infoAfter.Mode() {
+		t.Fatalf("lookup changed replay file: bytes=%v/%v before=%v after=%v", len(before), len(after), infoBefore, infoAfter)
+	}
+}
+
+func TestConcurrentLookupAndExecuteDoNotDuplicate(t *testing.T) {
+	a := &adapter{}
+	e := New("host-1", a, func() time.Time { return time.Date(2026, 9, 28, 8, 0, 0, 0, time.UTC) })
+	r := req()
+	var wg sync.WaitGroup
+	wg.Add(2)
+	var executeErr, lookupErr error
+	var lookup ReplayLookup
+	go func() { defer wg.Done(); _, executeErr = e.Execute(context.Background(), r) }()
+	go func() { defer wg.Done(); lookup, lookupErr = e.LookupReplay(r) }()
+	wg.Wait()
+	if executeErr != nil || lookupErr != nil || (lookup.State != ReplayMissing && lookup.State != ReplayTerminal) || a.calls != 1 {
+		t.Fatalf("execute=%v lookup=%#v/%v calls=%d", executeErr, lookup, lookupErr, a.calls)
+	}
+}
