@@ -2,7 +2,9 @@ package fleet
 
 import (
 	"context"
+	"encoding/json"
 	"errors"
+	"reflect"
 	"time"
 
 	"github.com/JesusITWarrior/AI-LAN-Model-Manager/agents/host-agent/internal/command"
@@ -30,6 +32,7 @@ type CommandRunner struct {
 	persistenceUncertain   bool
 	activeStream           bool
 	activeDigest           string
+	heldRequest            *command.Request
 }
 
 func NewCommandRunner(executor *command.Executor, peerRelays ...*command.PeerRelay) (*CommandRunner, error) {
@@ -113,6 +116,7 @@ func (r *CommandRunner) Run(ctx context.Context, c *HTTPSClient) error {
 				}
 				r.activeJob, r.cancelActive, r.done, r.pending = "", nil, nil, nil
 				r.activeDeadline, r.reportedExpiredPending = time.Time{}, false
+				r.heldRequest = nil
 			} else if ctx.Err() != nil {
 				return nil
 			}
@@ -153,6 +157,11 @@ func (r *CommandRunner) Run(ctx context.Context, c *HTTPSClient) error {
 			r.activeStream = work.stream != nil
 			r.activeDigest = request.Capability.RequestDigest
 			r.activeJob, r.cancelActive, r.done = request.JobID, cancel, make(chan commandCompletion, 1)
+			// Detach the admitted request up front so a later heldSnapshot never
+			// aliases caller-mutable Params bytes or the ModelID pointer.
+			heldRequest := detachedRequestCopy(*request)
+			executionRequest := detachedRequestCopy(*request)
+			r.heldRequest = &heldRequest
 			r.event(DomainExecution, StageEntered)
 			go func(value command.Request, runCtx context.Context, client *HTTPSClient, executor *command.Executor, output chan<- commandCompletion) {
 				commandStage("EXECUTION_ENTERED", 0)
@@ -178,7 +187,7 @@ func (r *CommandRunner) Run(ctx context.Context, c *HTTPSClient) error {
 					result = command.Response{RequestID: value.RequestID, JobID: value.JobID, HostID: value.HostID, Sequence: value.Sequence, Status: "failed", ObservedAt: time.Now().UTC().Format("2006-01-02T15:04:05.000Z"), ErrorCode: &code}
 				}
 				output <- commandCompletion{response: result}
-			}(*request, runCtx, c, r.executor, r.done)
+			}(executionRequest, runCtx, c, r.executor, r.done)
 		}
 		timer := time.NewTimer(250 * time.Millisecond)
 		select {
@@ -217,5 +226,254 @@ func (r *CommandRunner) capture(completed commandCompletion) {
 	r.event(DomainPending, StageCaptured)
 	if completed.persistenceUncertain {
 		r.event(DomainPending, StageUncertain)
+	}
+}
+
+// heldSnapshot returns a detached, read-only view of the admitted request and its
+// held completion for future exact comparison. It exposes no exported surface and
+// never executes, persists, transports, or releases anything.
+//
+// It is unavailable before admission, while completion is not yet captured, and
+// after ordinary ACK release. It returns a detached request plus a full detached
+// response, persistence-uncertain classification, stream classification, and the
+// authorization digest already owned by the runner. It fails closed (nil) for
+// unsupported mutable response-observation shapes rather than returning a partial
+// or aliased snapshot.
+func (r *CommandRunner) heldSnapshot() *commandHeldSnapshot {
+	if r == nil || r.heldRequest == nil || r.pending == nil {
+		return nil
+	}
+	// The request is already detached at admission; copy it once per call so each
+	// accessor receives an independent value that source mutation cannot touch.
+	request := detachedRequestCopy(*r.heldRequest)
+	response, err := detachedResponseCopy(*r.pending)
+	if err != nil {
+		return nil
+	}
+	return &commandHeldSnapshot{
+		request:              request,
+		response:             response,
+		persistenceUncertain: r.persistenceUncertain,
+		stream:               r.activeStream,
+		digest:               r.activeDigest,
+	}
+}
+
+// commandHeldSnapshot is the package-private detached snapshot returned by
+// heldSnapshot. Every field is a deep copy owned by the snapshot; mutating any of
+// them, including nested observations, never affects runner state or a later
+// snapshot.
+type commandHeldSnapshot struct {
+	request              command.Request
+	response             command.Response
+	persistenceUncertain bool
+	stream               bool
+	digest               string
+}
+
+// Request returns a detached copy of the admitted request captured at admission.
+// It never executes, persists, transports, or releases anything.
+func (s *commandHeldSnapshot) Request() command.Request {
+	if s == nil {
+		return command.Request{}
+	}
+	return s.request
+}
+
+// Response returns the full detached completion response held until ordinary ACK
+// release. It is a deep copy independent of later source mutation.
+func (s *commandHeldSnapshot) Response() command.Response {
+	if s == nil {
+		return command.Response{}
+	}
+	return s.response
+}
+
+// PersistenceUncertain reports whether the held completion's replay storage was
+// uncertain (not rejected, not durably persisted) at capture.
+func (s *commandHeldSnapshot) PersistenceUncertain() bool {
+	return s != nil && s.persistenceUncertain
+}
+
+// Stream reports whether the held completion was admitted as a stream operation.
+func (s *commandHeldSnapshot) Stream() bool {
+	return s != nil && s.stream
+}
+
+// Digest returns the authorization digest already owned by the runner for the
+// held generation.
+func (s *commandHeldSnapshot) Digest() string {
+	if s == nil {
+		return ""
+	}
+	return s.digest
+}
+
+// detachedResponseCopy deep-copies the response's mutable Progress, ErrorCode, and
+// Observation. It fails closed (error) for unsupported mutable observation shapes
+// (cycles, functions, channels, unsafe pointers, or unexported struct fields) so
+// the caller never returns a partial or aliased snapshot.
+func detachedResponseCopy(response command.Response) (command.Response, error) {
+	out := response
+	if response.Progress != nil {
+		x := *response.Progress
+		out.Progress = &x
+	}
+	if response.ErrorCode != nil {
+		x := *response.ErrorCode
+		out.ErrorCode = &x
+	}
+	clone, err := cloneObservable(response.Observation)
+	if err != nil {
+		return command.Response{}, err
+	}
+	out.Observation = clone
+	return out, nil
+}
+
+// detachedRequestCopy deep-copies a request, copying its Params bytes and ModelID
+// pointer so the retained request never aliases caller-mutable state.
+func detachedRequestCopy(request command.Request) command.Request {
+	out := request
+	if len(request.Params) > 0 {
+		out.Params = make(json.RawMessage, len(request.Params))
+		copy(out.Params, request.Params)
+	}
+	if request.Capability.ModelID != nil {
+		model := *request.Capability.ModelID
+		out.Capability.ModelID = &model
+	}
+	return out
+}
+
+// heldCloneVisit identifies a live value by both its type and its pointer so that
+// cloneDeep can detect cycles instead of recursing without bound. It mirrors the
+// proven cloneVisit contract in command.cloneReflect.
+type heldCloneVisit struct {
+	typ reflect.Type
+	ptr uintptr
+}
+
+// cloneObservable deep-copies an arbitrary observation value, failing closed with
+// an error for unsupported mutable observation shapes (functions, channels, unsafe
+// pointers, cycles, or unexported struct fields). Plain JSON-observable data
+// (maps, slices, arrays, scalars, pointers, and interfaces) is deep-copied.
+func cloneObservable(value any) (any, error) {
+	cloned, err := cloneDeep(reflect.ValueOf(value), make(map[heldCloneVisit]bool))
+	if err != nil {
+		return nil, err
+	}
+	if !cloned.IsValid() {
+		return nil, nil
+	}
+	return cloned.Interface(), nil
+}
+
+// cloneDeep performs a cycle-safe deep copy of an arbitrary value. It fails
+// closed (ErrReplayLookup) for unsupported mutable shapes: functions, channels,
+// unsafe pointers, cycles, or unexported struct fields.
+func cloneDeep(v reflect.Value, seen map[heldCloneVisit]bool) (reflect.Value, error) {
+	if !v.IsValid() {
+		return reflect.Value{}, nil
+	}
+	switch v.Kind() {
+	case reflect.Interface:
+		if v.IsNil() {
+			return reflect.Zero(v.Type()), nil
+		}
+		x, err := cloneDeep(v.Elem(), seen)
+		if err != nil {
+			return reflect.Value{}, err
+		}
+		out := reflect.New(v.Type()).Elem()
+		out.Set(x)
+		return out, nil
+	case reflect.Ptr:
+		if v.IsNil() {
+			return reflect.Zero(v.Type()), nil
+		}
+		key := heldCloneVisit{v.Type(), v.Pointer()}
+		if seen[key] {
+			return reflect.Value{}, command.ErrReplayLookup
+		}
+		seen[key] = true
+		defer delete(seen, key)
+		x, err := cloneDeep(v.Elem(), seen)
+		if err != nil {
+			return reflect.Value{}, err
+		}
+		out := reflect.New(v.Type().Elem())
+		out.Elem().Set(x)
+		return out, nil
+	case reflect.Map:
+		if v.IsNil() {
+			return reflect.Zero(v.Type()), nil
+		}
+		key := heldCloneVisit{v.Type(), v.Pointer()}
+		if seen[key] {
+			return reflect.Value{}, command.ErrReplayLookup
+		}
+		seen[key] = true
+		defer delete(seen, key)
+		out := reflect.MakeMapWithSize(v.Type(), v.Len())
+		it := v.MapRange()
+		for it.Next() {
+			k, err := cloneDeep(it.Key(), seen)
+			if err != nil {
+				return reflect.Value{}, err
+			}
+			x, err := cloneDeep(it.Value(), seen)
+			if err != nil {
+				return reflect.Value{}, err
+			}
+			out.SetMapIndex(k, x)
+		}
+		return out, nil
+	case reflect.Slice:
+		if v.IsNil() {
+			return reflect.Zero(v.Type()), nil
+		}
+		key := heldCloneVisit{v.Type(), v.Pointer()}
+		if seen[key] {
+			return reflect.Value{}, command.ErrReplayLookup
+		}
+		seen[key] = true
+		defer delete(seen, key)
+		out := reflect.MakeSlice(v.Type(), v.Len(), v.Len())
+		for i := 0; i < v.Len(); i++ {
+			x, err := cloneDeep(v.Index(i), seen)
+			if err != nil {
+				return reflect.Value{}, err
+			}
+			out.Index(i).Set(x)
+		}
+		return out, nil
+	case reflect.Array:
+		out := reflect.New(v.Type()).Elem()
+		for i := 0; i < v.Len(); i++ {
+			x, err := cloneDeep(v.Index(i), seen)
+			if err != nil {
+				return reflect.Value{}, err
+			}
+			out.Index(i).Set(x)
+		}
+		return out, nil
+	case reflect.Struct:
+		out := reflect.New(v.Type()).Elem()
+		for i := 0; i < v.NumField(); i++ {
+			if v.Type().Field(i).PkgPath != "" {
+				return reflect.Value{}, command.ErrReplayLookup
+			}
+			x, err := cloneDeep(v.Field(i), seen)
+			if err != nil {
+				return reflect.Value{}, err
+			}
+			out.Field(i).Set(x)
+		}
+		return out, nil
+	case reflect.Func, reflect.Chan, reflect.UnsafePointer:
+		return reflect.Value{}, command.ErrReplayLookup
+	default:
+		return v, nil
 	}
 }
